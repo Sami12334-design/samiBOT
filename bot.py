@@ -167,17 +167,18 @@ async def main():
         print(f"❌ Telethon connection failed (Check your STRING_SESSION). Error: {e}")
         return
 
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-    app.add_handler(CallbackQueryHandler(handle_callback))
+    # ⚠️ RENAMED TO bot_app TO AVOID CONFLICT WITH FLASK's app
+    bot_app = Application.builder().token(BOT_TOKEN).build()
+    bot_app.add_handler(CommandHandler("start", start))
+    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+    bot_app.add_handler(CallbackQueryHandler(handle_callback))
     print("Bot is running...")
     
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
+    await bot_app.initialize()
+    await bot_app.start()
+    await bot_app.updater.start_polling()
 
-    # Run Flask in the background so Render doesn't shut it down
+    # Flask (app) runs in the background so Render doesn't shut it down
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
     
     await asyncio.Event().wait()
