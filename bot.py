@@ -8,20 +8,10 @@ from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
-from telethon import TelegramClient, events, functions, types
+from telethon import TelegramClient, events, functions
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError, ChannelPrivateError, UsernameNotOccupiedError, MessageIdInvalidError
-from telethon.tl.types import (
-    InputMessagesFilterEmpty,
-    InputMessagesFilterPhotos,
-    InputMessagesFilterVideo,
-    InputMessagesFilterDocument,
-    InputMessagesFilterAudio,
-    InputMessagesFilterVoice,
-    InputMessagesFilterUrl,
-    InputMessagesFilterGif,
-    InputMessagesFilterMusic
-)
+from telethon.errors import FloodWaitError, UsernameNotOccupiedError
+from telethon.tl import types  # <--- use this for all TL types
 
 # --- STORIES FIX ---
 try:
@@ -334,22 +324,27 @@ async def menu_callback(update, context):
         context.user_data['story_index'] = context.user_data.get('story_index', 0) + 1
         await display_story(update, context)
 
-    # ----- SEARCH FILTERS -----
+    # ----- SEARCH FILTERS (dynamic imports) -----
     elif data.startswith("filter_"):
+        # Safely get filter classes, fallback to Empty if not available
+        def get_filter(name):
+            return getattr(types, name, types.InputMessagesFilterEmpty)
+
         filter_map = {
-            "all": InputMessagesFilterEmpty(),
-            "posts": InputMessagesFilterEmpty(),      # you can change this if needed
-            "media": InputMessagesFilterEmpty(),      # you can combine filters
-            "photos": InputMessagesFilterPhotos(),
-            "videos": InputMessagesFilterVideo(),
-            "docs": InputMessagesFilterDocument(),
-            "audio": InputMessagesFilterAudio(),
-            "voice": InputMessagesFilterVoice(),
-            "links": InputMessagesFilterUrl(),
-            # add "gif" or "music" if desired
+            "all": types.InputMessagesFilterEmpty,
+            "posts": types.InputMessagesFilterEmpty,
+            "media": types.InputMessagesFilterEmpty,
+            "photos": get_filter('InputMessagesFilterPhotos'),
+            "videos": get_filter('InputMessagesFilterVideo'),
+            "docs": get_filter('InputMessagesFilterDocument'),
+            "audio": get_filter('InputMessagesFilterAudio'),
+            "voice": get_filter('InputMessagesFilterVoice'),
+            "links": get_filter('InputMessagesFilterUrl'),
         }
         filter_key = data.split("_")[1]
-        filter_type = filter_map.get(filter_key, InputMessagesFilterEmpty())
+        filter_class = filter_map.get(filter_key, types.InputMessagesFilterEmpty)
+        filter_type = filter_class()  # instantiate
+
         query_text = context.user_data.get('search_query', '')
         if query_text:
             await fetch_search(update, context, query_text, filter_type)
@@ -442,7 +437,7 @@ async def handle_posts_pagination(update, context, page):
                                   parse_mode=ParseMode.HTML)
 
 # --- SEARCH FEATURE ---
-async def fetch_search(update, context, text, filter_type=InputMessagesFilterEmpty()):
+async def fetch_search(update, context, text, filter_type=types.InputMessagesFilterEmpty()):
     try:
         result = await telethon_client(functions.messages.SearchGlobalRequest(
             q=text,
@@ -700,7 +695,7 @@ async def handle_link(update, context):
             await fetch_friends(update, context, text)
         elif state == 'names':
             await fetch_names(update, context, text)
-        # You can add other states like stats, track, etc. as needed
+        # add more states as needed
         return
 
     if "t.me" in text:
