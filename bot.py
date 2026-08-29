@@ -9,9 +9,14 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
 from telethon import TelegramClient, events, functions, types
-from telethon.tl.functions.stories import GetStoriesRequest
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, ChannelPrivateError, UsernameNotOccupiedError, MessageIdInvalidError
+
+# --- FIX FOR STORIES IMPORT ---
+try:
+    from telethon.tl.functions.stories import GetStoriesRequest
+except ImportError:
+    GetStoriesRequest = None
 
 # --- FLASK SETUP ---
 app = Flask(__name__)
@@ -427,21 +432,15 @@ async def fetch_search(update, context, text):
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
-# --- NEW DYNAMIC GROUPS & CHANNELS LOGIC ---
+# --- DYNAMIC GROUPS & CHANNELS LOGIC ---
 async def fetch_groups(update, context, target):
     try:
-        # Fetching dialogs for the authenticated personal account
         dialogs = await telethon_client.get_dialogs(limit=None)
         groups = []
         no_msg_groups = []
-        status_map = {}
-        
-        # Fetch participant status to determine admin/left (approximate)
-        # Note: Telegram doesn't allow checking arbitrary users' status efficiently, so we focus on the authenticated account
         for dialog in dialogs:
             if dialog.is_group:
                 entity = dialog.entity
-                # Determine if admin or creator
                 status = ""
                 if hasattr(entity, 'admin_rights') and entity.admin_rights:
                     if entity.admin_rights.is_creator:
@@ -453,7 +452,6 @@ async def fetch_groups(update, context, target):
                 elif hasattr(entity, 'is_private') and entity.is_private:
                     status = "🔒private"
                 
-                # Get last message
                 last_msg = dialog.message.message[:30] if dialog.message and dialog.message.message else "No text"
                 if dialog.message:
                     groups.append(f"{str(dialog.message.date)[:5]} {last_msg} • {entity.title} (1)")
@@ -588,7 +586,7 @@ async def fetch_names(update, context, target):
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
-# --- PROFILE STORIES PAGINATION ---
+# --- PROFILE STORIES PAGINATION (FIXED VERSION) ---
 async def display_story(update, context):
     query = update.callback_query
     entity = context.user_data.get('story_entity')
@@ -620,6 +618,9 @@ async def display_story(update, context):
         await query.edit_message_text(f"Story {index+1}/{len(stories)}\nCannot download media: {e}", reply_markup=InlineKeyboardMarkup(kb))
 
 async def fetch_stories(update, context, target):
+    if GetStoriesRequest is None:
+        await update.message.reply_text("❌ Stories API is not supported in your current Telethon version. Please ignore this button.")
+        return
     entity = await telethon_client.get_entity(target)
     try:
         stories = await telethon_client(GetStoriesRequest(entity))
@@ -627,8 +628,8 @@ async def fetch_stories(update, context, target):
         context.user_data['stories_list'] = stories.stories
         context.user_data['story_index'] = 0
         await display_story(update, context)
-    except:
-        await update.message.reply_text("No accessible stories found for this user.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Could not fetch stories: {e}")
 
 # --- MESSAGE HANDLER ---
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -670,7 +671,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif state == 'names': await fetch_names(update, context, text)
         elif state == 'groups': await fetch_groups(update, context, text)
         elif state == 'channels': await fetch_channels(update, context, text)
-        # Stories are triggered by profile button
         return
     if "t.me" in text:
         username, msg_id = parse_tg_link(text)
