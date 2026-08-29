@@ -5,7 +5,8 @@ import threading
 import sqlite3
 from io import BytesIO
 from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
 from telethon import TelegramClient, events, functions, types
 from telethon.tl.functions.stories import GetStoriesRequest
@@ -35,7 +36,6 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY)''')
     c.execute('''CREATE TABLE IF NOT EXISTS inbox (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, sender_id INTEGER, name TEXT, username TEXT, text TEXT, media_type TEXT, date TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS tracking (target_id INTEGER PRIMARY KEY, username TEXT)''')
-    # New table for Names History
     c.execute('''CREATE TABLE IF NOT EXISTS user_history (user_id INTEGER, username TEXT, first_name TEXT, last_name TEXT, date TEXT)''')
     conn.commit()
     conn.close()
@@ -85,7 +85,6 @@ def add_track(target_id, username):
     conn.commit()
     conn.close()
 
-# --- NEW: USER HISTORY HELPERS ---
 def save_user_history(user_id, username, first_name, last_name):
     conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
@@ -293,10 +292,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "stats": ("📊 STATISTICS", "Enter target username/ID or chat link:"),
             "track": ("🔔 TRACK", "Enter target username/ID to track:"),
             "names": ("🔗 NAMES", "Enter target username/ID:"),
-            "groups": ("👥 GROUPS", "Enter target username/ID:"),
+            "groups": ("👥 GROUPS", "Enter the account ID (usually your own) to list groups:"),
             "messages": ("💬 MESSAGES", "Enter target username/ID or chat link:"),
             "analysis": ("🔎 ANALYSIS", "Enter target username/ID or chat link:"),
-            "channels": ("📢 CHANNELS", "Enter target username/ID or chat link:"),
+            "channels": ("📢 CHANNELS", "Enter the account ID (usually your own) to list channels:"),
             "rep": ("👍 REPUTATION", "Enter target username/ID or chat link:"),
             "friends": ("👥 FRIENDS", "Enter target group username (e.g. @group) AND target user username (e.g. @user) separated by space:\nExample: @mygroup @Ollock"),
             "reactions": ("🔄 REACTIONS", "Enter target username/ID or chat link:"),
@@ -428,6 +427,77 @@ async def fetch_search(update, context, text):
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
+# --- NEW DYNAMIC GROUPS & CHANNELS LOGIC ---
+async def fetch_groups(update, context, target):
+    try:
+        # Fetching dialogs for the authenticated personal account
+        dialogs = await telethon_client.get_dialogs(limit=None)
+        groups = []
+        no_msg_groups = []
+        status_map = {}
+        
+        # Fetch participant status to determine admin/left (approximate)
+        # Note: Telegram doesn't allow checking arbitrary users' status efficiently, so we focus on the authenticated account
+        for dialog in dialogs:
+            if dialog.is_group:
+                entity = dialog.entity
+                # Determine if admin or creator
+                status = ""
+                if hasattr(entity, 'admin_rights') and entity.admin_rights:
+                    if entity.admin_rights.is_creator:
+                        status = "👑creator"
+                    else:
+                        status = "👑admin"
+                elif hasattr(entity, 'left') and entity.left:
+                    status = "✖left"
+                elif hasattr(entity, 'is_private') and entity.is_private:
+                    status = "🔒private"
+                
+                # Get last message
+                last_msg = dialog.message.message[:30] if dialog.message and dialog.message.message else "No text"
+                if dialog.message:
+                    groups.append(f"{str(dialog.message.date)[:5]} {last_msg} • {entity.title} (1)")
+                else:
+                    no_msg_groups.append(entity.title)
+        
+        if not groups and not no_msg_groups:
+            await update.message.reply_text("No groups found for this account.")
+            return
+            
+        text = f"<blockquote>Known groups of account <b>{telethon_client.get_me().id}</b>\n👑admin, 🔒private, ✖left\nLast msg - group (total messages)\n\n"
+        for g in groups[:10]:
+            text += f"|{g}\n"
+        if no_msg_groups:
+            text += "\nWithout messages:\n"
+            for g in no_msg_groups[:10]:
+                text += f"| {g}\n"
+        text += "</blockquote>"
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+async def fetch_channels(update, context, target):
+    try:
+        dialogs = await telethon_client.get_dialogs(limit=None)
+        channels = []
+        for dialog in dialogs:
+            if dialog.is_channel and not dialog.is_group:
+                entity = dialog.entity
+                last_msg = dialog.message.message[:30] if dialog.message and dialog.message.message else "No text"
+                channels.append(f"{str(dialog.message.date)[:5]} {last_msg} • {entity.title} (1)")
+        
+        if not channels:
+            await update.message.reply_text("No channels found for this account.")
+            return
+            
+        text = f"<blockquote>Known channels of account <b>{telethon_client.get_me().id}</b>\nLast msg - channel (total messages)\n\n"
+        for c in channels[:10]:
+            text += f"|{c}\n"
+        text += "</blockquote>"
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
 # --- WORDS FREQUENCY (LEGEND STYLE) ---
 async def fetch_words(update, context, target):
     context.user_data['word_target'] = target
@@ -476,7 +546,6 @@ async def fetch_friends(update, context, text):
                     sender_id = reply_to_msg.sender_id
                     if sender_id not in reply_data:
                         reply_data[sender_id] = {'count': 0, 'date': str(m.date)}
-                        # Resolve sender name
                         try:
                             sender_entity = await telethon_client.get_entity(sender_id)
                             reply_data[sender_id]['name'] = f"{sender_entity.first_name} {getattr(sender_entity, 'last_name', '')}"
@@ -599,6 +668,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif state == 'words': await fetch_words(update, context, text)
         elif state == 'friends': await fetch_friends(update, context, text)
         elif state == 'names': await fetch_names(update, context, text)
+        elif state == 'groups': await fetch_groups(update, context, text)
+        elif state == 'channels': await fetch_channels(update, context, text)
         # Stories are triggered by profile button
         return
     if "t.me" in text:
