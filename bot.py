@@ -11,6 +11,17 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from telethon import TelegramClient, events, functions, types
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, ChannelPrivateError, UsernameNotOccupiedError, MessageIdInvalidError
+from telethon.tl.types import (
+    InputMessagesFilterEmpty,
+    InputMessagesFilterPhotos,
+    InputMessagesFilterVideo,
+    InputMessagesFilterDocument,
+    InputMessagesFilterAudio,
+    InputMessagesFilterVoice,
+    InputMessagesFilterUrl,
+    InputMessagesFilterGif,
+    InputMessagesFilterMusic
+)
 
 # --- STORIES FIX ---
 try:
@@ -142,12 +153,12 @@ def parse_tg_link(text):
     return None, None
 
 def get_media_type(event):
-    if event.photo: return "📷"
-    elif event.video: return "🎬"
-    elif event.document: return "🎞️" if event.gif else "📄"
-    elif event.audio: return "🎵"
-    elif event.voice: return "🎤"
-    elif event.sticker: return "🧩"
+    if hasattr(event, 'photo') and event.photo: return "📷"
+    elif hasattr(event, 'video') and event.video: return "🎬"
+    elif hasattr(event, 'document') and event.document: return "📄" if not hasattr(event, 'gif') or not event.gif else "🎞️"
+    elif hasattr(event, 'audio') and event.audio: return "🎵"
+    elif hasattr(event, 'voice') and event.voice: return "🎤"
+    elif hasattr(event, 'sticker') and event.sticker: return "🧩"
     else: return "💬"
 
 # --- COMMANDS ---
@@ -179,6 +190,8 @@ async def menu_callback(update, context):
         return
 
     data = query.data
+
+    # ----- INBOX -----
     if data == "inbox":
         rows = get_inbox_conversations()
         if not rows:
@@ -223,14 +236,32 @@ async def menu_callback(update, context):
         kb = [[InlineKeyboardButton("↩️ Reply", callback_data=f"reply_{chat_id}"), InlineKeyboardButton("👤 Profile", callback_data="profile")], [InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_{chat_id}"), InlineKeyboardButton("⬅️ Back", callback_data="inbox")]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
 
+    # ----- PROFILE -----
     elif data == "profile":
-        await query.edit_message_text("👤 PROFILE\n\nEnter a Telegram username or ID to generate the Profile Card:")
-        context.user_data['state'] = 'profile_query'
-    
+        entity = context.user_data.get('profile_entity')
+        if entity:
+            # Re-display profile (text only)
+            text = f"<blockquote><b>{entity.first_name} {getattr(entity, 'last_name', '')}</b>\n"
+            text += f"@{entity.username or 'N/A'}\n\n"
+            text += f"{getattr(entity, 'about', 'No bio')}\n\n"
+            text += f"ID: {entity.id}\nVerified: {entity.verified}\n"
+            text += f"Premium: {getattr(entity, 'premium', False)}\nBot: {entity.bot}</blockquote>"
+            kb = [
+                [InlineKeyboardButton("📰 View Posts", callback_data="posts_1"),
+                 InlineKeyboardButton("📸 View Stories", callback_data="story_start")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="more")]
+            ]
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+        else:
+            await query.edit_message_text("👤 PROFILE\n\nEnter a Telegram username or ID to generate the Profile Card:")
+            context.user_data['state'] = 'profile_query'
+
+    # ----- FETCH -----
     elif data == "fetch":
         await query.edit_message_text("🔗 Fetch Telegram\n\nSend me a link (e.g., t.me/channel/123):")
         context.user_data['state'] = 'fetch_link'
 
+    # ----- MAIN MENU -----
     elif data == "main_menu":
         keyboard = [
             [InlineKeyboardButton("📥 Inbox", callback_data="inbox"), InlineKeyboardButton("👤 Profile", callback_data="profile")],
@@ -239,6 +270,7 @@ async def menu_callback(update, context):
         ]
         await query.edit_message_text("🤖 TELEGRAM ASSISTANT", reply_markup=InlineKeyboardMarkup(keyboard))
 
+    # ----- MORE MENU -----
     elif data == "more":
         kb = [
             [InlineKeyboardButton("🔎 Search", callback_data="search"), InlineKeyboardButton("📊 Statistics", callback_data="stats")],
@@ -253,6 +285,7 @@ async def menu_callback(update, context):
         ]
         await query.edit_message_text("➕ MORE COMMANDS", reply_markup=InlineKeyboardMarkup(kb))
 
+    # ----- OTHER FEATURES (prompt for input) -----
     elif data in ["search", "stats", "track", "names", "groups", "messages", "analysis", "channels", "rep", "friends", "reactions", "gifts", "share", "words", "common"]:
         prompts = {
             "search": ("🔎 SEARCH", "Enter any keyword to search globally:\nExample: logic exam or wcu freshman"),
@@ -275,107 +308,171 @@ async def menu_callback(update, context):
         await query.edit_message_text(f"{title}\n\n{prompt}")
         context.user_data['state'] = data
 
-    # SEARCH PAGINATION
+    # ----- SEARCH PAGINATION -----
     elif data.startswith("search_"):
         page = int(data.split("_")[1])
         await handle_search_pagination(update, context, page)
 
-    # POSTS PAGINATION
+    # ----- POSTS PAGINATION -----
     elif data.startswith("posts_"):
         page = int(data.split("_")[1])
         await handle_posts_pagination(update, context, page)
+
+    # ----- STORY NAVIGATION -----
+    elif data == "story_start":
+        entity = context.user_data.get('profile_entity')
+        if not entity:
+            await query.edit_message_text("No profile loaded. Please view a profile first.")
+            return
+        await fetch_stories(update, context, entity)
+
+    elif data == "story_prev":
+        context.user_data['story_index'] = context.user_data.get('story_index', 0) - 1
+        await display_story(update, context)
+
+    elif data == "story_next":
+        context.user_data['story_index'] = context.user_data.get('story_index', 0) + 1
+        await display_story(update, context)
+
+    # ----- SEARCH FILTERS -----
+    elif data.startswith("filter_"):
+        filter_map = {
+            "all": InputMessagesFilterEmpty(),
+            "posts": InputMessagesFilterEmpty(),      # you can change this if needed
+            "media": InputMessagesFilterEmpty(),      # you can combine filters
+            "photos": InputMessagesFilterPhotos(),
+            "videos": InputMessagesFilterVideo(),
+            "docs": InputMessagesFilterDocument(),
+            "audio": InputMessagesFilterAudio(),
+            "voice": InputMessagesFilterVoice(),
+            "links": InputMessagesFilterUrl(),
+            # add "gif" or "music" if desired
+        }
+        filter_key = data.split("_")[1]
+        filter_type = filter_map.get(filter_key, InputMessagesFilterEmpty())
+        query_text = context.user_data.get('search_query', '')
+        if query_text:
+            await fetch_search(update, context, query_text, filter_type)
+        else:
+            await query.edit_message_text("No search query found. Please search again.")
 
 # --- PROFILE FEATURE ---
 async def fetch_profile(update, context, target):
     try:
         entity = await telethon_client.get_entity(target)
-        save_user_history(entity.id, entity.username, getattr(entity, 'first_name', ''), getattr(entity, 'last_name', ''))
-        text = f"<blockquote><b>{entity.first_name} {getattr(entity, 'last_name', '')}</b>\n@{entity.username or 'N/A'}\n\n"
+        context.user_data['profile_entity'] = entity
+
+        # Fetch recent posts (limit 50)
+        messages = await telethon_client.get_messages(entity, limit=50)
+        context.user_data['post_messages'] = messages
+
+        save_user_history(entity.id, entity.username,
+                          getattr(entity, 'first_name', ''),
+                          getattr(entity, 'last_name', ''))
+
+        text = f"<blockquote><b>{entity.first_name} {getattr(entity, 'last_name', '')}</b>\n"
+        text += f"@{entity.username or 'N/A'}\n\n"
         text += f"{getattr(entity, 'about', 'No bio')}\n\n"
-        text += f"ID: {entity.id}\nVerified: {entity.verified}\nPremium: {getattr(entity, 'premium', False)}\nBot: {entity.bot}</blockquote>"
-        
+        text += f"ID: {entity.id}\nVerified: {entity.verified}\n"
+        text += f"Premium: {getattr(entity, 'premium', False)}\nBot: {entity.bot}</blockquote>"
+
         kb = [
-            [InlineKeyboardButton("📰 View Posts", callback_data="posts_1"), InlineKeyboardButton("📸 View Stories", callback_data="story_start")],
+            [InlineKeyboardButton("📰 View Posts", callback_data="posts_1"),
+             InlineKeyboardButton("📸 View Stories", callback_data="story_start")],
             [InlineKeyboardButton("⬅️ Back", callback_data="more")]
         ]
+
         try:
             photo = await telethon_client.download_profile_photo(entity, file=BytesIO())
             photo.seek(0)
-            await update.message.reply_photo(photo=photo, caption=text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+            await update.message.reply_photo(photo=photo, caption=text,
+                                             parse_mode=ParseMode.HTML,
+                                             reply_markup=InlineKeyboardMarkup(kb))
         except Exception:
-            await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+            await update.message.reply_text(text, parse_mode=ParseMode.HTML,
+                                            reply_markup=InlineKeyboardMarkup(kb))
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
-# --- POSTS PAGINATION LOGIC ---
+# --- POSTS PAGINATION ---
 async def handle_posts_pagination(update, context, page):
     query = update.callback_query
     await query.answer()
-    entity = context.user_data.get('post_entity')
-    if not entity:
+
+    messages = context.user_data.get('post_messages')
+    if not messages:
         await query.edit_message_text("No posts found.")
         return
-    
+
     per_page = 5
-    messages = await telethon_client.get_messages(entity, limit=(page * per_page))
-    total_posts = len(messages)
+    total = len(messages)
     start = (page - 1) * per_page
-    end = min(start + per_page, total_posts)
+    end = min(start + per_page, total)
     page_items = messages[start:end]
-    
+
     if not page_items:
-        await query.edit_message_text("No more posts to show.")
+        await query.edit_message_text("No more posts.")
         return
 
-    text = f"📰 POSTS OF {entity.title or entity.first_name}\n"
-    text += f"Page {page}\n\n"
-    for m in page_items:
-        content = m.message[:50] if m.message else f"[{get_media_type(m)}]"
-        text += f"• {content}\n"
+    text = f"📰 **POSTS**\nPage {page}/{max(1, (total + per_page - 1)//per_page)}\n\n"
+    entity = context.user_data.get('profile_entity')
+
+    for msg in page_items:
+        media_emoji = get_media_type(msg)
+        date_str = msg.date.strftime("%Y-%m-%d %H:%M")
+        content = msg.message[:50] if msg.message else "[Media]"
+        if entity:
+            if hasattr(entity, 'username') and entity.username:
+                link = f"https://t.me/{entity.username}/{msg.id}"
+            else:
+                link = f"https://t.me/c/{entity.id}/{msg.id}"
+            text += f"{media_emoji} <a href='{link}'>{content}</a> - {date_str}\n"
+        else:
+            text += f"{media_emoji} {content} - {date_str}\n"
 
     kb = []
     if page > 1:
         kb.append([InlineKeyboardButton("⬅️ Previous", callback_data=f"posts_{page-1}")])
-    if end < total_posts:
+    if end < total:
         kb.append([InlineKeyboardButton("Next ➡️", callback_data=f"posts_{page+1}")])
     kb.append([InlineKeyboardButton("⬅️ Back to Profile", callback_data="profile")])
-    
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
 
-# --- SEARCH FEATURE (FIXED WITH FULL ARGUMENTS) ---
-async def fetch_search(update, context, text):
+    await query.edit_message_text(text,
+                                  reply_markup=InlineKeyboardMarkup(kb),
+                                  parse_mode=ParseMode.HTML)
+
+# --- SEARCH FEATURE ---
+async def fetch_search(update, context, text, filter_type=InputMessagesFilterEmpty()):
     try:
-        # Adding the missing required arguments for SearchGlobalRequest
         result = await telethon_client(functions.messages.SearchGlobalRequest(
             q=text,
-            filter=types.InputMessagesFilterEmpty(),
+            filter=filter_type,
             min_date=0,
             max_date=0,
             offset_rate=0,
             offset_peer=types.InputPeerEmpty(),
             offset_id=0,
-            limit=10
+            limit=50
         ))
-        
         context.user_data['search_results'] = result
+        context.user_data['search_query'] = text
+        context.user_data['search_filter'] = filter_type
         await handle_search_pagination(update, context, 1)
-        
     except Exception as e:
         await update.message.reply_text(f"❌ Search failed: {e}")
 
 async def handle_search_pagination(update, context, page):
     query = update.callback_query
     await query.answer()
-    
+
     results = context.user_data.get('search_results')
     if not results:
         if isinstance(update, Update) and update.message:
             await update.message.reply_text("No results found.")
         return
-    
+
     per_page = 5
     all_items = []
-    
     for msg in results.messages:
         chat_id = msg.chat_id
         msg_id = msg.id
@@ -389,31 +486,48 @@ async def handle_search_pagination(update, context, page):
             all_items.append(f"🔗 <a href='{link}'>{content}</a>")
         except:
             pass
-            
+
     total_items = len(all_items)
     start = (page - 1) * per_page
     end = min(start + per_page, total_items)
     page_items = all_items[start:end]
-    
+
     if not page_items:
         await query.edit_message_text("No more results.")
         return
 
-    # Format exactly like Legend Bot
-    text = f"<blockquote><b>Samuel</b>\n{context.user_data.get('search_query', '')}\n\n"
+    text = f"<blockquote><b>{context.user_data.get('search_query', '')}</b>\n\n"
     for item in page_items:
         text += f"{item}\n"
     text += f"\nPage {page}/{max(1, (total_items + per_page - 1) // per_page)}\n"
     text += "Sort by relevance and activity</blockquote>"
-    
-    kb = []
+
+    # Filter buttons (9 buttons in 3 rows)
+    filter_buttons = [
+        InlineKeyboardButton("All", callback_data="filter_all"),
+        InlineKeyboardButton("Posts", callback_data="filter_posts"),
+        InlineKeyboardButton("Media", callback_data="filter_media"),
+        InlineKeyboardButton("Photos", callback_data="filter_photos"),
+        InlineKeyboardButton("Videos", callback_data="filter_videos"),
+        InlineKeyboardButton("Docs", callback_data="filter_docs"),
+        InlineKeyboardButton("Audio", callback_data="filter_audio"),
+        InlineKeyboardButton("Voice", callback_data="filter_voice"),
+        InlineKeyboardButton("Links", callback_data="filter_links"),
+    ]
+    filter_rows = [filter_buttons[i:i+3] for i in range(0, len(filter_buttons), 3)]
+
+    nav_buttons = []
     if page > 1:
-        kb.append([InlineKeyboardButton("⬅️ Previous", callback_data=f"search_{page-1}")])
+        nav_buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"search_{page-1}"))
     if end < total_items:
-        kb.append([InlineKeyboardButton("Next ➡️", callback_data=f"search_{page+1}")])
-    kb.append([InlineKeyboardButton("🔄 New Search", callback_data="search"), InlineKeyboardButton("⬅️ Back", callback_data="more")])
-    
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"search_{page+1}"))
+    nav_buttons.append(InlineKeyboardButton("🔄 New Search", callback_data="search"))
+    nav_buttons.append(InlineKeyboardButton("⬅️ Back", callback_data="more"))
+
+    keyboard = filter_rows + [nav_buttons]
+    await query.edit_message_text(text,
+                                  reply_markup=InlineKeyboardMarkup(keyboard),
+                                  parse_mode=ParseMode.HTML)
 
 # --- STORIES FEATURE ---
 async def display_story(update, context):
@@ -434,23 +548,25 @@ async def display_story(update, context):
     try:
         media_file = await telethon_client.download_media(story, file=BytesIO())
         media_file.seek(0)
-        await query.edit_message_media(media=media_file, caption=f"Story {index+1}/{len(stories)}", reply_markup=InlineKeyboardMarkup(kb))
+        await query.edit_message_media(media=media_file,
+                                       caption=f"Story {index+1}/{len(stories)}",
+                                       reply_markup=InlineKeyboardMarkup(kb))
     except Exception as e:
-        await query.edit_message_text(f"Story {index+1}/{len(stories)}\nCannot download media: {e}", reply_markup=InlineKeyboardMarkup(kb))
+        await query.edit_message_text(f"Story {index+1}/{len(stories)}\nCannot download media: {e}",
+                                      reply_markup=InlineKeyboardMarkup(kb))
 
-async def fetch_stories(update, context, target):
+async def fetch_stories(update, context, entity):
     if GetStoriesRequest is None:
         await update.message.reply_text("❌ Stories API not supported in this Telethon version.")
         return
     try:
-        entity = await telethon_client.get_entity(target)
         stories = await telethon_client(GetStoriesRequest(entity))
         context.user_data['story_entity'] = entity
         context.user_data['stories_list'] = stories.stories
         context.user_data['story_index'] = 0
         await display_story(update, context)
-    except:
-        await update.message.reply_text("No accessible stories found.")
+    except Exception as e:
+        await update.message.reply_text(f"No accessible stories found: {e}")
 
 # --- OTHER FEATURES (WORDS, FRIENDS, NAMES) ---
 async def perform_words_analysis(update, context, target, limit):
@@ -540,7 +656,7 @@ async def fetch_names(update, context, target):
 async def handle_link(update, context):
     user_id = update.effective_user.id
     text = update.message.text
-    
+
     if context.user_data.get('state') == 'awaiting_password':
         if text == BOT_PASSWORD:
             add_authenticated_user(user_id)
@@ -573,13 +689,18 @@ async def handle_link(update, context):
     state = context.user_data.get('state')
     if state:
         context.user_data['state'] = None
-        if state == 'profile_query': await fetch_profile(update, context, text)
+        if state == 'profile_query':
+            await fetch_profile(update, context, text)
         elif state == 'search':
             context.user_data['search_query'] = text
             await fetch_search(update, context, text)
-        elif state == 'words': await fetch_words(update, context, text)
-        elif state == 'friends': await fetch_friends(update, context, text)
-        elif state == 'names': await fetch_names(update, context, text)
+        elif state == 'words':
+            await fetch_words(update, context, text)
+        elif state == 'friends':
+            await fetch_friends(update, context, text)
+        elif state == 'names':
+            await fetch_names(update, context, text)
+        # You can add other states like stats, track, etc. as needed
         return
 
     if "t.me" in text:
