@@ -307,7 +307,7 @@ async def fetch_profile(update, context, target):
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
-# --- POSTS PAGINATION LOGIC (NEW) ---
+# --- POSTS PAGINATION LOGIC ---
 async def handle_posts_pagination(update, context, page):
     query = update.callback_query
     await query.answer()
@@ -342,13 +342,22 @@ async def handle_posts_pagination(update, context, page):
     
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
 
-# --- SEARCH FEATURE (GLOBAL SEARCH) ---
+# --- SEARCH FEATURE (FIXED WITH FULL ARGUMENTS) ---
 async def fetch_search(update, context, text):
     try:
-        query = text
-        results = await telethon_client(functions.messages.SearchGlobalRequest(q=query, limit=10))
+        # Adding the missing required arguments for SearchGlobalRequest
+        result = await telethon_client(functions.messages.SearchGlobalRequest(
+            q=text,
+            filter=types.InputMessagesFilterEmpty(),
+            min_date=0,
+            max_date=0,
+            offset_rate=0,
+            offset_peer=types.InputPeerEmpty(),
+            offset_id=0,
+            limit=10
+        ))
         
-        context.user_data['search_results'] = results
+        context.user_data['search_results'] = result
         await handle_search_pagination(update, context, 1)
         
     except Exception as e:
@@ -406,7 +415,7 @@ async def handle_search_pagination(update, context, page):
     
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
 
-# --- STORIES FEATURE (FIXED) ---
+# --- STORIES FEATURE ---
 async def display_story(update, context):
     query = update.callback_query
     stories = context.user_data.get('stories_list')
