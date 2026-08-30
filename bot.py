@@ -13,7 +13,7 @@ from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, UsernameNotOccupiedError
 from telethon.tl import types
 
-# --- STORIES FIX: try both methods ---
+# --- STORIES FIX ---
 try:
     from telethon.tl.functions.stories import GetStoriesRequest
 except ImportError:
@@ -433,9 +433,10 @@ async def handle_posts_pagination(update, context, page):
                                   reply_markup=InlineKeyboardMarkup(kb),
                                   parse_mode=ParseMode.HTML)
 
-# --- SEARCH FEATURE (fix for both message and callback) ---
+# --- SEARCH FEATURE (FIXED) ---
 async def fetch_search(update, context, text, filter_type=types.InputMessagesFilterEmpty(), is_callback=False):
     try:
+        # Use SearchGlobalRequest (works for public channels)
         result = await telethon_client(functions.messages.SearchGlobalRequest(
             q=text,
             filter=filter_type,
@@ -446,6 +447,21 @@ async def fetch_search(update, context, text, filter_type=types.InputMessagesFil
             offset_id=0,
             limit=50
         ))
+        # If no results, try SearchRequest with InputPeerEmpty (sometimes more reliable)
+        if not result.messages:
+            result = await telethon_client(functions.messages.SearchRequest(
+                peer=types.InputPeerEmpty(),
+                q=text,
+                filter=filter_type,
+                min_date=0,
+                max_date=0,
+                offset_id=0,
+                add_offset=0,
+                limit=50,
+                max_id=0,
+                min_id=0,
+                hash=0
+            ))
         context.user_data['search_results'] = result
         context.user_data['search_query'] = text
         context.user_data['search_filter'] = filter_type
@@ -613,20 +629,14 @@ async def display_story(update, context):
         media_file = BytesIO()
         await telethon_client.download_media(story, file=media_file)
         media_file.seek(0)
-        # Check if it's a photo, video, etc.
-        if hasattr(story, 'media') and story.media:
-            # We'll just send as document with caption; better to detect type.
-            # For simplicity, send as photo if possible, else document.
-            try:
-                await query.edit_message_media(media=media_file,
-                                               caption=f"Story {index+1}/{len(stories)}",
-                                               reply_markup=InlineKeyboardMarkup(kb))
-            except Exception:
-                # If edit_message_media fails, send as document
-                await query.edit_message_text(f"Story {index+1}/{len(stories)} (media file)",
-                                              reply_markup=InlineKeyboardMarkup(kb))
-        else:
-            await query.edit_message_text(f"Story {index+1}/{len(stories)} (no media)",
+        # Try to send as photo or video, else as document
+        try:
+            await query.edit_message_media(media=media_file,
+                                           caption=f"Story {index+1}/{len(stories)}",
+                                           reply_markup=InlineKeyboardMarkup(kb))
+        except Exception:
+            # Fallback: send as document
+            await query.edit_message_text(f"Story {index+1}/{len(stories)} (media file)",
                                           reply_markup=InlineKeyboardMarkup(kb))
     except Exception as e:
         await query.edit_message_text(f"Story {index+1}/{len(stories)}\nCannot download media: {e}",
@@ -634,7 +644,7 @@ async def display_story(update, context):
 
 async def fetch_stories(update, context, entity):
     try:
-        # Try modern method first (if available)
+        # Try modern method first
         if hasattr(telethon_client, 'get_stories'):
             stories = await telethon_client.get_stories(entity)
         elif GetStoriesRequest is not None:
@@ -643,7 +653,6 @@ async def fetch_stories(update, context, entity):
             await update.message.reply_text("❌ Stories API not supported in this Telethon version.")
             return
 
-        # stories is a list of story objects
         if not stories:
             await update.message.reply_text("No stories available for this user.")
             return
@@ -651,15 +660,6 @@ async def fetch_stories(update, context, entity):
         context.user_data['story_entity'] = entity
         context.user_data['stories_list'] = stories
         context.user_data['story_index'] = 0
-
-        # Display first story
-        # We need to call display_story but we have a message not callback.
-        # We'll send a new message with the story.
-        # However, the button 'story_start' is a callback, so we already have a callback.
-        # So we can call display_story from there.
-        # But here fetch_stories is called from callback, so we can use query.
-        # Actually, fetch_stories is called from menu_callback, which has a query.
-        # We'll use the query to edit message.
         await display_story(update, context)
 
     except Exception as e:
