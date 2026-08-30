@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-telegram_assistant_full.py
+telegram_assistant_public_search.py
 Full Telethon + python-telegram-bot assistant with:
-- password-gated menu UI
-- inbox collection of private messages
-- fetch by t.me link (single or batch)
-- profile card with "View Posts" (recent -> old) and "View Stories"
-- posts pagination and story navigation
-- words/friends/names features preserved
+- Menu UI, password gating, inbox, fetching by t.me links
+- Profile card with "View Posts" (recent -> old) and "View Stories"
+- Global search that returns results from public channels/groups even if you're not joined,
+  by using SearchGlobalRequest response.chat mapping to build links.
 
 Requirements:
   pip install telethon python-telegram-bot Flask
@@ -30,6 +28,7 @@ from telethon import TelegramClient, events, functions
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, UsernameNotOccupiedError
 from telethon.tl import types
+from telethon.tl.types import PeerChannel, PeerUser, PeerChat
 
 # --- STORIES FIX: try both methods ---
 try:
@@ -137,25 +136,64 @@ def get_media_type(event):
     elif hasattr(event, 'sticker') and event.sticker: return "🧩"
     else: return "💬"
 
-def tg_message_link(chat, msg_id):
+def tg_message_link_from_chat_obj(chat_obj, msg_id):
     """
-    Build a clickable t.me link for a message.
-    Works for public channels/groups (username) and private supergroups (-100xxx).
-    `chat` can be an entity or an id.
+    Build a clickable t.me link for a message given a chat object (from SearchGlobalResponse.chats).
+    Prefer username when available (public channels). Fallback to /c/ for supergroups.
     """
-    username = getattr(chat, 'username', None)
+    if chat_obj is None:
+        return ""
+    username = getattr(chat_obj, 'username', None)
     if username:
         return f"https://t.me/{username}/{msg_id}"
-    cid = getattr(chat, 'id', chat)  # chat may be an id already
+    # fallback: use id
+    cid = getattr(chat_obj, 'id', None)
+    if cid is None:
+        return ""
     s = str(cid)
-    # Telethon channel ids often look like -1001234567890
     if s.startswith("-100"):
         return f"https://t.me/c/{s[4:]}/{msg_id}"
     elif s.startswith("-"):
         return f"https://t.me/c/{s[1:]}/{msg_id}"
     else:
-        # as fallback use /c path (may not always work for private chats)
         return f"https://t.me/{s}/{msg_id}"
+
+def tg_message_link(chat, msg_id):
+    """
+    Build a clickable t.me link for a message given a chat entity or id.
+    """
+    username = getattr(chat, 'username', None)
+    if username:
+        return f"https://t.me/{username}/{msg_id}"
+    cid = getattr(chat, 'id', chat)
+    s = str(cid)
+    if s.startswith("-100"):
+        return f"https://t.me/c/{s[4:]}/{msg_id}"
+    elif s.startswith("-"):
+        return f"https://t.me/c/{s[1:]}/{msg_id}"
+    else:
+        return f"https://t.me/{s}/{msg_id}"
+
+def extract_msg_chat_id(msg):
+    """
+    Extract numeric chat id from a Telethon message's peer_id / to_id.
+    Returns None if not available.
+    """
+    pid = getattr(msg, 'peer_id', None) or getattr(msg, 'to_id', None)
+    if pid is None:
+        return None
+    # PeerChannel / PeerUser / PeerChat types
+    if isinstance(pid, PeerChannel):
+        return pid.channel_id
+    if isinstance(pid, PeerUser):
+        return pid.user_id
+    if isinstance(pid, PeerChat):
+        return pid.chat_id
+    # fallback: some messages have chat_id attribute
+    if hasattr(msg, 'chat_id') and getattr(msg, 'chat_id'):
+        return getattr(msg, 'chat_id')
+    # Else try common names
+    return None
 
 # --- EXISTING FETCHER ---
 async def safe_send(chat_id, bot, msg, from_chat_id, message_id):
@@ -460,7 +498,6 @@ async def handle_posts_pagination(update, context, page):
             if getattr(entity, 'username', None):
                 link = f"https://t.me/{entity.username}/{msg.id}"
             else:
-                # for private supergroups/channels the /c path expects id without -100
                 eid = getattr(entity, 'id', None)
                 if eid:
                     s = str(eid)
@@ -489,8 +526,12 @@ async def handle_posts_pagination(update, context, page):
 
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
-# --- SEARCH FEATURE (Global Search wrapper kept minimal) ---
+# --- SEARCH FEATURE (Global Search that can return public-channel results) ---
 async def fetch_search(update, context, text, filter_type=types.InputMessagesFilterEmpty(), is_callback=False):
+    """
+    Uses functions.messages.SearchGlobalRequest and uses result.chats mapping to
+    build clickable links for messages from public channels/groups even if not joined.
+    """
     try:
         result = await telethon_client(functions.messages.SearchGlobalRequest(
             q=text,
@@ -506,24 +547,36 @@ async def fetch_search(update, context, text, filter_type=types.InputMessagesFil
         context.user_data['search_query'] = text
         context.user_data['search_filter'] = filter_type
 
+        # Build mapping of chats returned with the search response:
+        chat_map = {}
+        if hasattr(result, 'chats') and result.chats:
+            for ch in result.chats:
+                # Telethon Channel/Chat objects have .id
+                cid = getattr(ch, 'id', None)
+                if cid is not None:
+                    chat_map[cid] = ch
+
         # Build first page
         page = 1
         per_page = 5
         all_items = []
         for msg in result.messages:
-            chat_id = getattr(msg, 'chat_id', None) or getattr(msg, 'peer_id', None)
             msg_id = msg.id
-            try:
-                chat = await telethon_client.get_entity(chat_id)
-                if hasattr(chat, 'username') and chat.username:
-                    link = f"https://t.me/{chat.username}/{msg_id}"
-                else:
-                    link = f"https://t.me/c/{chat.id}/{msg_id}"
-                content = msg.message[:120] if getattr(msg, 'message', None) else f"[{get_media_type(msg)}]"
+            chat_id = extract_msg_chat_id(msg)
+            chat_obj = chat_map.get(chat_id)
+            # Build link preferring chat_obj username if available:
+            if chat_obj:
+                link = tg_message_link_from_chat_obj(chat_obj, msg_id)
+            else:
+                # fallback: try get_entity (may fail for channels not joined) but we avoid calling it for performance
+                link = ""
+            content = (msg.message[:120]) if getattr(msg, 'message', None) else f"[{get_media_type(msg)}]"
+            if link:
                 all_items.append(f"🔗 <a href='{link}'>{content}</a>")
-            except:
-                pass
-
+            else:
+                # If we cannot build a clickable link, show text snippet and source info if any
+                src = getattr(chat_obj, 'title', None) or getattr(chat_obj, 'username', None) or str(chat_id or "")
+                all_items.append(f"• {content}  — {src}")
         total_items = len(all_items)
         start = (page - 1) * per_page
         end = min(start + per_page, total_items)
@@ -541,7 +594,7 @@ async def fetch_search(update, context, text, filter_type=types.InputMessagesFil
         for item in page_items:
             text_output += f"{item}\n"
         text_output += f"\nPage {page}/{max(1, (total_items + per_page - 1) // per_page)}\n"
-        text_output += "Sort by relevance and activity</blockquote>"
+        text_output += "Results include public channels/groups (even if not joined)</blockquote>"
 
         filter_buttons = [
             InlineKeyboardButton("All", callback_data="filter_all"),
@@ -565,9 +618,9 @@ async def fetch_search(update, context, text, filter_type=types.InputMessagesFil
         keyboard = filter_rows + ([nav_buttons] if nav_buttons else []) + [[InlineKeyboardButton("🔄 New Search", callback_data="search"), InlineKeyboardButton("⬅️ Back", callback_data="more")]]
 
         if is_callback:
-            await update.callback_query.edit_message_text(text_output, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
+            await update.callback_query.edit_message_text(text_output, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         else:
-            await update.effective_message.reply_text(text_output, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
+            await update.effective_message.reply_text(text_output, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     except Exception as e:
         error_msg = f"❌ Search failed: {e}"
         if is_callback:
@@ -579,26 +632,35 @@ async def handle_search_pagination(update, context, page):
     query = update.callback_query
     await query.answer()
 
-    results = context.user_data.get('search_results')
-    if not results:
+    result = context.user_data.get('search_results')
+    if not result:
         await query.edit_message_text("No results found.")
         return
 
+    # Build mapping:
+    chat_map = {}
+    if hasattr(result, 'chats') and result.chats:
+        for ch in result.chats:
+            cid = getattr(ch, 'id', None)
+            if cid is not None:
+                chat_map[cid] = ch
+
     per_page = 5
     all_items = []
-    for msg in results.messages:
-        chat_id = getattr(msg, 'chat_id', None) or getattr(msg, 'peer_id', None)
+    for msg in result.messages:
         msg_id = msg.id
-        try:
-            chat = await telethon_client.get_entity(chat_id)
-            if hasattr(chat, 'username') and chat.username:
-                link = f"https://t.me/{chat.username}/{msg_id}"
-            else:
-                link = f"https://t.me/c/{chat.id}/{msg_id}"
-            content = msg.message[:120] if getattr(msg, 'message', None) else f"[{get_media_type(msg)}]"
+        chat_id = extract_msg_chat_id(msg)
+        chat_obj = chat_map.get(chat_id)
+        if chat_obj:
+            link = tg_message_link_from_chat_obj(chat_obj, msg_id)
+        else:
+            link = ""
+        content = (msg.message[:120]) if getattr(msg, 'message', None) else f"[{get_media_type(msg)}]"
+        if link:
             all_items.append(f"🔗 <a href='{link}'>{content}</a>")
-        except:
-            pass
+        else:
+            src = getattr(chat_obj, 'title', None) or getattr(chat_obj, 'username', None) or str(chat_id or "")
+            all_items.append(f"• {content}  — {src}")
 
     total_items = len(all_items)
     start = (page - 1) * per_page
@@ -613,7 +675,7 @@ async def handle_search_pagination(update, context, page):
     for item in page_items:
         text += f"{item}\n"
     text += f"\nPage {page}/{max(1, (total_items + per_page - 1) // per_page)}\n"
-    text += "Sort by relevance and activity</blockquote>"
+    text += "Results include public channels/groups (even if not joined)</blockquote>"
 
     filter_buttons = [
         InlineKeyboardButton("All", callback_data="filter_all"),
@@ -635,7 +697,7 @@ async def handle_search_pagination(update, context, page):
         nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"search_{page+1}"))
 
     keyboard = filter_rows + ([nav_buttons] if nav_buttons else []) + [[InlineKeyboardButton("🔄 New Search", callback_data="search"), InlineKeyboardButton("⬅️ Back", callback_data="more")]]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 # --- STORIES FEATURE ---
 async def display_story(update, context):
@@ -657,10 +719,7 @@ async def display_story(update, context):
         media_file = BytesIO()
         await telethon_client.download_media(story, file=media_file)
         media_file.seek(0)
-        # We cannot directly edit media via CallbackQuery with arbitrary file object in PTB easily;
-        # fallback to edit text with note or send media as a new message (we try edit first)
         try:
-            # Attempt to show as captioned media if possible
             await query.edit_message_text(f"Story {index+1}/{len(stories)} (media file)", reply_markup=InlineKeyboardMarkup(kb))
         except Exception:
             await query.edit_message_text(f"Story {index+1}/{len(stories)} (no media)", reply_markup=InlineKeyboardMarkup(kb))
@@ -669,7 +728,6 @@ async def display_story(update, context):
 
 async def fetch_stories(update, context, entity):
     try:
-        # Try telethon client's get_stories or fallback to GetStoriesRequest
         stories = None
         if hasattr(telethon_client, 'get_stories'):
             try:
@@ -695,7 +753,7 @@ async def fetch_stories(update, context, entity):
     except Exception as e:
         await update.callback_query.edit_message_text(f"❌ Failed to fetch stories: {e}")
 
-# --- OTHER FEATURES ---
+# --- OTHER FEATURES (words, friends, names) ---
 async def perform_words_analysis(update, context, target, limit=20):
     try:
         entity = await telethon_client.get_entity(target)
@@ -921,11 +979,10 @@ async def main():
     print("Bot running...")
     await bot_app.initialize()
     await bot_app.start()
-    # start polling (keeps compatibility)
+    # start polling
     try:
         await bot_app.updater.start_polling()
     except Exception:
-        # fallback (some PTB versions expose run_polling)
         await bot_app.start_polling()
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
     await asyncio.Event().wait()
