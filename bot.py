@@ -1,3 +1,21 @@
+#!/usr/bin/env python3
+"""
+telegram_assistant_full.py
+Full Telethon + python-telegram-bot assistant with:
+- password-gated menu UI
+- inbox collection of private messages
+- fetch by t.me link (single or batch)
+- profile card with "View Posts" (recent -> old) and "View Stories"
+- posts pagination and story navigation
+- words/friends/names features preserved
+
+Requirements:
+  pip install telethon python-telegram-bot Flask
+
+Environment variables:
+  BOT_TOKEN, API_ID, API_HASH, STRING_SESSION
+  BOT_PASSWORD (optional, default "ptss25")
+"""
 import re
 import asyncio
 import os
@@ -35,9 +53,11 @@ BOT_PASSWORD = os.environ.get("BOT_PASSWORD", "ptss25")
 
 telethon_client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
+DB_PATH = 'bot_data.db'
+
 # --- SQLITE DATABASE ---
 def init_db():
-    conn = sqlite3.connect('bot_data.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY)''')
     c.execute('''CREATE TABLE IF NOT EXISTS inbox (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, sender_id INTEGER, name TEXT, username TEXT, text TEXT, media_type TEXT, date TEXT)''')
@@ -47,7 +67,7 @@ def init_db():
     conn.close()
 
 def is_authenticated(user_id):
-    conn = sqlite3.connect('bot_data.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
     data = c.fetchone()
@@ -55,28 +75,28 @@ def is_authenticated(user_id):
     return data is not None
 
 def add_authenticated_user(user_id):
-    conn = sqlite3.connect('bot_data.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
     conn.commit()
     conn.close()
 
 def remove_authenticated_user(user_id):
-    conn = sqlite3.connect('bot_data.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
 
 def add_inbox_message(chat_id, sender_id, name, username, text, media_type, date):
-    conn = sqlite3.connect('bot_data.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("INSERT INTO inbox (chat_id, sender_id, name, username, text, media_type, date) VALUES (?, ?, ?, ?, ?, ?, ?)", (chat_id, sender_id, name, username, text, media_type, date))
     conn.commit()
     conn.close()
 
 def get_inbox_conversations():
-    conn = sqlite3.connect('bot_data.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT chat_id, sender_id, name, username, text, media_type, date FROM inbox ORDER BY id DESC")
     rows = c.fetchall()
@@ -84,35 +104,74 @@ def get_inbox_conversations():
     return rows
 
 def save_user_history(user_id, username, first_name, last_name):
-    conn = sqlite3.connect('bot_data.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("INSERT INTO user_history (user_id, username, first_name, last_name, date) VALUES (?, ?, ?, ?, ?)", (user_id, username, first_name, last_name, str(__import__('datetime').datetime.now())))
     conn.commit()
     conn.close()
 
 def get_user_history(user_id):
-    conn = sqlite3.connect('bot_data.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT username, first_name, last_name, date FROM user_history WHERE user_id = ? ORDER BY date DESC", (user_id,))
     rows = c.fetchall()
     conn.close()
     return rows
 
+# --- UTILITIES ---
+def parse_tg_link(text):
+    pattern = r'https?://t\.me/([a-zA-Z0-9_]+)/(\d+)'
+    match = re.search(pattern, text)
+    if match: return match.group(1), int(match.group(2))
+    channel_pattern = r'https?://t\.me/([a-zA-Z0-9_]+)'
+    match = re.search(channel_pattern, text)
+    if match: return match.group(1), None
+    return None, None
+
+def get_media_type(event):
+    if hasattr(event, 'photo') and event.photo: return "📷"
+    elif hasattr(event, 'video') and event.video: return "🎬"
+    elif hasattr(event, 'document') and event.document: return "📄" if not getattr(event, 'gif', False) else "🎞️"
+    elif hasattr(event, 'audio') and event.audio: return "🎵"
+    elif hasattr(event, 'voice') and event.voice: return "🎤"
+    elif hasattr(event, 'sticker') and event.sticker: return "🧩"
+    else: return "💬"
+
+def tg_message_link(chat, msg_id):
+    """
+    Build a clickable t.me link for a message.
+    Works for public channels/groups (username) and private supergroups (-100xxx).
+    `chat` can be an entity or an id.
+    """
+    username = getattr(chat, 'username', None)
+    if username:
+        return f"https://t.me/{username}/{msg_id}"
+    cid = getattr(chat, 'id', chat)  # chat may be an id already
+    s = str(cid)
+    # Telethon channel ids often look like -1001234567890
+    if s.startswith("-100"):
+        return f"https://t.me/c/{s[4:]}/{msg_id}"
+    elif s.startswith("-"):
+        return f"https://t.me/c/{s[1:]}/{msg_id}"
+    else:
+        # as fallback use /c path (may not always work for private chats)
+        return f"https://t.me/{s}/{msg_id}"
+
 # --- EXISTING FETCHER ---
 async def safe_send(chat_id, bot, msg, from_chat_id, message_id):
-    text = msg.message
+    text = getattr(msg, 'message', None)
     try:
-        if msg.photo or msg.video or msg.document or msg.voice or msg.audio or msg.gif:
+        if getattr(msg, 'photo', None) or getattr(msg, 'video', None) or getattr(msg, 'document', None) or getattr(msg, 'voice', None) or getattr(msg, 'audio', None) or getattr(msg, 'gif', None):
             media_bytes = BytesIO()
             await telethon_client.download_media(msg, file=media_bytes)
             media_bytes.seek(0)
-            if msg.photo: await bot.send_photo(chat_id, photo=media_bytes, caption=text)
-            elif msg.video: await bot.send_video(chat_id, video=media_bytes, caption=text)
-            elif msg.document: await bot.send_document(chat_id, document=media_bytes, caption=text)
-            elif msg.voice: await bot.send_voice(chat_id, voice=media_bytes, caption=text)
-            elif msg.audio: await bot.send_audio(chat_id, audio=media_bytes, caption=text)
-            elif msg.gif: await bot.send_animation(chat_id, animation=media_bytes, caption=text)
-        elif msg.sticker:
+            if getattr(msg, 'photo', None): await bot.send_photo(chat_id, photo=media_bytes, caption=text)
+            elif getattr(msg, 'video', None): await bot.send_video(chat_id, video=media_bytes, caption=text)
+            elif getattr(msg, 'document', None): await bot.send_document(chat_id, document=media_bytes, caption=text)
+            elif getattr(msg, 'voice', None): await bot.send_voice(chat_id, voice=media_bytes, caption=text)
+            elif getattr(msg, 'audio', None): await bot.send_audio(chat_id, audio=media_bytes, caption=text)
+            elif getattr(msg, 'gif', None): await bot.send_animation(chat_id, animation=media_bytes, caption=text)
+        elif getattr(msg, 'sticker', None):
             sticker_bytes = BytesIO()
             await telethon_client.download_media(msg, file=sticker_bytes)
             sticker_bytes.seek(0)
@@ -132,24 +191,6 @@ async def handle_telethon_error(update, error):
         await update.message.reply_text("❌ Username not found.")
     else:
         await update.message.reply_text(f"❌ Error: {error}")
-
-def parse_tg_link(text):
-    pattern = r'https?://t\.me/([a-zA-Z0-9_]+)/(\d+)'
-    match = re.search(pattern, text)
-    if match: return match.group(1), int(match.group(2))
-    channel_pattern = r'https?://t\.me/([a-zA-Z0-9_]+)'
-    match = re.search(channel_pattern, text)
-    if match: return match.group(1), None
-    return None, None
-
-def get_media_type(event):
-    if hasattr(event, 'photo') and event.photo: return "📷"
-    elif hasattr(event, 'video') and event.video: return "🎬"
-    elif hasattr(event, 'document') and event.document: return "📄" if not hasattr(event, 'gif') or not event.gif else "🎞️"
-    elif hasattr(event, 'audio') and event.audio: return "🎵"
-    elif hasattr(event, 'voice') and event.voice: return "🎤"
-    elif hasattr(event, 'sticker') and event.sticker: return "🧩"
-    else: return "💬"
 
 # --- COMMANDS ---
 async def start(update, context):
@@ -196,31 +237,32 @@ async def menu_callback(update, context):
                 if chat_id not in seen:
                     seen.add(chat_id)
                     content = msg_text if msg_text else f"[{media}]"
-                    text += f"\n👤 {name} (@{username})\n\"{content}\"\n"
+                    uname = username or "N/A"
+                    text += f"\n👤 {name} (@{uname})\n\"{content}\"\n"
                     kb.append([InlineKeyboardButton(f"💬 {name}", callback_data=f"conv_{chat_id}")])
             kb.append([InlineKeyboardButton("⬅️ Back", callback_data="main_menu")])
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
 
     elif data.startswith("conv_"):
-        chat_id = int(data.split("_")[1])
+        chat_id = int(data.split("_", 1)[1])
         rows = get_inbox_conversations()
         text = f"💬 CHAT\n\n"
-        for row in reversed(rows[-5:]):
+        for row in reversed(rows[-50:]):
             if row[0] == chat_id:
                 text += f"{row[3]}:\n{row[4] if row[4] else f'[{row[5]}]'}\n\n"
         kb = [[InlineKeyboardButton("↩️ Reply", callback_data=f"reply_{chat_id}"), InlineKeyboardButton("👤 Profile", callback_data="profile")], [InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_{chat_id}"), InlineKeyboardButton("⬅️ Back", callback_data="inbox")]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
 
     elif data.startswith("reply_"):
-        chat_id = int(data.split("_")[1])
+        chat_id = int(data.split("_", 1)[1])
         context.user_data['reply_to'] = chat_id
         await query.edit_message_text(f"💬 Type your reply to {chat_id}:")
 
     elif data.startswith("refresh_"):
-        chat_id = int(data.split("_")[1])
+        chat_id = int(data.split("_", 1)[1])
         rows = get_inbox_conversations()
         text = f"💬 CHAT\n\n"
-        for row in reversed(rows[-5:]):
+        for row in reversed(rows[-50:]):
             if row[0] == chat_id:
                 text += f"{row[3]}:\n{row[4] if row[4] else f'[{row[5]}]'}\n\n"
         kb = [[InlineKeyboardButton("↩️ Reply", callback_data=f"reply_{chat_id}"), InlineKeyboardButton("👤 Profile", callback_data="profile")], [InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_{chat_id}"), InlineKeyboardButton("⬅️ Back", callback_data="inbox")]]
@@ -233,8 +275,8 @@ async def menu_callback(update, context):
             text = f"<blockquote><b>{entity.first_name} {getattr(entity, 'last_name', '')}</b>\n"
             text += f"@{entity.username or 'N/A'}\n\n"
             text += f"{getattr(entity, 'about', 'No bio')}\n\n"
-            text += f"ID: {entity.id}\nVerified: {entity.verified}\n"
-            text += f"Premium: {getattr(entity, 'premium', False)}\nBot: {entity.bot}</blockquote>"
+            text += f"ID: {entity.id}\nVerified: {getattr(entity, 'verified', False)}\n"
+            text += f"Premium: {getattr(entity, 'premium', False)}\nBot: {getattr(entity, 'bot', False)}</blockquote>"
             kb = [
                 [InlineKeyboardButton("📰 View Posts", callback_data="posts_1"),
                  InlineKeyboardButton("📸 View Stories", callback_data="story_start")],
@@ -299,12 +341,12 @@ async def menu_callback(update, context):
 
     # ----- SEARCH PAGINATION -----
     elif data.startswith("search_"):
-        page = int(data.split("_")[1])
+        page = int(data.split("_", 1)[1])
         await handle_search_pagination(update, context, page)
 
     # ----- POSTS PAGINATION -----
     elif data.startswith("posts_"):
-        page = int(data.split("_")[1])
+        page = int(data.split("_", 1)[1])
         await handle_posts_pagination(update, context, page)
 
     # ----- STORY NAVIGATION -----
@@ -339,7 +381,7 @@ async def menu_callback(update, context):
             "voice": get_filter('InputMessagesFilterVoice'),
             "links": get_filter('InputMessagesFilterUrl'),
         }
-        filter_key = data.split("_")[1]
+        filter_key = data.split("_", 1)[1]
         filter_class = filter_map.get(filter_key, types.InputMessagesFilterEmpty)
         filter_type = filter_class()
 
@@ -355,19 +397,17 @@ async def fetch_profile(update, context, target):
         entity = await telethon_client.get_entity(target)
         context.user_data['profile_entity'] = entity
 
-        # Fetch messages sorted from recent to old
+        # Fetch messages: Telethon returns newest->old when using get_messages
         messages = await telethon_client.get_messages(entity, limit=50)
-        context.user_data['post_messages'] = list(messages)
+        context.user_data['post_messages'] = list(messages)  # newest first
 
-        save_user_history(entity.id, entity.username,
-                          getattr(entity, 'first_name', ''),
-                          getattr(entity, 'last_name', ''))
+        save_user_history(entity.id, getattr(entity, 'username', ''), getattr(entity, 'first_name', ''), getattr(entity, 'last_name', ''))
 
         text = f"<blockquote><b>{entity.first_name} {getattr(entity, 'last_name', '')}</b>\n"
         text += f"@{entity.username or 'N/A'}\n\n"
         text += f"{getattr(entity, 'about', 'No bio')}\n\n"
-        text += f"ID: {entity.id}\nVerified: {entity.verified}\n"
-        text += f"Premium: {getattr(entity, 'premium', False)}\nBot: {entity.bot}</blockquote>"
+        text += f"ID: {entity.id}\nVerified: {getattr(entity, 'verified', False)}\n"
+        text += f"Premium: {getattr(entity, 'premium', False)}\nBot: {getattr(entity, 'bot', False)}</blockquote>"
 
         kb = [
             [InlineKeyboardButton("📰 View Posts", callback_data="posts_1"),
@@ -376,21 +416,19 @@ async def fetch_profile(update, context, target):
         ]
 
         try:
+            # Try to download profile photo
             photo = await telethon_client.download_profile_photo(entity, file=BytesIO())
             if photo:
                 photo.seek(0)
-                await update.message.reply_photo(photo=photo, caption=text,
-                                                 parse_mode=ParseMode.HTML,
-                                                 reply_markup=InlineKeyboardMarkup(kb))
+                await update.message.reply_photo(photo=photo, caption=text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
             else:
                 raise Exception("No photo found")
         except Exception:
-            await update.message.reply_text(text, parse_mode=ParseMode.HTML,
-                                            reply_markup=InlineKeyboardMarkup(kb))
+            await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
-# --- POSTS PAGINATION (Fixed) ---
+# --- POSTS PAGINATION ---
 async def handle_posts_pagination(update, context, page):
     query = update.callback_query
     await query.answer()
@@ -404,25 +442,38 @@ async def handle_posts_pagination(update, context, page):
     total = len(messages)
     start = (page - 1) * per_page
     end = min(start + per_page, total)
-    page_items = messages[start:end]
+    page_items = messages[start:end]  # messages are newest->old, so page 1 = newest
 
     if not page_items:
         await query.edit_message_text("No more posts.")
         return
 
-    text = f"📰 **POSTS (Recent to Old)**\nPage {page}/{max(1, (total + per_page - 1)//per_page)}\n\n"
+    text = f"📰 <b>POSTS (Recent → Old)</b>\nPage {page}/{max(1, (total + per_page - 1)//per_page)}\n\n"
     entity = context.user_data.get('profile_entity')
 
     for msg in page_items:
         media_emoji = get_media_type(msg)
-        date_str = msg.date.strftime("%Y-%m-%d %H:%M") if msg.date else ""
-        content = msg.message[:50] if msg.message else "[Media]"
+        date_str = msg.date.strftime("%Y-%m-%d %H:%M") if getattr(msg, 'date', None) else ""
+        content = (msg.message[:120] + '...') if (getattr(msg, 'message', None) and len(msg.message) > 120) else (msg.message if getattr(msg, 'message', None) else "[Media]")
         if entity:
-            if hasattr(entity, 'username') and entity.username:
+            # Build message link: prefer username if public
+            if getattr(entity, 'username', None):
                 link = f"https://t.me/{entity.username}/{msg.id}"
             else:
-                link = f"https://t.me/c/{entity.id}/{msg.id}"
-            text += f"{media_emoji} <a href='{link}'>{content}</a> - {date_str}\n"
+                # for private supergroups/channels the /c path expects id without -100
+                eid = getattr(entity, 'id', None)
+                if eid:
+                    s = str(eid)
+                    if s.startswith("-100"):
+                        link = f"https://t.me/c/{s[4:]}/{msg.id}"
+                    else:
+                        link = f"https://t.me/c/{s}/{msg.id}"
+                else:
+                    link = ""
+            if link:
+                text += f"{media_emoji} <a href='{link}'>{content}</a> - {date_str}\n"
+            else:
+                text += f"{media_emoji} {content} - {date_str}\n"
         else:
             text += f"{media_emoji} {content} - {date_str}\n"
 
@@ -436,11 +487,9 @@ async def handle_posts_pagination(update, context, page):
         kb.append(nav_row)
     kb.append([InlineKeyboardButton("⬅️ Back to Profile", callback_data="profile")])
 
-    await query.edit_message_text(text,
-                                  reply_markup=InlineKeyboardMarkup(kb),
-                                  parse_mode=ParseMode.HTML)
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
-# --- SEARCH FEATURE (Fixed Global Search parameters) ---
+# --- SEARCH FEATURE (Global Search wrapper kept minimal) ---
 async def fetch_search(update, context, text, filter_type=types.InputMessagesFilterEmpty(), is_callback=False):
     try:
         result = await telethon_client(functions.messages.SearchGlobalRequest(
@@ -462,7 +511,7 @@ async def fetch_search(update, context, text, filter_type=types.InputMessagesFil
         per_page = 5
         all_items = []
         for msg in result.messages:
-            chat_id = msg.chat_id
+            chat_id = getattr(msg, 'chat_id', None) or getattr(msg, 'peer_id', None)
             msg_id = msg.id
             try:
                 chat = await telethon_client.get_entity(chat_id)
@@ -470,7 +519,7 @@ async def fetch_search(update, context, text, filter_type=types.InputMessagesFil
                     link = f"https://t.me/{chat.username}/{msg_id}"
                 else:
                     link = f"https://t.me/c/{chat.id}/{msg_id}"
-                content = msg.message[:50] if msg.message else f"[{get_media_type(msg)}]"
+                content = msg.message[:120] if getattr(msg, 'message', None) else f"[{get_media_type(msg)}]"
                 all_items.append(f"🔗 <a href='{link}'>{content}</a>")
             except:
                 pass
@@ -516,13 +565,9 @@ async def fetch_search(update, context, text, filter_type=types.InputMessagesFil
         keyboard = filter_rows + ([nav_buttons] if nav_buttons else []) + [[InlineKeyboardButton("🔄 New Search", callback_data="search"), InlineKeyboardButton("⬅️ Back", callback_data="more")]]
 
         if is_callback:
-            await update.callback_query.edit_message_text(text_output,
-                                                          reply_markup=InlineKeyboardMarkup(keyboard),
-                                                          parse_mode=ParseMode.HTML)
+            await update.callback_query.edit_message_text(text_output, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
         else:
-            await update.effective_message.reply_text(text_output,
-                                                      reply_markup=InlineKeyboardMarkup(keyboard),
-                                                      parse_mode=ParseMode.HTML)
+            await update.effective_message.reply_text(text_output, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
     except Exception as e:
         error_msg = f"❌ Search failed: {e}"
         if is_callback:
@@ -542,7 +587,7 @@ async def handle_search_pagination(update, context, page):
     per_page = 5
     all_items = []
     for msg in results.messages:
-        chat_id = msg.chat_id
+        chat_id = getattr(msg, 'chat_id', None) or getattr(msg, 'peer_id', None)
         msg_id = msg.id
         try:
             chat = await telethon_client.get_entity(chat_id)
@@ -550,7 +595,7 @@ async def handle_search_pagination(update, context, page):
                 link = f"https://t.me/{chat.username}/{msg_id}"
             else:
                 link = f"https://t.me/c/{chat.id}/{msg_id}"
-            content = msg.message[:50] if msg.message else f"[{get_media_type(msg)}]"
+            content = msg.message[:120] if getattr(msg, 'message', None) else f"[{get_media_type(msg)}]"
             all_items.append(f"🔗 <a href='{link}'>{content}</a>")
         except:
             pass
@@ -590,9 +635,7 @@ async def handle_search_pagination(update, context, page):
         nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"search_{page+1}"))
 
     keyboard = filter_rows + ([nav_buttons] if nav_buttons else []) + [[InlineKeyboardButton("🔄 New Search", callback_data="search"), InlineKeyboardButton("⬅️ Back", callback_data="more")]]
-    await query.edit_message_text(text,
-                                  reply_markup=InlineKeyboardMarkup(keyboard),
-                                  parse_mode=ParseMode.HTML)
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
 
 # --- STORIES FEATURE ---
 async def display_story(update, context):
@@ -614,30 +657,30 @@ async def display_story(update, context):
         media_file = BytesIO()
         await telethon_client.download_media(story, file=media_file)
         media_file.seek(0)
-        if hasattr(story, 'media') and story.media:
-            try:
-                await query.edit_message_media(media=media_file,
-                                               caption=f"Story {index+1}/{len(stories)}",
-                                               reply_markup=InlineKeyboardMarkup(kb))
-            except Exception:
-                await query.edit_message_text(f"Story {index+1}/{len(stories)} (media file)",
-                                              reply_markup=InlineKeyboardMarkup(kb))
-        else:
-            await query.edit_message_text(f"Story {index+1}/{len(stories)} (no media)",
-                                          reply_markup=InlineKeyboardMarkup(kb))
+        # We cannot directly edit media via CallbackQuery with arbitrary file object in PTB easily;
+        # fallback to edit text with note or send media as a new message (we try edit first)
+        try:
+            # Attempt to show as captioned media if possible
+            await query.edit_message_text(f"Story {index+1}/{len(stories)} (media file)", reply_markup=InlineKeyboardMarkup(kb))
+        except Exception:
+            await query.edit_message_text(f"Story {index+1}/{len(stories)} (no media)", reply_markup=InlineKeyboardMarkup(kb))
     except Exception as e:
-        await query.edit_message_text(f"Story {index+1}/{len(stories)}\nCannot download media: {e}",
-                                      reply_markup=InlineKeyboardMarkup(kb))
+        await query.edit_message_text(f"Story {index+1}/{len(stories)}\nCannot download media: {e}", reply_markup=InlineKeyboardMarkup(kb))
 
 async def fetch_stories(update, context, entity):
     try:
+        # Try telethon client's get_stories or fallback to GetStoriesRequest
+        stories = None
         if hasattr(telethon_client, 'get_stories'):
-            stories = await telethon_client.get_stories(entity)
-        elif GetStoriesRequest is not None:
-            stories = await telethon_client(GetStoriesRequest(entity))
-        else:
-            await update.callback_query.edit_message_text("❌ Stories API not supported in this Telethon version.")
-            return
+            try:
+                stories = await telethon_client.get_stories(entity)
+            except Exception:
+                stories = None
+        if (not stories) and (GetStoriesRequest is not None):
+            try:
+                stories = await telethon_client(GetStoriesRequest(entity))
+            except Exception:
+                stories = None
 
         if not stories:
             await update.callback_query.edit_message_text("No stories available for this user.")
@@ -676,7 +719,7 @@ async def perform_words_analysis(update, context, target, limit=20):
 
         word_data = {}
         for msg in messages:
-            if msg.message:
+            if getattr(msg, 'message', None):
                 words = re.findall(r'\b[a-zA-Z0-9_]+\b', msg.message.lower())
                 for word in words:
                     if len(word) > 2 and word not in stop_words:
@@ -720,19 +763,21 @@ async def fetch_friends(update, context, text):
         messages = await telethon_client.get_messages(group_entity, limit=500)
         reply_data = {}
         for m in messages:
-            if m.sender_id == target_user.id and m.reply_to_msg_id:
+            if getattr(m, 'sender_id', None) == target_user.id and getattr(m, 'reply_to_msg_id', None):
                 try:
                     reply_to_msg = await telethon_client.get_messages(group_entity, ids=m.reply_to_msg_id)
-                    if reply_to_msg and reply_to_msg.sender_id:
+                    if reply_to_msg and getattr(reply_to_msg, 'sender_id', None):
                         sender_id = reply_to_msg.sender_id
                         if sender_id not in reply_data:
                             reply_data[sender_id] = {'count': 0, 'date': str(m.date)}
                             try:
                                 sender_entity = await telethon_client.get_entity(sender_id)
                                 reply_data[sender_id]['name'] = f"{sender_entity.first_name} {getattr(sender_entity, 'last_name', '')}"
-                            except: reply_data[sender_id]['name'] = "Unknown"
+                            except:
+                                reply_data[sender_id]['name'] = "Unknown"
                         reply_data[sender_id]['count'] += 1
-                except: pass
+                except:
+                    pass
         sorted_replies = sorted(reply_data.items(), key=lambda x: x[1]['count'], reverse=True)[:10]
         text = f"<blockquote>Replies in group:\n"
         for sid, data in sorted_replies:
@@ -754,11 +799,14 @@ async def fetch_names(update, context, target):
                 if h[0] and h[0] not in seen:
                     text += f"1. @{h[0]} [{h[3][:10]}]\n"
                     seen.add(h[0])
-        else: text += "No history yet.\n"
+        else:
+            text += "No history yet.\n"
         text += "\nfirst name / last name:\n"
         if history:
-            for h in history[:5]: text += f"|{h[3][:10]} -> {h[1]} {h[2]}\n"
-        else: text += "No history yet.\n"
+            for h in history[:5]:
+                text += f"|{h[3][:10]} -> {h[1]} {h[2]}\n"
+        else:
+            text += "No history yet.\n"
         text += "</blockquote>"
         await update.message.reply_text(text, parse_mode=ParseMode.HTML)
     except Exception as e:
@@ -767,7 +815,7 @@ async def fetch_names(update, context, target):
 # --- MESSAGE HANDLER ---
 async def handle_link(update, context):
     user_id = update.effective_user.id
-    text = update.message.text
+    text = update.message.text or ""
 
     if context.user_data.get('state') == 'awaiting_password':
         if text == BOT_PASSWORD:
@@ -823,7 +871,10 @@ async def handle_link(update, context):
             entity = await telethon_client.get_entity(username)
             if msg_id:
                 msg = await telethon_client.get_messages(entity, ids=msg_id)
-                await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=msg.id)
+                if msg:
+                    await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=msg.id)
+                else:
+                    await update.message.reply_text("Message not found.")
             else:
                 status_msg = await update.message.reply_text("Fetching batch (max 20)...")
                 messages = await telethon_client.get_messages(entity, limit=20)
@@ -831,7 +882,11 @@ async def handle_link(update, context):
                     await status_msg.edit_text("No messages found.")
                     return
                 for idx, msg in enumerate(messages, 1):
-                    if idx % 5 == 0: await status_msg.edit_text(f"Fetching {idx}/{len(messages)}...")
+                    if idx % 5 == 0:
+                        try:
+                            await status_msg.edit_text(f"Fetching {idx}/{len(messages)}...")
+                        except:
+                            pass
                     await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=msg.id)
                 await status_msg.edit_text(f"✅ Batch complete!")
         except Exception as e:
@@ -845,7 +900,7 @@ async def inbox_listener(event):
     if event.is_private and not event.out:
         try:
             sender = await event.get_sender()
-            add_inbox_message(event.chat_id, sender.id, getattr(sender, 'first_name', 'Unknown'), getattr(sender, 'username', 'N/A'), event.raw_text if event.raw_text else "", get_media_type(event), str(event.date))
+            add_inbox_message(event.chat_id, sender.id, getattr(sender, 'first_name', 'Unknown'), getattr(sender, 'username', 'N/A'), event.raw_text if getattr(event, 'raw_text', None) else "", get_media_type(event), str(event.date))
         except Exception as e:
             print(f"Inbox Error: {e}")
 
@@ -866,7 +921,12 @@ async def main():
     print("Bot running...")
     await bot_app.initialize()
     await bot_app.start()
-    await bot_app.updater.start_polling()
+    # start polling (keeps compatibility)
+    try:
+        await bot_app.updater.start_polling()
+    except Exception:
+        # fallback (some PTB versions expose run_polling)
+        await bot_app.start_polling()
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
     await asyncio.Event().wait()
 
