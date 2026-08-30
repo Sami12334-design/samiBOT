@@ -1,3 +1,22 @@
+#!/usr/bin/env python3
+"""
+telegram_assistant_resilient_search.py
+
+Features:
+- Menu UI, inbox, fetch-by-link, profile card, view posts/stories (preserved)
+- Robust global search that returns clickable links for public channels/groups (even if not joined)
+  using multiple fallbacks and careful chat-id normalization.
+- Profile resolution and "View Posts" resilient: tries get_entity, then uses cached search chat objects
+  (with access_hash) to read messages from public channels without joining.
+
+Requirements:
+  pip install telethon python-telegram-bot Flask
+
+Environment variables:
+  BOT_TOKEN, API_ID, API_HASH, STRING_SESSION
+  BOT_PASSWORD (optional, default "ptss25")
+"""
+
 import re
 import asyncio
 import os
