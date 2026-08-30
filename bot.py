@@ -13,7 +13,7 @@ from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, UsernameNotOccupiedError
 from telethon.tl import types
 
-# --- STORIES FIX ---
+# --- STORIES FIX: try both methods ---
 try:
     from telethon.tl.functions.stories import GetStoriesRequest
 except ImportError:
@@ -277,7 +277,7 @@ async def menu_callback(update, context):
     # ----- OTHER FEATURES (prompt for input) -----
     elif data in ["search", "stats", "track", "names", "groups", "messages", "analysis", "channels", "rep", "friends", "reactions", "gifts", "share", "words", "common"]:
         prompts = {
-            "search": ("🔎 SEARCH", "Enter any keyword to search globally:\nExample: logic exam or wcu freshman"),
+            "search": ("🔎 SEARCH", "Enter any keyword to search globally across channels/groups:\nExample: python or technology"),
             "stats": ("📊 STATISTICS", "Enter target username/ID or chat link:"),
             "track": ("🔔 TRACK", "Enter target username/ID to track:"),
             "names": ("🔗 NAMES", "Enter target username/ID:"),
@@ -355,8 +355,9 @@ async def fetch_profile(update, context, target):
         entity = await telethon_client.get_entity(target)
         context.user_data['profile_entity'] = entity
 
+        # Fetch messages sorted from recent to old
         messages = await telethon_client.get_messages(entity, limit=50)
-        context.user_data['post_messages'] = messages
+        context.user_data['post_messages'] = list(messages)
 
         save_user_history(entity.id, entity.username,
                           getattr(entity, 'first_name', ''),
@@ -376,24 +377,27 @@ async def fetch_profile(update, context, target):
 
         try:
             photo = await telethon_client.download_profile_photo(entity, file=BytesIO())
-            photo.seek(0)
-            await update.message.reply_photo(photo=photo, caption=text,
-                                             parse_mode=ParseMode.HTML,
-                                             reply_markup=InlineKeyboardMarkup(kb))
+            if photo:
+                photo.seek(0)
+                await update.message.reply_photo(photo=photo, caption=text,
+                                                 parse_mode=ParseMode.HTML,
+                                                 reply_markup=InlineKeyboardMarkup(kb))
+            else:
+                raise Exception("No photo found")
         except Exception:
             await update.message.reply_text(text, parse_mode=ParseMode.HTML,
                                             reply_markup=InlineKeyboardMarkup(kb))
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
-# --- POSTS PAGINATION ---
+# --- POSTS PAGINATION (Fixed) ---
 async def handle_posts_pagination(update, context, page):
     query = update.callback_query
     await query.answer()
 
     messages = context.user_data.get('post_messages')
     if not messages:
-        await query.edit_message_text("No posts found.")
+        await query.edit_message_text("No posts found. Please load profile first.")
         return
 
     per_page = 5
@@ -406,12 +410,12 @@ async def handle_posts_pagination(update, context, page):
         await query.edit_message_text("No more posts.")
         return
 
-    text = f"📰 **POSTS**\nPage {page}/{max(1, (total + per_page - 1)//per_page)}\n\n"
+    text = f"📰 **POSTS (Recent to Old)**\nPage {page}/{max(1, (total + per_page - 1)//per_page)}\n\n"
     entity = context.user_data.get('profile_entity')
 
     for msg in page_items:
         media_emoji = get_media_type(msg)
-        date_str = msg.date.strftime("%Y-%m-%d %H:%M")
+        date_str = msg.date.strftime("%Y-%m-%d %H:%M") if msg.date else ""
         content = msg.message[:50] if msg.message else "[Media]"
         if entity:
             if hasattr(entity, 'username') and entity.username:
@@ -423,45 +427,32 @@ async def handle_posts_pagination(update, context, page):
             text += f"{media_emoji} {content} - {date_str}\n"
 
     kb = []
+    nav_row = []
     if page > 1:
-        kb.append([InlineKeyboardButton("⬅️ Previous", callback_data=f"posts_{page-1}")])
+        nav_row.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"posts_{page-1}"))
     if end < total:
-        kb.append([InlineKeyboardButton("Next ➡️", callback_data=f"posts_{page+1}")])
+        nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"posts_{page+1}"))
+    if nav_row:
+        kb.append(nav_row)
     kb.append([InlineKeyboardButton("⬅️ Back to Profile", callback_data="profile")])
 
     await query.edit_message_text(text,
                                   reply_markup=InlineKeyboardMarkup(kb),
                                   parse_mode=ParseMode.HTML)
 
-# --- SEARCH FEATURE (FIXED) ---
+# --- SEARCH FEATURE (Fixed Global Search parameters) ---
 async def fetch_search(update, context, text, filter_type=types.InputMessagesFilterEmpty(), is_callback=False):
     try:
-        # Use SearchGlobalRequest (works for public channels)
         result = await telethon_client(functions.messages.SearchGlobalRequest(
             q=text,
             filter=filter_type,
-            min_date=0,
-            max_date=0,
+            min_date=None,
+            max_date=None,
             offset_rate=0,
             offset_peer=types.InputPeerEmpty(),
             offset_id=0,
             limit=50
         ))
-        # If no results, try SearchRequest with InputPeerEmpty (sometimes more reliable)
-        if not result.messages:
-            result = await telethon_client(functions.messages.SearchRequest(
-                peer=types.InputPeerEmpty(),
-                q=text,
-                filter=filter_type,
-                min_date=0,
-                max_date=0,
-                offset_id=0,
-                add_offset=0,
-                limit=50,
-                max_id=0,
-                min_id=0,
-                hash=0
-            ))
         context.user_data['search_results'] = result
         context.user_data['search_query'] = text
         context.user_data['search_filter'] = filter_type
@@ -490,20 +481,19 @@ async def fetch_search(update, context, text, filter_type=types.InputMessagesFil
         page_items = all_items[start:end]
 
         if not page_items:
-            msg_text = "No results found."
+            msg_text = "No search results found globally."
             if is_callback:
                 await update.callback_query.edit_message_text(msg_text)
             else:
                 await update.effective_message.reply_text(msg_text)
             return
 
-        text_output = f"<blockquote><b>{text}</b>\n\n"
+        text_output = f"<blockquote><b>Search: {text}</b>\n\n"
         for item in page_items:
             text_output += f"{item}\n"
         text_output += f"\nPage {page}/{max(1, (total_items + per_page - 1) // per_page)}\n"
         text_output += "Sort by relevance and activity</blockquote>"
 
-        # Filter buttons
         filter_buttons = [
             InlineKeyboardButton("All", callback_data="filter_all"),
             InlineKeyboardButton("Posts", callback_data="filter_posts"),
@@ -522,10 +512,8 @@ async def fetch_search(update, context, text, filter_type=types.InputMessagesFil
             nav_buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"search_{page-1}"))
         if end < total_items:
             nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"search_{page+1}"))
-        nav_buttons.append(InlineKeyboardButton("🔄 New Search", callback_data="search"))
-        nav_buttons.append(InlineKeyboardButton("⬅️ Back", callback_data="more"))
-
-        keyboard = filter_rows + [nav_buttons]
+        
+        keyboard = filter_rows + ([nav_buttons] if nav_buttons else []) + [[InlineKeyboardButton("🔄 New Search", callback_data="search"), InlineKeyboardButton("⬅️ Back", callback_data="more")]]
 
         if is_callback:
             await update.callback_query.edit_message_text(text_output,
@@ -576,7 +564,7 @@ async def handle_search_pagination(update, context, page):
         await query.edit_message_text("No more results.")
         return
 
-    text = f"<blockquote><b>{context.user_data.get('search_query', '')}</b>\n\n"
+    text = f"<blockquote><b>Search: {context.user_data.get('search_query', '')}</b>\n\n"
     for item in page_items:
         text += f"{item}\n"
     text += f"\nPage {page}/{max(1, (total_items + per_page - 1) // per_page)}\n"
@@ -600,15 +588,13 @@ async def handle_search_pagination(update, context, page):
         nav_buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"search_{page-1}"))
     if end < total_items:
         nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"search_{page+1}"))
-    nav_buttons.append(InlineKeyboardButton("🔄 New Search", callback_data="search"))
-    nav_buttons.append(InlineKeyboardButton("⬅️ Back", callback_data="more"))
 
-    keyboard = filter_rows + [nav_buttons]
+    keyboard = filter_rows + ([nav_buttons] if nav_buttons else []) + [[InlineKeyboardButton("🔄 New Search", callback_data="search"), InlineKeyboardButton("⬅️ Back", callback_data="more")]]
     await query.edit_message_text(text,
                                   reply_markup=InlineKeyboardMarkup(keyboard),
                                   parse_mode=ParseMode.HTML)
 
-# --- STORIES FEATURE (FIXED) ---
+# --- STORIES FEATURE ---
 async def display_story(update, context):
     query = update.callback_query
     stories = context.user_data.get('stories_list')
@@ -625,18 +611,19 @@ async def display_story(update, context):
         [InlineKeyboardButton("⬅️ Back to Profile", callback_data="profile")]
     ]
     try:
-        # Download story media
         media_file = BytesIO()
         await telethon_client.download_media(story, file=media_file)
         media_file.seek(0)
-        # Try to send as photo or video, else as document
-        try:
-            await query.edit_message_media(media=media_file,
-                                           caption=f"Story {index+1}/{len(stories)}",
-                                           reply_markup=InlineKeyboardMarkup(kb))
-        except Exception:
-            # Fallback: send as document
-            await query.edit_message_text(f"Story {index+1}/{len(stories)} (media file)",
+        if hasattr(story, 'media') and story.media:
+            try:
+                await query.edit_message_media(media=media_file,
+                                               caption=f"Story {index+1}/{len(stories)}",
+                                               reply_markup=InlineKeyboardMarkup(kb))
+            except Exception:
+                await query.edit_message_text(f"Story {index+1}/{len(stories)} (media file)",
+                                              reply_markup=InlineKeyboardMarkup(kb))
+        else:
+            await query.edit_message_text(f"Story {index+1}/{len(stories)} (no media)",
                                           reply_markup=InlineKeyboardMarkup(kb))
     except Exception as e:
         await query.edit_message_text(f"Story {index+1}/{len(stories)}\nCannot download media: {e}",
@@ -644,28 +631,28 @@ async def display_story(update, context):
 
 async def fetch_stories(update, context, entity):
     try:
-        # Try modern method first
         if hasattr(telethon_client, 'get_stories'):
             stories = await telethon_client.get_stories(entity)
         elif GetStoriesRequest is not None:
             stories = await telethon_client(GetStoriesRequest(entity))
         else:
-            await update.message.reply_text("❌ Stories API not supported in this Telethon version.")
+            await update.callback_query.edit_message_text("❌ Stories API not supported in this Telethon version.")
             return
 
         if not stories:
-            await update.message.reply_text("No stories available for this user.")
+            await update.callback_query.edit_message_text("No stories available for this user.")
             return
 
         context.user_data['story_entity'] = entity
         context.user_data['stories_list'] = stories
         context.user_data['story_index'] = 0
+
         await display_story(update, context)
 
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed to fetch stories: {e}")
+        await update.callback_query.edit_message_text(f"❌ Failed to fetch stories: {e}")
 
-# --- OTHER FEATURES (WORDS, FRIENDS, NAMES) ---
+# --- OTHER FEATURES ---
 async def perform_words_analysis(update, context, target, limit=20):
     try:
         entity = await telethon_client.get_entity(target)
@@ -699,20 +686,17 @@ async def perform_words_analysis(update, context, target, limit=20):
                         word_data[word]['messages'].add(msg.id)
 
         if not word_data:
-            await update.message.reply_text("No meaningful words found (maybe only stop words).")
+            await update.message.reply_text("No meaningful words found.")
             return
 
         sorted_words = sorted(word_data.items(), key=lambda x: x[1]['count'], reverse=True)[:limit]
 
-        text = f"<blockquote>RIGID M (@{entity.username}) often uses these words:\n"
+        text = f"<blockquote>RIGID M (@{getattr(entity, 'username', 'N/A')}) often uses these words:\n"
         for word, data in sorted_words:
             text += f"-{len(data['messages'])} - {data['count']} {word}\n"
         text += "</blockquote>"
 
         kb = [[
-            InlineKeyboardButton("⬅️ Less Words", callback_data="words_less"),
-            InlineKeyboardButton("More Words ➡️", callback_data="words_more")
-        ], [
             InlineKeyboardButton("⬅️ Back", callback_data="more")
         ]]
 
@@ -750,9 +734,9 @@ async def fetch_friends(update, context, text):
                         reply_data[sender_id]['count'] += 1
                 except: pass
         sorted_replies = sorted(reply_data.items(), key=lambda x: x[1]['count'], reverse=True)[:10]
-        text = f"<blockquote>Replies them in the groups:\nwhen - to whom (total times)\n"
+        text = f"<blockquote>Replies in group:\n"
         for sid, data in sorted_replies:
-            text += f"|{data['date'][:5]} - {data['name']} ({data['count']})\n"
+            text += f"|{data['date'][:10]} - {data['name']} ({data['count']})\n"
         text += "</blockquote>"
         await update.message.reply_text(text, parse_mode=ParseMode.HTML)
     except Exception as e:
@@ -761,9 +745,9 @@ async def fetch_friends(update, context, text):
 async def fetch_names(update, context, target):
     try:
         entity = await telethon_client.get_entity(target)
-        save_user_history(entity.id, entity.username, getattr(entity, 'first_name', ''), getattr(entity, 'last_name', ''))
+        save_user_history(entity.id, getattr(entity, 'username', ''), getattr(entity, 'first_name', ''), getattr(entity, 'last_name', ''))
         history = get_user_history(entity.id)
-        text = f"<blockquote>Names history {entity.first_name} (@{entity.username}):\n\nusernames:\n"
+        text = f"<blockquote>Names history {entity.first_name} (@{getattr(entity, 'username', 'N/A')}):\n\nusernames:\n"
         if history:
             seen = set()
             for h in history:
@@ -821,14 +805,13 @@ async def handle_link(update, context):
             await fetch_profile(update, context, text)
         elif state == 'search':
             context.user_data['search_query'] = text
-            await fetch_search(update, context, text)   # is_callback=False
+            await fetch_search(update, context, text)
         elif state == 'words':
             await fetch_words(update, context, text)
         elif state == 'friends':
             await fetch_friends(update, context, text)
         elif state == 'names':
             await fetch_names(update, context, text)
-        # add other states if needed
         return
 
     if "t.me" in text:
