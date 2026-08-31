@@ -1,6 +1,4 @@
 import re
-import html
-from datetime import datetime, timezone
 import asyncio
 import os
 import threading
@@ -13,11 +11,14 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
 from telethon import TelegramClient, events, functions, types
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError, ChannelPrivateError, UsernameNotOccupiedError, MessageIdInvalidError
+from telethon.errors import (FloodWaitError, ChannelPrivateError, UsernameNotOccupiedError, MessageIdInvalidError, RPCError, SessionPasswordNeededError, PeerIdInvalidError)
 import fitz  # PyMuPDF
 
-# Telegram Stories are retrieved with stories.getPeerStories.
-# Use peer-specific Telegram API calls for Stories and message search.
+try:
+    from telethon.tl.functions.stories import GetPeerStoriesRequest, GetStoriesByIDRequest
+except ImportError:
+    GetPeerStoriesRequest = None
+    GetStoriesByIDRequest = None
 
 app = Flask(__name__)
 
@@ -291,204 +292,273 @@ async def menu_callback(update, context):
         page = int(data.split("_")[1])
         await handle_posts_pagination(update, context, page)
     elif data.startswith("story_"):
+        # story_start must FETCH stories first. Previously it jumped directly
+        # to display_story(), which could have an empty stories_list.
         if data == "story_start":
-            context.user_data['story_index'] = 0
-            entity = context.user_data.get('profile_entity')
+            entity = context.user_data.get("story_entity") or context.user_data.get("profile_entity")
             if not entity:
-                await query.edit_message_text("❌ Profile session expired. Please open the profile again.")
+                await query.edit_message_text("❌ No profile selected.")
                 return
-            await fetch_stories_from_entity(update, context, entity)
+            await query.answer("Fetching Stories…")
+            context.user_data["story_index"] = 0
+            context.user_data.pop("story_message_id", None)
+            context.user_data["stories_list"] = []
+            fake_message = query.message
+            # Reuse fetch logic with the callback's message context.
+            try:
+                if not GetPeerStoriesRequest:
+                    await query.edit_message_text(
+                        "❌ Telethon does not support stories.getPeerStories in this installation."
+                    )
+                    return
+
+                response = await telethon_client(
+                    GetPeerStoriesRequest(peer=entity)
+                )
+                stories = list(getattr(response, "stories", []) or [])
+
+                # Expand skipped StoryItems using getStoriesByID.
+                if GetStoriesByIDRequest:
+                    full_items = []
+                    skipped_ids = []
+                    for story in stories:
+                        if getattr(story, "media", None):
+                            full_items.append(story)
+                        elif getattr(story, "id", None):
+                            skipped_ids.append(story.id)
+
+                    if skipped_ids:
+                        try:
+                            full = await telethon_client(
+                                GetStoriesByIDRequest(peer=entity, id=skipped_ids)
+                            )
+                            full_items.extend(
+                                s for s in (getattr(full, "stories", []) or [])
+                                if getattr(s, "media", None)
+                            )
+                        except Exception:
+                            pass
+                    stories = full_items
+
+                stories = [
+                    s for s in stories
+                    if getattr(s, "media", None) and getattr(s, "id", None) is not None
+                ]
+
+                if not stories:
+                    await query.edit_message_text(
+                        "❌ No active downloadable Stories are available for this account."
+                    )
+                    return
+
+                context.user_data["stories_list"] = stories
+                context.user_data["story_entity"] = entity
+                context.user_data["story_index"] = 0
+
+                await display_story(update, context)
+
+            except FloodWaitError as e:
+                await query.edit_message_text(
+                    f"⏳ Telegram rate limit. Please wait {e.seconds} seconds."
+                )
+            except Exception as e:
+                await query.edit_message_text(
+                    f"❌ Could not retrieve Stories: {type(e).__name__}: {e}"
+                )
+
         elif data == "story_next":
-            context.user_data['story_index'] = context.user_data.get('story_index', 0) + 1
-            await display_story(update, context, replace_current=True)
+            context.user_data["story_index"] = context.user_data.get("story_index", 0) + 1
+            await display_story(update, context)
+
         elif data == "story_prev":
-            context.user_data['story_index'] = context.user_data.get('story_index', 0) - 1
-            await display_story(update, context, replace_current=True)
-        elif data == "story_back_profile":
-            await restore_profile_from_callback(update, context)
+            context.user_data["story_index"] = context.user_data.get("story_index", 0) - 1
+            await display_story(update, context)
 
-# --- CONCURRENT GLOBAL SCANNER (FAST) ---
-async def _search_one_dialog(dialog, query, limit=10):
-    """Search INSIDE one already-accessible dialog.
+# --- SEARCH WITHOUT the forbidden global-message request ---
+# Telegram does not expose an exact "global message search across arbitrary public
+# channels" through messages.search without using messages.searchGlobal. Since
+# the forbidden global-message request is explicitly forbidden here, this implementation combines:
+#   1) messages in dialogs the account already has access to
+#   2) public users/channels/groups discovered with contacts.search
+#      (these can include public chats the account has NOT joined)
+#
+# This is intentionally honest: it cannot reproduce Telegram's exact global-search
+# index, but it can search accessible dialogs plus discoverable public chats/channels.
 
-    This intentionally uses Telethon's peer-specific search path through
-    get_messages(entity, search=...). It does NOT perform a global
-    Telegram global message search.
-    """
+def _peer_key(entity):
+    return getattr(entity, "id", None), getattr(entity, "access_hash", None)
+
+def _result_link(entity, msg_id):
+    username = getattr(entity, "username", None)
+    if username:
+        return f"https://t.me/{username}/{msg_id}"
+    # For private/supergroup IDs Telegram's /c/ form is only useful when the
+    # message is actually addressable. Keep it as a best-effort link.
+    entity_id = getattr(entity, "id", None)
+    if entity_id:
+        return f"https://t.me/c/{entity_id}/{msg_id}"
+    return ""
+
+def _result_text(msg):
+    text = (getattr(msg, "message", None) or "").strip()
+    if text:
+        return re.sub(r"\s+", " ", text)[:180]
+    return f"{get_media_type(msg)} Media message"
+
+def _relevance_score(query, msg, entity):
+    q_words = [w.lower() for w in re.findall(r"\w+", query) if len(w) > 1]
+    haystack = " ".join([
+        getattr(msg, "message", "") or "",
+        getattr(entity, "title", "") or "",
+        getattr(entity, "username", "") or "",
+        getattr(entity, "first_name", "") or "",
+        getattr(entity, "last_name", "") or "",
+    ]).lower()
+
+    text = (getattr(msg, "message", "") or "").lower()
+    score = 0
+    for word in q_words:
+        if word in text:
+            score += 10
+        if word in haystack:
+            score += 2
+    if q_words and all(word in text for word in q_words):
+        score += 20
+    # Newer messages get a small bonus without overwhelming text relevance.
     try:
-        msgs = await asyncio.wait_for(
-            telethon_client.get_messages(dialog.entity, search=query, limit=limit),
-            timeout=12,
+        score += max(0, int(msg.date.timestamp() / 10_000_000))
+    except Exception:
+        pass
+    return score
+
+async def _search_one_entity(entity, query, limit=10):
+    """Search messages in one specific accessible peer."""
+    try:
+        messages = await telethon_client.get_messages(
+            entity,
+            search=query,
+            limit=limit
         )
         results = []
-        for msg in msgs:
-            if not msg or not msg.id:
+        for msg in messages or []:
+            if not getattr(msg, "id", None):
                 continue
-            text = (msg.message or "").strip()
-            if not text and not msg.media:
-                continue
-
-            chat = dialog.entity
-            username = getattr(chat, "username", None)
-            title = (
-                getattr(chat, "title", None)
-                or " ".join(filter(None, [getattr(chat, "first_name", None), getattr(chat, "last_name", None)]))
-                or username
-                or str(getattr(chat, "id", "Unknown"))
-            )
-
-            if username:
-                link = f"https://t.me/{username}/{msg.id}"
-            else:
-                chat_id = getattr(chat, "id", 0)
-                if str(chat_id).startswith("-100"):
-                    internal_id = str(chat_id)[4:]
-                    link = f"https://t.me/c/{internal_id}/{msg.id}"
-                else:
-                    # Private users/chats do not always have public web links.
-                    # Telegram's tg:// link opens the message for an account
-                    # that has access to it.
-                    if isinstance(chat, types.User):
-                        link = f"tg://openmessage?user_id={chat.id}&message_id={msg.id}"
-                    else:
-                        link = f"tg://openmessage?chat_id={chat_id}&message_id={msg.id}"
-
             results.append({
-                "link": link,
-                "content": text[:180] if text else f"[{get_media_type(msg)} Media]",
-                "chat": str(title),
-                "date": msg.date,
-                "message_id": msg.id,
+                "entity": entity,
+                "message": msg,
+                "link": _result_link(entity, msg.id),
+                "content": _result_text(msg),
+                "score": _relevance_score(query, msg, entity),
             })
         return results
-    except FloodWaitError as e:
-        # Respect Telegram's limit once for this dialog. No infinite retry.
-        await asyncio.sleep(min(e.seconds, 30))
-        try:
-            msgs = await telethon_client.get_messages(dialog.entity, search=query, limit=limit)
-            results = []
-            chat = dialog.entity
-            username = getattr(chat, "username", None)
-            title = (
-                getattr(chat, "title", None)
-                or " ".join(filter(None, [getattr(chat, "first_name", None), getattr(chat, "last_name", None)]))
-                or username
-                or str(getattr(chat, "id", "Unknown"))
-            )
-            for msg in msgs:
-                if not msg or not msg.id:
-                    continue
-                text = (msg.message or "").strip()
-                if not text and not msg.media:
-                    continue
-                if username:
-                    link = f"https://t.me/{username}/{msg.id}"
-                else:
-                    chat_id = getattr(chat, "id", 0)
-                    if str(chat_id).startswith("-100"):
-                        link = f"https://t.me/c/{str(chat_id)[4:]}/{msg.id}"
-                    else:
-                        if isinstance(chat, types.User):
-                            link = f"tg://openmessage?user_id={chat.id}&message_id={msg.id}"
-                        else:
-                            link = f"tg://openmessage?chat_id={chat_id}&message_id={msg.id}"
-                results.append({
-                    "link": link,
-                    "content": text[:180] if text else f"[{get_media_type(msg)} Media]",
-                    "chat": str(title),
-                    "date": msg.date,
-                    "message_id": msg.id,
-                })
-            return results
-        except Exception:
-            return []
+    except (ChannelPrivateError, PeerIdInvalidError, UsernameNotOccupiedError):
+        return []
+    except FloodWaitError:
+        raise
     except Exception:
         return []
 
-
-def _search_score(result, query):
-    """Rank results approximately like relevance + activity."""
-    text = result["content"].lower()
-    q = query.strip().lower()
-    words = [w for w in re.findall(r"\w+", q) if len(w) > 1]
-
-    score = 0.0
-    if q and q in text:
-        score += 100.0
-    if words:
-        matched = sum(text.count(word) for word in words)
-        score += matched * 12.0
-        if all(word in text for word in words):
-            score += 35.0
-
-    dt = result.get("date")
-    if dt:
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        age_days = max(0.0, (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0)
-        score += max(0.0, 30.0 - min(age_days, 30.0))
-        result["timestamp"] = dt.timestamp()
-    else:
-        result["timestamp"] = 0
-    return score
-
+async def _discover_public_peers(query, limit=100):
+    """
+    Discover public Telegram users/chats/channels by name/username using
+    contacts.search. This can return public peers that are not in dialogs,
+    so the search is not limited to joined chats.
+    """
+    discovered = []
+    try:
+        response = await telethon_client(functions.contacts.SearchRequest(
+            q=query,
+            limit=limit
+        ))
+        for entity in list(getattr(response, "chats", []) or []) + list(getattr(response, "users", []) or []):
+            username = getattr(entity, "username", None)
+            # Only use public username-addressable peers here. This avoids
+            # pretending that arbitrary private/unjoined chats are searchable.
+            if username:
+                discovered.append(entity)
+    except FloodWaitError:
+        raise
+    except Exception:
+        pass
+    return discovered
 
 async def fetch_search(update, context, query):
-    """Search accessible dialogs without using the global message-search request.
-
-    Telegram's global-search request is deliberately avoided. Instead, the
-    authenticated user session searches each accessible dialog separately
-    using peer-specific message search, then results are merged and ranked.
-    """
     query = (query or "").strip()
     if not query:
-        await update.message.reply_text("❌ Please enter a search keyword.")
+        await update.message.reply_text("🔎 Please enter a keyword, for example: Logic mid")
         return
 
     status_msg = await update.message.reply_text(
-        f"🔍 Searching your accessible chats for: {query}\n"
-        "⏳ Searching chats separately for reliable results..."
+        f"🔎 Searching accessible chats and discoverable public Telegram chats for: {query}"
     )
 
     try:
-        # Search more than the old 30-dialog limit. Tune with an environment
-        # variable if the account has a very large number of dialogs.
-        max_dialogs = int(os.environ.get("SEARCH_MAX_DIALOGS", "300"))
-        dialogs = await telethon_client.get_dialogs(limit=max_dialogs)
+        # A larger dialog window than the old 30-dialog limit.
+        dialogs = await telethon_client.get_dialogs(limit=200)
 
-        # Avoid excessive concurrent RPCs. This is intentionally not a single
-        # global search request.
-        sem = asyncio.Semaphore(4)
-
-        async def worker(dialog):
-            async with sem:
-                return await _search_one_dialog(dialog, query, limit=10)
-
-        chunks = await asyncio.gather(*(worker(d) for d in dialogs), return_exceptions=True)
-
-        merged = []
+        # Start with the user's accessible dialogs.
+        peers = []
         seen = set()
-        for chunk in chunks:
-            if isinstance(chunk, Exception):
+
+        for dialog in dialogs:
+            entity = getattr(dialog, "entity", None)
+            if not entity:
                 continue
-            for result in chunk:
-                key = (result["chat"], result["message_id"])
-                if key in seen:
-                    continue
-                seen.add(key)
-                result["score"] = _search_score(result, query)
-                merged.append(result)
+            key = _peer_key(entity)
+            if key[0] not in seen:
+                seen.add(key[0])
+                peers.append(entity)
 
-        merged.sort(key=lambda r: (r.get("score", 0), r.get("timestamp", 0)), reverse=True)
+        # IMPORTANT: discover public chats/channels outside the user's joined
+        # dialogs. This is the non-the forbidden global-message request technique.
+        public_peers = await _discover_public_peers(query, limit=100)
+        for entity in public_peers:
+            key = _peer_key(entity)
+            if key[0] not in seen:
+                seen.add(key[0])
+                peers.append(entity)
 
-        if not merged:
+        all_results = []
+        sem = asyncio.Semaphore(8)
+
+        async def worker(entity):
+            async with sem:
+                return await _search_one_entity(entity, query, limit=10)
+
+        # Search peers concurrently, but cap concurrency.
+        batches = await asyncio.gather(
+            *(worker(entity) for entity in peers),
+            return_exceptions=True
+        )
+
+        for batch in batches:
+            if isinstance(batch, FloodWaitError):
+                raise batch
+            if isinstance(batch, list):
+                all_results.extend(batch)
+
+        # Remove duplicate message results.
+        unique = {}
+        for item in all_results:
+            entity = item["entity"]
+            msg = item["message"]
+            key = (getattr(entity, "id", None), getattr(msg, "id", None))
+            unique[key] = item
+
+        all_results = list(unique.values())
+        all_results.sort(key=lambda x: x["score"], reverse=True)
+
+        if not all_results:
             await status_msg.edit_text(
                 f"❌ No results found for '{query}'.\n\n"
-                "The search checks the dialogs accessible to your authenticated Telegram account."
+                "Tip: Telegram's exact global message index is not used because "
+                "the forbidden global-message request is disabled. Public chats/channels that "
+                "can be discovered by Telegram are searched individually."
             )
             return
 
-        context.user_data["search_results"] = merged
+        # Store the full result objects in the user's session.
+        context.user_data["search_results"] = all_results
         context.user_data["search_query"] = query
         context.user_data["search_page"] = 1
 
@@ -497,58 +567,68 @@ async def fetch_search(update, context, query):
 
     except FloodWaitError as e:
         await status_msg.edit_text(
-            f"⏳ Telegram rate-limited the search. Please wait {e.seconds} seconds and try again."
+            f"⏳ Telegram rate limit. Please wait {e.seconds} seconds and try again."
         )
     except Exception as e:
-        await status_msg.edit_text(f"❌ Search failed: {html.escape(str(e))}")
-
+        await status_msg.edit_text(f"❌ Search failed: {type(e).__name__}: {e}")
 
 async def display_search_page(update, context, page):
-    callback = update.callback_query
-    if callback:
-        await callback.answer()
+    query = update.callback_query
+    if query:
+        await query.answer()
 
     results = context.user_data.get("search_results", [])
     search_query = context.user_data.get("search_query", "")
+
     if not results:
-        text = f"🔎 No results for <b>{html.escape(search_query)}</b>"
-        if callback:
-            await callback.edit_message_text(text, parse_mode=ParseMode.HTML)
+        text = f"<blockquote><b>Telegram Search</b>\n{search_query}\n\nNo results.</blockquote>"
+        kb = [[
+            InlineKeyboardButton("🔄 New Search", callback_data="search"),
+            InlineKeyboardButton("⬅️ Back", callback_data="more")
+        ]]
+        if query:
+            await query.edit_message_text(
+                text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML
+            )
         else:
-            await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+            await update.message.reply_text(
+                text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML
+            )
         return
 
     per_page = 10
     total_pages = max(1, (len(results) + per_page - 1) // per_page)
-    page = max(1, min(int(page), total_pages))
+    page = max(1, min(page, total_pages))
     context.user_data["search_page"] = page
 
     start = (page - 1) * per_page
     page_items = results[start:start + per_page]
 
-    # Keep the visual style close to the screenshot: title, keyword, then
-    # clickable search results and pagination information.
-    lines = [
-        "<blockquote>",
-        "<b>🔎 Telegram Search</b>",
-        html.escape(search_query),
-        "",
-    ]
+    text = f"<blockquote><b>Telegram Search</b>\n{search_query}\n\n"
 
     for item in page_items:
-        content = html.escape(item["content"].replace("\n", " "))
-        chat = html.escape(item["chat"])
-        link = html.escape(item["link"], quote=True)
-        lines.append(f'🔗 <a href="{link}">{content}</a>')
-        lines.append(f"   📁 {chat}")
+        entity = item["entity"]
+        msg = item["message"]
+        title = (
+            getattr(entity, "title", None)
+            or getattr(entity, "first_name", None)
+            or getattr(entity, "username", None)
+            or "Telegram"
+        )
+        username = getattr(entity, "username", None)
+        peer_label = f"@{username}" if username else title
+        link = item["link"]
 
-    lines.extend([
-        "",
-        f"Page {page}/{total_pages}",
-        "Sort by relevance and activity",
-        "</blockquote>",
-    ])
-    text = "\n".join(lines)
+        if link:
+            text += (
+                f"🔗 <a href='{link}'>{item['content']}</a>\n"
+                f"   📌 {peer_label}\n\n"
+            )
+        else:
+            text += f"🔗 {item['content']}\n   📌 {peer_label}\n\n"
+
+    text += f"Page {page}/{total_pages}\n"
+    text += "Sort by relevance and activity</blockquote>"
 
     kb = []
     nav_row = []
@@ -558,17 +638,28 @@ async def display_search_page(update, context, page):
         nav_row.append(InlineKeyboardButton("Next ➡️", callback_data="search_next"))
     if nav_row:
         kb.append(nav_row)
+
     kb.append([
         InlineKeyboardButton("🔄 New Search", callback_data="search"),
-        InlineKeyboardButton("⬅️ Back", callback_data="more"),
+        InlineKeyboardButton("⬅️ Back", callback_data="more")
     ])
 
     markup = InlineKeyboardMarkup(kb)
-    if callback:
-        await callback.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
-    else:
-        await update.message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
 
+    if query:
+        await query.edit_message_text(
+            text,
+            reply_markup=markup,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
+        )
+    else:
+        await update.message.reply_text(
+            text,
+            reply_markup=markup,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
+        )
 
 # --- PDF FETCH ---
 async def handle_pdf_upload(update, context):
@@ -626,35 +717,39 @@ async def handle_pdf_upload(update, context):
 async def fetch_profile(update, context, target):
     try:
         entity = await telethon_client.get_entity(target)
-        context.user_data['profile_entity'] = entity
-        context.user_data['post_entity'] = entity
-        save_user_history(entity.id, getattr(entity, 'username', None), getattr(entity, 'first_name', ''), getattr(entity, 'last_name', ''))
 
-        first_name = getattr(entity, 'first_name', '') or ''
-        last_name = getattr(entity, 'last_name', '') or ''
-        display_name = f"{first_name} {last_name}".strip() or getattr(entity, 'title', None) or "Unknown"
-        username = getattr(entity, 'username', None)
-        verified = getattr(entity, 'verified', False)
-        premium = getattr(entity, 'premium', False)
-        is_bot = getattr(entity, 'bot', False)
-        about = getattr(entity, 'about', None) or 'No bio'
+        # Keep the exact entity for the View Story callback.
+        context.user_data["profile_entity"] = entity
+        context.user_data["post_entity"] = entity
+        context.user_data["story_entity"] = entity
+
+        save_user_history(
+            entity.id,
+            getattr(entity, "username", None),
+            getattr(entity, "first_name", ""),
+            getattr(entity, "last_name", "")
+        )
+
+        first_name = getattr(entity, "first_name", "") or ""
+        last_name = getattr(entity, "last_name", "") or ""
+        display_name = f"{first_name} {last_name}".strip() or getattr(entity, "title", "Unknown")
 
         text = (
-            f"<blockquote><b>{html.escape(display_name)}</b>\n"
-            f"@{html.escape(username or 'N/A')}\n\n"
-            f"{html.escape(about)}\n\n"
+            f"<blockquote><b>{display_name}</b>\n"
+            f"@{getattr(entity, 'username', None) or 'N/A'}\n\n"
+            f"{getattr(entity, 'about', 'No bio')}\n\n"
             f"ID: {entity.id}\n"
-            f"Verified: {verified}\n"
-            f"Premium: {premium}\n"
-            f"Bot: {is_bot}</blockquote>"
+            f"Verified: {getattr(entity, 'verified', False)}\n"
+            f"Premium: {getattr(entity, 'premium', False)}\n"
+            f"Bot: {getattr(entity, 'bot', False)}</blockquote>"
         )
-        kb = [
-            [
-                InlineKeyboardButton("📰 View Posts", callback_data="posts_1"),
-                InlineKeyboardButton("👁 View Story", callback_data="story_start"),
-            ],
-            [InlineKeyboardButton("⬅️ Back", callback_data="more")],
-        ]
+
+        kb = [[
+            InlineKeyboardButton("📰 View Posts", callback_data="posts_1"),
+            InlineKeyboardButton("👁 View Story", callback_data="story_start")
+        ], [
+            InlineKeyboardButton("⬅️ Back", callback_data="more")
+        ]]
 
         try:
             photo = await telethon_client.download_profile_photo(entity, file=BytesIO())
@@ -664,264 +759,446 @@ async def fetch_profile(update, context, target):
                     photo=photo,
                     caption=text,
                     parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup(kb),
+                    reply_markup=InlineKeyboardMarkup(kb)
                 )
             else:
-                await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+                await update.message.reply_text(
+                    text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(kb)
+                )
         except Exception:
-            await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {html.escape(str(e))}", parse_mode=ParseMode.HTML)
+            await update.message.reply_text(
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(kb)
+            )
 
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {type(e).__name__}: {e}")
 
 async def handle_posts_pagination(update, context, page):
     query = update.callback_query
     await query.answer()
-    entity = context.user_data.get('post_entity')
+
+    entity = context.user_data.get("post_entity") or context.user_data.get("profile_entity")
     if not entity:
-        await query.edit_message_text("No posts found.")
+        await query.edit_message_text("❌ No profile selected.")
         return
+
     per_page = 5
-    messages = await telethon_client.get_messages(entity, limit=(page * per_page))
+
+    try:
+        messages = await telethon_client.get_messages(entity, limit=(page * per_page))
+    except Exception as e:
+        await query.edit_message_text(f"❌ Could not fetch posts: {e}")
+        return
+
     total_posts = len(messages)
     start = (page - 1) * per_page
     end = min(start + per_page, total_posts)
     page_items = messages[start:end]
+
     if not page_items:
         await query.edit_message_text("No more posts to show.")
         return
-    text = f"📰 POSTS OF {entity.title or entity.first_name}\nPage {page}\n\n"
+
+    title = getattr(entity, "title", None) or getattr(entity, "first_name", "User")
+    text = f"📰 POSTS OF {title}\nPage {page}\n\n"
+
     for m in page_items:
-        content = m.message[:50] if m.message else f"[{get_media_type(m)}]"
+        content = (m.message or "").strip()[:80] if m.message else f"[{get_media_type(m)}]"
         text += f"• {content}\n"
+
     kb = []
-    if page > 1: kb.append([InlineKeyboardButton("⬅️ Previous", callback_data=f"posts_{page-1}")])
-    if end < total_posts: kb.append([InlineKeyboardButton("Next ➡️", callback_data=f"posts_{page+1}")])
+    if page > 1:
+        kb.append([InlineKeyboardButton("⬅️ Previous", callback_data=f"posts_{page-1}")])
+    if end < total_posts:
+        kb.append([InlineKeyboardButton("Next ➡️", callback_data=f"posts_{page+1}")])
     kb.append([InlineKeyboardButton("⬅️ Back to Profile", callback_data="profile")])
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
 
-async def _get_accessible_stories(entity):
-    """Fetch active stories for one peer using stories.getPeerStories."""
-    response = await telethon_client(functions.stories.GetPeerStoriesRequest(peer=entity))
-    stories = list(getattr(getattr(response, "stories", None), "stories", None) or [])
-    # Some Telethon versions/objects may expose the vector directly.
-    if not stories:
-        raw = getattr(response, "stories", None)
-        if isinstance(raw, (list, tuple)):
-            stories = list(raw)
-    return [s for s in stories if getattr(s, "id", None) and not isinstance(s, types.StoryItemDeleted)]
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
 
+def _story_media_kind(media):
+    if not media:
+        return None
+    if getattr(media, "photo", None):
+        return "photo"
+    if getattr(media, "document", None):
+        document = media.document
+        # Check Telegram document attributes to distinguish video.
+        for attr in getattr(document, "attributes", []) or []:
+            if hasattr(attr, "supports_streaming") or hasattr(attr, "duration"):
+                return "video"
+            if attr.__class__.__name__.lower().endswith("video"):
+                return "video"
+        mime = (getattr(document, "mime_type", "") or "").lower()
+        if mime.startswith("video/"):
+            return "video"
+        return "document"
+    return None
 
-async def fetch_stories_from_entity(update, context, entity):
-    """Fetch real active Stories for the already selected profile."""
-    query = update.callback_query
+async def _refresh_story(entity, story):
+    """
+    Refresh a StoryItem through stories.getStoriesByID when possible.
+    This is important because Story media may need a fresh file reference.
+    """
+    if not GetStoriesByIDRequest:
+        return story
+
     try:
-        if not entity:
-            await query.edit_message_text("❌ No Telegram user is selected.")
-            return
+        response = await telethon_client(GetStoriesByIDRequest(
+            peer=entity,
+            id=[story.id]
+        ))
+        refreshed = getattr(response, "stories", None) or []
+        if refreshed:
+            candidate = refreshed[0]
+            # Ignore deleted/skipped constructors if they don't contain media.
+            if getattr(candidate, "media", None):
+                return candidate
+    except FloodWaitError:
+        raise
+    except Exception:
+        pass
 
-        stories = await _get_accessible_stories(entity)
-        if not stories:
-            await query.answer("No active accessible Stories.", show_alert=True)
+    return story
+
+async def _download_story_media(entity, story):
+    """
+    Fetch a full StoryItem and download its actual MessageMedia.
+    We first refresh with getStoriesByID so the media has a current file reference.
+    """
+    story = await _refresh_story(entity, story)
+
+    media = getattr(story, "media", None)
+    if not media:
+        return None, None, story
+
+    kind = _story_media_kind(media)
+    if kind not in ("photo", "video"):
+        return None, None, story
+
+    suffix = ".jpg" if kind == "photo" else ".mp4"
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp_path = tmp.name
+    tmp.close()
+
+    try:
+        # Telethon's downloader accepts the MessageMedia contained in StoryItem.
+        downloaded = await telethon_client.download_media(
+            media,
+            file=tmp_path
+        )
+
+        if not downloaded or not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return None, None, story
+
+        return tmp_path, kind, story
+
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return None, None, story
+
+async def _send_or_edit_story_message(query, story, index, total, entity):
+    """
+    On story_start, send a new media message because the profile message may be
+    text/photo and cannot always be edited into media. On next/previous, edit
+    the existing story media message.
+    """
+    tmp_path, kind, story = await _download_story_media(entity, story)
+
+    if not tmp_path:
+        return False, story
+
+    caption = getattr(story, "caption", None) or getattr(story, "message", None) or ""
+    caption = f"{caption}\n\n📖 Story {index + 1}/{total}".strip()
+
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("⬅️ Previous", callback_data="story_prev"),
+        InlineKeyboardButton("Next ➡️", callback_data="story_next")
+    ], [
+        InlineKeyboardButton("⬅️ Back to Profile", callback_data="profile")
+    ]])
+
+    try:
+        with open(tmp_path, "rb") as f:
+            if kind == "photo":
+                media = InputMediaPhoto(media=InputFile(f), caption=caption)
+            else:
+                media = InputMediaVideo(media=InputFile(f), caption=caption)
+
+            # story_message_id is present after the first Story has been sent.
+            story_message_id = context_user_message_id = None
+            # Caller decides whether this is a new message or edit.
+            return media, kb, story
+
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+async def display_story(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    entity = context.user_data.get("story_entity") or context.user_data.get("profile_entity")
+    stories = context.user_data.get("stories_list", [])
+    index = int(context.user_data.get("story_index", 0))
+
+    if not entity:
+        await query.edit_message_text("❌ No Telegram user is selected.")
+        return
+
+    if not stories:
+        await query.edit_message_text("❌ No accessible active Stories were found.")
+        return
+
+    index = max(0, min(index, len(stories) - 1))
+    context.user_data["story_index"] = index
+
+    story = stories[index]
+
+    try:
+        tmp_path, kind, story = await _download_story_media(entity, story)
+
+        if not tmp_path or not kind:
             await query.edit_message_text(
-                "❌ No active accessible Story was returned by Telegram.\n\n"
-                "The account may have no active Story, or the Story may not be available to the authenticated account."
+                "❌ Telegram returned the Story, but its media could not be downloaded.\n\n"
+                "The Story may be protected, expired, skipped, or its file reference "
+                "may no longer be valid."
             )
             return
 
-        context.user_data['story_entity'] = entity
-        context.user_data['stories_list'] = stories
-        context.user_data['story_index'] = 0
-        await query.answer("Story found")
-        await display_story(update, context, replace_current=False)
+        caption = getattr(story, "caption", None) or ""
+        caption = f"{caption}\n\n📖 Story {index + 1}/{len(stories)}".strip()
 
-    except FloodWaitError as e:
-        await query.answer()
-        await query.edit_message_text(f"⏳ Telegram rate limit. Please wait {e.seconds} seconds and try again.")
-    except (ChannelPrivateError, UsernameNotOccupiedError) as e:
-        await query.answer()
-        await query.edit_message_text("❌ This Story cannot be accessed by the authenticated Telegram account.")
-    except Exception as e:
-        await query.answer()
-        await query.edit_message_text(f"❌ Could not retrieve Stories: {html.escape(str(e))}", parse_mode=ParseMode.HTML)
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ Previous", callback_data="story_prev"),
+            InlineKeyboardButton("Next ➡️", callback_data="story_next")
+        ], [
+            InlineKeyboardButton("⬅️ Back to Profile", callback_data="profile")
+        ]])
 
+        # If the callback is on an existing media message, edit it.
+        # If it is on the profile text/photo message, send a new media message.
+        is_story_message = context.user_data.get("story_message_id") == query.message.message_id
 
-async def display_story(update, context, replace_current=False):
-    query = update.callback_query
-    await query.answer()
-
-    stories = context.user_data.get('stories_list') or []
-    entity = context.user_data.get('story_entity')
-    index = context.user_data.get('story_index', 0)
-
-    if not stories:
-        await query.edit_message_text("❌ No accessible Stories found.")
-        return
-
-    if index < 0:
-        index = len(stories) - 1
-    if index >= len(stories):
-        index = 0
-    context.user_data['story_index'] = index
-    story = stories[index]
-
-    if replace_current:
-        # On next/previous, remove the old story message so only one story
-        # remains visible at a time.
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
-
-    media = getattr(story, 'media', None)
-    if not media:
-        await query.message.reply_text("❌ This Story has no downloadable media.")
-        return
-
-    is_photo = isinstance(media, types.MessageMediaPhoto)
-    is_document = isinstance(media, types.MessageMediaDocument)
-    document = getattr(media, 'document', None)
-    mime = (getattr(document, 'mime_type', '') or '').lower()
-    is_video = is_document and (mime.startswith('video/') or getattr(document, 'attributes', None))
-
-    if not (is_photo or is_document):
-        await query.message.reply_text("❌ Unsupported Story media type.")
-        return
-
-    suffix = ".jpg" if is_photo else ".mp4" if mime.startswith('video/') else ".bin"
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp_path = tmp.name
-
-        downloaded = await telethon_client.download_media(story, file=tmp_path)
-        if not downloaded or not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
-            raise RuntimeError("Telegram did not return downloadable Story media.")
-
-        caption_text = (getattr(story, 'message', None) or '').strip()
-        base = caption_text if caption_text else "📖 Telegram Story"
-        caption = f"{base}\n\n📖 Story {index + 1}/{len(stories)}"
-
-        kb = []
-        nav = []
-        if len(stories) > 1:
-            nav.append(InlineKeyboardButton("⬅️ Previous", callback_data="story_prev"))
-            nav.append(InlineKeyboardButton("Next ➡️", callback_data="story_next"))
-        if nav:
-            kb.append(nav)
-        kb.append([InlineKeyboardButton("⬅️ Back to Profile", callback_data="story_back_profile")])
-        markup = InlineKeyboardMarkup(kb)
-
-        with open(tmp_path, 'rb') as f:
-            if is_photo:
-                sent = await context.bot.send_photo(
-                    chat_id=query.message.chat_id,
-                    photo=f,
-                    caption=caption[:1024],
-                    reply_markup=markup,
-                )
-            elif mime.startswith('video/'):
-                sent = await context.bot.send_video(
-                    chat_id=query.message.chat_id,
-                    video=f,
-                    caption=caption[:1024],
-                    supports_streaming=True,
-                    reply_markup=markup,
+        with open(tmp_path, "rb") as f:
+            if is_story_message:
+                if kind == "photo":
+                    media = InputMediaPhoto(
+                        media=InputFile(f),
+                        caption=caption
+                    )
+                else:
+                    media = InputMediaVideo(
+                        media=InputFile(f),
+                        caption=caption
+                    )
+                await query.edit_message_media(
+                    media=media,
+                    reply_markup=kb
                 )
             else:
-                sent = await context.bot.send_document(
-                    chat_id=query.message.chat_id,
-                    document=f,
-                    caption=caption[:1024],
-                    reply_markup=markup,
-                )
+                if kind == "photo":
+                    sent = await query.message.reply_photo(
+                        photo=InputFile(f),
+                        caption=caption,
+                        reply_markup=kb
+                    )
+                else:
+                    sent = await query.message.reply_video(
+                        video=InputFile(f),
+                        caption=caption,
+                        reply_markup=kb
+                    )
+                context.user_data["story_message_id"] = sent.message_id
 
-        context.user_data['story_message_id'] = sent.message_id
+        # Keep the refreshed story object so subsequent navigation uses the
+        # current file reference.
+        stories[index] = story
+        context.user_data["stories_list"] = stories
 
-        if not replace_current:
-            # The original profile message remains in place. The Story is sent
-            # as a separate real media message with navigation buttons.
-            return
-
-    except FloodWaitError as e:
-        await context.bot.send_message(query.message.chat_id, f"⏳ Telegram rate limit. Wait {e.seconds} seconds and try again.")
-    except Exception as e:
-        await context.bot.send_message(query.message.chat_id, f"❌ Could not fetch Story: {html.escape(str(e))}", parse_mode=ParseMode.HTML)
-    finally:
-        if tmp_path:
-            try:
-                if os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
-            except Exception:
-                pass
-
-
-async def restore_profile_from_callback(update, context):
-    """Restore the selected profile after leaving Story view."""
-    query = update.callback_query
-    await query.answer()
-    entity = context.user_data.get('profile_entity') or context.user_data.get('story_entity')
-    if not entity:
-        await query.edit_message_text("❌ Profile session expired. Please search for the user again.")
-        return
-
-    try:
         try:
-            await query.message.delete()
-        except Exception:
+            os.unlink(tmp_path)
+        except OSError:
             pass
 
-        first_name = getattr(entity, 'first_name', '') or ''
-        last_name = getattr(entity, 'last_name', '') or ''
-        display_name = f"{first_name} {last_name}".strip() or getattr(entity, 'title', None) or 'Unknown'
-        username = getattr(entity, 'username', None)
-        about = getattr(entity, 'about', None) or 'No bio'
-        text = (
-            f"<blockquote><b>{html.escape(display_name)}</b>\n"
-            f"@{html.escape(username or 'N/A')}\n\n"
-            f"{html.escape(about)}\n\n"
-            f"ID: {entity.id}\n"
-            f"Verified: {getattr(entity, 'verified', False)}\n"
-            f"Premium: {getattr(entity, 'premium', False)}\n"
-            f"Bot: {getattr(entity, 'bot', False)}</blockquote>"
+    except FloodWaitError as e:
+        await query.edit_message_text(
+            f"⏳ Telegram rate limit. Please wait {e.seconds} seconds."
         )
-        kb = [[
-            InlineKeyboardButton("📰 View Posts", callback_data="posts_1"),
-            InlineKeyboardButton("👁 View Story", callback_data="story_start"),
-        ], [InlineKeyboardButton("⬅️ Back", callback_data="more")]]
-        photo = await telethon_client.download_profile_photo(entity, file=BytesIO())
-        if photo:
-            photo.seek(0)
-            await context.bot.send_photo(query.message.chat_id, photo=photo, caption=text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
-        else:
-            await context.bot.send_message(query.message.chat_id, text=text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
     except Exception as e:
-        await context.bot.send_message(query.message.chat_id, f"❌ Could not restore profile: {html.escape(str(e))}", parse_mode=ParseMode.HTML)
-
+        try:
+            if "tmp_path" in locals() and tmp_path:
+                os.unlink(tmp_path)
+        except Exception:
+            pass
+        await query.edit_message_text(
+            f"❌ Could not fetch Story: {type(e).__name__}: {e}"
+        )
 
 async def fetch_stories(update, context, target):
-    """Compatibility entry point for any existing code that calls fetch_stories."""
+    """
+    Fetch active Stories for a specific peer using the official
+    stories.getPeerStories method.
+    """
     try:
         entity = await telethon_client.get_entity(target)
     except Exception as e:
-        await update.message.reply_text(f"❌ Could not resolve user: {html.escape(str(e))}", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            f"❌ Could not resolve user: {type(e).__name__}: {e}"
+        )
+        return
+
+    if not GetPeerStoriesRequest:
+        await update.message.reply_text(
+            "❌ Your installed Telethon version does not expose "
+            "stories.getPeerStories. Upgrade Telethon first."
+        )
         return
 
     try:
-        stories = await _get_accessible_stories(entity)
-        if not stories:
-            await update.message.reply_text("❌ No active accessible Story available for this user.")
-            return
-        context.user_data['profile_entity'] = entity
-        context.user_data['story_entity'] = entity
-        context.user_data['stories_list'] = stories
-        context.user_data['story_index'] = 0
-        await update.message.reply_text(f"📖 Found {len(stories)} accessible Story/Stories. Use the Story navigation buttons from the profile.")
-    except FloodWaitError as e:
-        await update.message.reply_text(f"⏳ Telegram rate limit. Please wait {e.seconds} seconds and try again.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Could not retrieve Stories: {html.escape(str(e))}", parse_mode=ParseMode.HTML)
+        response = await telethon_client(
+            GetPeerStoriesRequest(peer=entity)
+        )
 
+        stories = list(getattr(response, "stories", []) or [])
+
+        # StoryItemSkipped entries contain no media. Refresh those individually.
+        if GetStoriesByIDRequest:
+            refreshed_stories = []
+            skipped_ids = []
+
+            for story in stories:
+                if getattr(story, "media", None):
+                    refreshed_stories.append(story)
+                elif getattr(story, "id", None):
+                    skipped_ids.append(story.id)
+
+            if skipped_ids:
+                try:
+                    full = await telethon_client(
+                        GetStoriesByIDRequest(
+                            peer=entity,
+                            id=skipped_ids
+                        )
+                    )
+                    full_items = list(getattr(full, "stories", []) or [])
+                    full_by_id = {
+                        getattr(s, "id", None): s
+                        for s in full_items
+                        if getattr(s, "id", None) is not None
+                    }
+                    for sid in skipped_ids:
+                        if sid in full_by_id:
+                            refreshed_stories.append(full_by_id[sid])
+                except FloodWaitError:
+                    raise
+                except Exception:
+                    pass
+
+            stories = refreshed_stories
+
+        stories = [
+            s for s in stories
+            if getattr(s, "media", None)
+            and getattr(s, "id", None) is not None
+        ]
+
+        if not stories:
+            await update.message.reply_text(
+                "❌ No downloadable active Stories are available for this account."
+            )
+            return
+
+        context.user_data["story_entity"] = entity
+        context.user_data["profile_entity"] = entity
+        context.user_data["stories_list"] = stories
+        context.user_data["story_index"] = 0
+        context.user_data.pop("story_message_id", None)
+
+        # Send the first story as a fresh message.
+        await _send_first_story(update, context)
+
+    except FloodWaitError as e:
+        await update.message.reply_text(
+            f"⏳ Telegram rate limit. Please wait {e.seconds} seconds."
+        )
+    except ChannelPrivateError:
+        await update.message.reply_text(
+            "🔒 This Story is not accessible to the authenticated Telegram account."
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Could not retrieve Stories: {type(e).__name__}: {e}"
+        )
+
+async def _send_first_story(update, context):
+    """Send first Story from a normal message context."""
+    entity = context.user_data.get("story_entity")
+    stories = context.user_data.get("stories_list", [])
+    index = 0
+
+    if not entity or not stories:
+        await update.message.reply_text("❌ No Stories available.")
+        return
+
+    tmp_path, kind, story = await _download_story_media(entity, stories[index])
+
+    if not tmp_path or not kind:
+        await update.message.reply_text(
+            "❌ Telegram returned the Story, but its media could not be downloaded."
+        )
+        return
+
+    caption = getattr(story, "caption", None) or ""
+    caption = f"{caption}\n\n📖 Story 1/{len(stories)}".strip()
+
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("⬅️ Previous", callback_data="story_prev"),
+        InlineKeyboardButton("Next ➡️", callback_data="story_next")
+    ], [
+        InlineKeyboardButton("⬅️ Back to Profile", callback_data="profile")
+    ]])
+
+    try:
+        with open(tmp_path, "rb") as f:
+            if kind == "photo":
+                sent = await update.message.reply_photo(
+                    photo=InputFile(f),
+                    caption=caption,
+                    reply_markup=kb
+                )
+            else:
+                sent = await update.message.reply_video(
+                    video=InputFile(f),
+                    caption=caption,
+                    reply_markup=kb
+                )
+
+        context.user_data["story_message_id"] = sent.message_id
+        stories[index] = story
+        context.user_data["stories_list"] = stories
+
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 # --- OTHER FEATURES ---
 async def perform_words_analysis(update, context, target, limit):
