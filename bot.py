@@ -14,20 +14,17 @@ from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, ChannelPrivateError, UsernameNotOccupiedError, MessageIdInvalidError
 import fitz  # PyMuPDF
 
-# --- STORIES FIX ---
 try:
     from telethon.tl.functions.stories import GetStoriesRequest
 except ImportError:
     GetStoriesRequest = None
 
-# --- FLASK SETUP ---
 app = Flask(__name__)
 
 @app.route('/')
 def home():
     return "Bot is alive!"
 
-# --- CONFIGURATION ---
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
 API_ID = int(os.environ.get('API_ID', 0))
 API_HASH = os.environ.get('API_HASH', '')
@@ -36,7 +33,6 @@ BOT_PASSWORD = os.environ.get("BOT_PASSWORD", "ptss25")
 
 telethon_client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
-# --- SQLITE DATABASE ---
 def init_db():
     conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
@@ -99,7 +95,6 @@ def get_user_history(user_id):
     conn.close()
     return rows
 
-# --- EXISTING FETCHER ---
 async def safe_send(chat_id, bot, msg, from_chat_id, message_id):
     text = msg.message
     try:
@@ -152,7 +147,6 @@ def get_media_type(event):
     elif event.sticker: return "🧩"
     else: return "💬"
 
-# --- COMMANDS ---
 async def start(update, context):
     user_id = update.effective_user.id
     if not is_authenticated(user_id):
@@ -171,7 +165,6 @@ async def logout(update, context):
     remove_authenticated_user(user_id)
     await update.message.reply_text("🔒 Logged out.")
 
-# --- MENU CALLBACKS ---
 async def menu_callback(update, context):
     query = update.callback_query
     await query.answer()
@@ -273,7 +266,6 @@ async def menu_callback(update, context):
         if page < 1: page = 1
         await display_search_page(update, context, page)
 
-    # ... (other features unchanged)
     elif data in ["stats", "track", "names", "groups", "messages", "analysis", "channels", "rep", "friends", "reactions", "gifts", "share", "words", "common"]:
         prompts = {
             "stats": ("📊 STATISTICS", "Enter target username/ID or chat link:"),
@@ -295,7 +287,6 @@ async def menu_callback(update, context):
         await query.edit_message_text(f"{title}\n\n{prompt}")
         context.user_data['state'] = data
 
-    # POSTS / STORIES
     elif data.startswith("posts_"):
         page = int(data.split("_")[1])
         await handle_posts_pagination(update, context, page)
@@ -305,69 +296,73 @@ async def menu_callback(update, context):
         elif data == "story_prev": context.user_data['story_index'] -= 1
         await display_story(update, context)
 
-# --- SEARCH FEATURE (No SearchGlobalRequest, No @channel) ---
+# --- CONCURRENT GLOBAL SCANNER (FAST) ---
 async def fetch_search(update, context, query):
-    status_msg = await update.message.reply_text("🔍 Scanning your available chats... This may take a few seconds.")
-    
+    status_msg = await update.message.reply_text("🔍 Searching globally across your chats... This takes a few seconds.")
+
     try:
-        dialogs = await telethon_client.get_dialogs(limit=100)
+        dialogs = await telethon_client.get_dialogs(limit=30)  # Limit to 30 for speed
         all_results = []
-        
-        for dialog in dialogs:
-            try:
-                messages = await telethon_client.get_messages(dialog, search=query, limit=5)
-                for msg in messages:
-                    if msg.id:
+        sem = asyncio.Semaphore(5)  # Limit concurrent searches
+
+        async def search_dialog(dialog):
+            async with sem:
+                try:
+                    msgs = await asyncio.wait_for(
+                        telethon_client.get_messages(dialog, search=query, limit=3),
+                        timeout=5
+                    )
+                    for msg in msgs:
                         chat = dialog.entity
                         if hasattr(chat, 'username') and chat.username:
                             link = f"https://t.me/{chat.username}/{msg.id}"
                         else:
                             link = f"https://t.me/c/{chat.id}/{msg.id}"
-                        
                         content = msg.message[:80] if msg.message else f"[{get_media_type(msg)}]"
-                        # Add date to sort
-                        all_results.append((msg.date, link, content))
-            except Exception:
-                continue
-        
-        all_results.sort(key=lambda x: x[0], reverse=True)  # Sort by date latest first
-        all_results = [(link, content) for _, link, content in all_results]
-        
+                        all_results.append((link, content))
+                except Exception:
+                    pass
+
+        await asyncio.gather(*[search_dialog(d) for d in dialogs])
+
         if not all_results:
             await status_msg.edit_text(f"❌ No results found for '{query}'.")
             return
-        
-        # Store in context
+
+        # Store results
         context.user_data['search_results'] = all_results
         context.user_data['search_query'] = query
         context.user_data['search_page'] = 1
-        
-        await status_msg.delete()  # Remove loading message
+
+        await status_msg.delete()
         await display_search_page(update, context, 1)
-        
+
     except Exception as e:
         await status_msg.edit_text(f"❌ Search failed: {e}")
 
 async def display_search_page(update, context, page):
     query = update.callback_query
-    await query.answer()
-    
+    if query:
+        await query.answer()
+    else:
+        query = None
+
     results = context.user_data.get('search_results', [])
     search_query = context.user_data.get('search_query', '')
     per_page = 10
     total_pages = (len(results) + per_page - 1) // per_page
     page = max(1, min(page, total_pages))
     context.user_data['search_page'] = page
-    
+
     start = (page - 1) * per_page
     end = start + per_page
     page_items = results[start:end]
-    
+
     text = f"<blockquote><b>Test Test</b>\n{search_query}\n\n"
     for i, (link, content) in enumerate(page_items, 1):
         text += f"🔗 <a href='{link}'>{content}</a>\n"
     text += f"\nPage {page}/{total_pages}\nSort by relevance and activity</blockquote>"
-    
+
     kb = []
     nav_row = []
     if page > 1:
@@ -376,13 +371,13 @@ async def display_search_page(update, context, page):
         nav_row.append(InlineKeyboardButton("Next ➡️", callback_data="search_next"))
     if nav_row: kb.append(nav_row)
     kb.append([InlineKeyboardButton("🔄 New Search", callback_data="search"), InlineKeyboardButton("⬅️ Back", callback_data="more")])
-    
+
     if query:
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
     else:
         await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
 
-# --- PDF FETCH FEATURE ---
+# --- PDF FETCH ---
 async def handle_pdf_upload(update, context):
     if context.user_data.get('state') != 'awaiting_pdf': return
     if not update.message.document:
@@ -434,7 +429,7 @@ async def handle_pdf_upload(update, context):
         await status_msg.edit_text(f"❌ Error: {e}")
         context.user_data['state'] = None
 
-# --- PROFILE, POSTS, STORIES, etc ---
+# --- PROFILE, POSTS, STORIES ---
 async def fetch_profile(update, context, target):
     try:
         entity = await telethon_client.get_entity(target)
