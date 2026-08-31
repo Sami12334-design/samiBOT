@@ -3,6 +3,7 @@ import asyncio
 import os
 import threading
 import sqlite3
+import tempfile
 from io import BytesIO
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -11,7 +12,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from telethon import TelegramClient, events, functions, types
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, ChannelPrivateError, UsernameNotOccupiedError, MessageIdInvalidError
-import fitz  # PyMuPDF for PDF processing
+import fitz  # PyMuPDF
 
 # --- STORIES FIX ---
 try:
@@ -286,6 +287,16 @@ async def menu_callback(update, context):
         page = int(data.split("_")[1])
         await handle_posts_pagination(update, context, page)
 
+    # STORIES PAGINATION
+    elif data.startswith("story_"):
+        if data == "story_start":
+            context.user_data['story_index'] = 0
+        elif data == "story_next":
+            context.user_data['story_index'] += 1
+        elif data == "story_prev":
+            context.user_data['story_index'] -= 1
+        await display_story(update, context)
+
 # --- PDF FETCH FEATURE ---
 async def handle_pdf_upload(update, context):
     if context.user_data.get('state') != 'awaiting_pdf':
@@ -302,13 +313,11 @@ async def handle_pdf_upload(update, context):
     status_msg = await update.message.reply_text("⏳ Processing PDF...")
 
     try:
-        # Download the file from Telegram
         file = await context.bot.get_file(update.message.document.file_id)
         pdf_bytes = BytesIO()
         await file.download_to_memory(pdf_bytes)
         pdf_bytes.seek(0)
 
-        # Open PDF with PyMuPDF
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         total_pages = len(doc)
 
@@ -317,13 +326,9 @@ async def handle_pdf_upload(update, context):
         
         for page_num in range(total_pages):
             page = doc.load_page(page_num)
-            
-            # Extract text
             page_text = page.get_text("text")
             if page_text.strip():
                 text_pages.append(page_text)
-            
-            # Extract images
             images = page.get_images(full=True)
             for img in images:
                 xref = img[0]
@@ -334,16 +339,13 @@ async def handle_pdf_upload(update, context):
         
         doc.close()
 
-        # Send the results
         await status_msg.edit_text("✅ PDF processed. Sending results...")
 
-        # Send images first (page by page as requested)
         if image_pages:
             await update.message.reply_text(f"🖼 Found {len(image_pages)} images in the PDF.")
             for i, img_bytes in enumerate(image_pages, 1):
                 await update.message.reply_photo(photo=img_bytes, caption=f"Page Image {i}")
         
-        # Send text if available
         if text_pages:
             full_text = "\n\n".join(text_pages)
             await update.message.reply_text(f"📄 Text extracted from {len(text_pages)} pages.")
@@ -356,7 +358,6 @@ async def handle_pdf_upload(update, context):
         if not image_pages and not text_pages:
             await status_msg.edit_text("❌ Could not extract any text or images from this PDF.")
 
-        # Reset state
         context.user_data['state'] = None
 
     except Exception as e:
@@ -373,7 +374,7 @@ async def fetch_profile(update, context, target):
         text += f"ID: {entity.id}\nVerified: {entity.verified}\nPremium: {getattr(entity, 'premium', False)}\nBot: {entity.bot}</blockquote>"
         
         kb = [
-            [InlineKeyboardButton("📰 View Posts", callback_data="posts_1"), InlineKeyboardButton("📸 View Stories", callback_data="story_start")],
+            [InlineKeyboardButton("📰 View Posts", callback_data="posts_1"), InlineKeyboardButton("👁 View Story", callback_data="story_start")],
             [InlineKeyboardButton("⬅️ Back", callback_data="more")]
         ]
         try:
@@ -450,44 +451,94 @@ async def fetch_search(update, context, text):
     except Exception as e:
         await update.message.reply_text(f"❌ Search failed: {e}")
 
-# --- STORIES FEATURE ---
+# --- REAL STORIES FEATURE ---
 async def display_story(update, context):
     query = update.callback_query
+    await query.answer()
+
     stories = context.user_data.get('stories_list')
     index = context.user_data.get('story_index', 0)
+
     if not stories:
-        await query.edit_message_text("No stories found.")
+        await query.edit_message_text("❌ No accessible stories found for this user.")
         return
-    if index < 0: index = 0
-    if index >= len(stories): index = len(stories) - 1
+
+    if index < 0:
+        index = 0
+    if index >= len(stories):
+        index = len(stories) - 1
+
     context.user_data['story_index'] = index
     story = stories[index]
+
     kb = [
         [InlineKeyboardButton("⬅️ Previous", callback_data="story_prev"), InlineKeyboardButton("Next ➡️", callback_data="story_next")],
         [InlineKeyboardButton("⬅️ Back to Profile", callback_data="profile")]
     ]
+
     try:
-        media_file = await telethon_client.download_media(story, file=BytesIO())
-        media_file.seek(0)
-        await query.edit_message_media(media=media_file, caption=f"Story {index+1}/{len(stories)}", reply_markup=InlineKeyboardMarkup(kb))
+        # Download the media to a temporary file to avoid memory issues
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg" if story.media.photo else ".mp4") as tmp_file:
+            await telethon_client.download_media(story, file=tmp_file.name)
+            tmp_file_path = tmp_file.name
+
+        caption = story.message if story.message else f"Story {index + 1}/{len(stories)}"
+        caption = f"{caption}\n📖 Story {index + 1}/{len(stories)}"
+
+        with open(tmp_file_path, 'rb') as f:
+            if hasattr(story.media, 'photo') and story.media.photo:
+                await query.edit_message_media(media=InputMediaPhoto(media=InputFile(f)), caption=caption, reply_markup=InlineKeyboardMarkup(kb))
+            elif hasattr(story.media, 'document') and story.media.document:
+                await query.edit_message_media(media=InputMediaVideo(media=InputFile(f)), caption=caption, reply_markup=InlineKeyboardMarkup(kb))
+            else:
+                await query.edit_message_text("Unsupported media type.", reply_markup=InlineKeyboardMarkup(kb))
+        
+        # Clean up the temporary file
+        os.unlink(tmp_file_path)
+
     except Exception as e:
-        await query.edit_message_text(f"Story {index+1}/{len(stories)}\nCannot download media: {e}", reply_markup=InlineKeyboardMarkup(kb))
+        await query.edit_message_text(f"❌ Could not fetch story: {e}", reply_markup=InlineKeyboardMarkup(kb))
 
 async def fetch_stories(update, context, target):
-    if GetStoriesRequest is None:
-        await update.message.reply_text("❌ Stories API not supported in this Telethon version.")
-        return
+    # Resolve the user
     try:
         entity = await telethon_client.get_entity(target)
-        stories = await telethon_client(GetStoriesRequest(entity))
-        context.user_data['story_entity'] = entity
-        context.user_data['stories_list'] = stories.stories
-        context.user_data['story_index'] = 0
-        await display_story(update, context)
-    except:
-        await update.message.reply_text("No accessible stories found.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Could not resolve user: {e}")
+        return
 
-# --- OTHER FEATURES (WORDS, FRIENDS, NAMES) ---
+    if GetStoriesRequest is None:
+        await update.message.reply_text("❌ Stories API is not supported in your current Telethon version.")
+        return
+
+    try:
+        # Fetch REAL Stories from Telegram
+        stories_response = await telethon_client(GetStoriesRequest(entity))
+        stories = stories_response.stories
+
+        if not stories:
+            await update.message.reply_text("❌ No active Story available for this user.")
+            return
+
+        # Store in user context
+        context.user_data['story_entity'] = entity
+        context.user_data['stories_list'] = stories
+        context.user_data['story_index'] = 0
+
+        # Trigger the callback handler to show the first story
+        fake_update = Update(update.update_id, callback_query=types.CallbackQuery(
+            id="0",
+            from_user=update.effective_user,
+            chat_instance="0",
+            data="story_start",
+            message=update.message
+        ))
+        await display_story(fake_update, context)
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Could not retrieve stories: {e}")
+
+# --- OTHER FEATURES ---
 async def perform_words_analysis(update, context, target, limit):
     try:
         entity = await telethon_client.get_entity(target)
@@ -571,12 +622,11 @@ async def fetch_names(update, context, target):
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
-# --- MESSAGE HANDLER (INCLUDES PDF UPLOAD) ---
+# --- MESSAGE HANDLER ---
 async def handle_link(update, context):
     user_id = update.effective_user.id
     text = update.message.text if update.message.text else ""
     
-    # Check for PDF upload state
     if context.user_data.get('state') == 'awaiting_pdf':
         await handle_pdf_upload(update, context)
         return
