@@ -20,6 +20,7 @@ import pymupdf
 import img2pdf
 from pdf2docx import Converter
 import yt_dlp
+import json
 
 try:
     from telethon.tl.functions.stories import GetPeerStoriesRequest, GetStoriesByIDRequest
@@ -41,7 +42,6 @@ STRING_SESSION = os.environ.get('STRING_SESSION', '')
 BOT_PASSWORD = os.environ.get("BOT_PASSWORD", "ptss25")
 RENDER_URL = os.environ.get('RENDER_URL', 'https://samibot-s1h6.onrender.com')
 
-# Admin IDs (comma separated in Render)
 ADMIN_IDS = []
 admin_ids_str = os.environ.get('ADMIN_IDS', '')
 if admin_ids_str:
@@ -604,7 +604,6 @@ async def process_image_pdf(update, context):
         images = context.user_data['pdf_images']
         pdf_bytes = img2pdf.convert([img.getvalue() for img in images])
 
-        # FIXED: Use bot.send_document instead of message.reply_document to avoid NoneType errors
         chat_id = query.message.chat_id if query else update.effective_chat.id
         await context.bot.send_document(chat_id=chat_id, document=BytesIO(pdf_bytes), filename="images.pdf")
 
@@ -621,31 +620,88 @@ async def process_image_pdf(update, context):
             await update.message.reply_text(error_msg)
         context.user_data['state'] = None; context.user_data['pdf_images'] = []
 
+# --- SUPER POWERFUL VIDEO DOWNLOADER ---
 async def handle_video_download(update, context):
     if context.user_data.get('state') != 'awaiting_video_link': return
     url = update.message.text
     if not url.startswith("http"):
         await update.message.reply_text("❌ Please send a valid video URL (YouTube, TikTok, Instagram, Facebook)."); return
-    status_msg = await update.message.reply_text("⏳ Downloading video... This may take a while.")
-    ydl_opts_list = [
-        {'format': 'best[height<=720]', 'outtmpl': '%(title)s.%(ext)s', 'quiet': True, 'no_warnings': True},
-        {'format': 'best', 'outtmpl': '%(title)s.%(ext)s', 'quiet': True, 'no_warnings': True, 'http_headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}}
+    
+    status_msg = await update.message.reply_text("⏳ Downloading video with advanced methods...")
+    
+    # Define multiple User-Agents to bypass blocks
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+        "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36"
     ]
+    
+    # Extensive extractor configurations
+    clients = [
+        {'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'tv', 'web_safari', 'mweb']}}},
+        {'extractor_args': {'youtube': {'player_client': ['android_vr', 'web_embedded']}}},
+        {}
+    ]
+    
+    ydl_opts_list = []
+    for client in clients:
+        for ua in user_agents:
+            ydl_opts_list.append({
+                'format': 'best[height<=1080]',
+                'outtmpl': os.path.join(tempfile.gettempdir(), '%(title)s.%(ext)s'),
+                'quiet': True,
+                'no_warnings': True,
+                'noplaylist': True,
+                'retries': 10,
+                'fragment_retries': 10,
+                'ignoreerrors': True,
+                'http_headers': {'User-Agent': ua},
+                **client
+            })
+    
+    # Add fallback for direct URL sending if download fails
+    ydl_opts_list.append({
+        'format': 'best',
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'simulate': True,
+        'skip_download': True,
+        'http_headers': {'User-Agent': user_agents[0]}
+    })
+    
     filename = None
+    last_error = ""
     for opts in ydl_opts_list:
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
+                info = ydl.extract_info(url, download=not opts.get('simulate'))
+                if opts.get('simulate'):
+                    # If simulated, try sending the direct URL
+                    direct_url = info.get('url') or info.get('webpage_url') or url
+                    await status_msg.edit_text("✅ Video detected! Sending direct link...")
+                    await update.message.reply_text(f"🎬 **Direct Video Link:**\n{direct_url}")
+                    context.user_data['state'] = None
+                    return
+                
                 filename = ydl.prepare_filename(info)
-            break
+                if os.path.exists(filename) and os.path.getsize(filename) > 0:
+                    break
         except Exception as e:
-            await status_msg.edit_text("⚠️ A method failed, trying another...")
+            last_error = str(e)
             continue
-    if not filename:
-        await status_msg.edit_text("❌ Download failed. The platform requires authentication or specific cookies."); return
+    
+    if not filename or not os.path.exists(filename):
+        await status_msg.edit_text(
+            f"❌ Could not download video despite advanced methods.\n"
+            f"Last Error: {last_error[:200]}"
+        )
+        context.user_data['state'] = None
+        return
+    
     try:
         with open(filename, 'rb') as video_file:
-            await update.message.reply_video(video=video_file, caption="✅ Downloaded!")
+            await update.message.reply_video(video=video_file, caption="✅ Downloaded successfully!")
         os.unlink(filename)
         await status_msg.edit_text("✅ Video download complete!")
         context.user_data['state'] = None
