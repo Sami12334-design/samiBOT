@@ -11,3 +11,6 @@ SpeechRecognition
 imageio-ffmpeg
 groq
 rembg
+gTTS
+python-pptx
+reportlab
