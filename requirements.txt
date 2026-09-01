@@ -4,6 +4,6 @@ flask
 pymupdf
 pdf2docx
 img2pdf
-pytesseract
+rapidocr_onnxruntime
 yt-dlp
 Pillow
