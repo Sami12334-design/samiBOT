@@ -20,7 +20,6 @@ import pymupdf
 import img2pdf
 from pdf2docx import Converter
 import yt_dlp
-import json
 
 try:
     from telethon.tl.functions.stories import GetPeerStoriesRequest, GetStoriesByIDRequest
@@ -620,82 +619,57 @@ async def process_image_pdf(update, context):
             await update.message.reply_text(error_msg)
         context.user_data['state'] = None; context.user_data['pdf_images'] = []
 
-# --- SUPER POWERFUL VIDEO DOWNLOADER ---
+# --- SUPER POWERFUL VIDEO DOWNLOADER (FIXED WITH PLAYER CLIENTS) ---
 async def handle_video_download(update, context):
     if context.user_data.get('state') != 'awaiting_video_link': return
     url = update.message.text
     if not url.startswith("http"):
         await update.message.reply_text("❌ Please send a valid video URL (YouTube, TikTok, Instagram, Facebook)."); return
     
-    status_msg = await update.message.reply_text("⏳ Downloading video with advanced methods...")
+    status_msg = await update.message.reply_text("⏳ Downloading video with advanced anti-bot methods...")
     
-    # Define multiple User-Agents to bypass blocks
-    user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
-        "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36"
-    ]
-    
-    # Extensive extractor configurations
-    clients = [
-        {'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'tv', 'web_safari', 'mweb']}}},
-        {'extractor_args': {'youtube': {'player_client': ['android_vr', 'web_embedded']}}},
-        {}
-    ]
-    
-    ydl_opts_list = []
-    for client in clients:
-        for ua in user_agents:
-            ydl_opts_list.append({
-                'format': 'best[height<=1080]',
-                'outtmpl': os.path.join(tempfile.gettempdir(), '%(title)s.%(ext)s'),
-                'quiet': True,
-                'no_warnings': True,
-                'noplaylist': True,
-                'retries': 10,
-                'fragment_retries': 10,
-                'ignoreerrors': True,
-                'http_headers': {'User-Agent': ua},
-                **client
-            })
-    
-    # Add fallback for direct URL sending if download fails
-    ydl_opts_list.append({
-        'format': 'best',
+    # The key to bypassing IP blocks is using specific Player Clients like 'tv' or 'mweb'
+    ydl_opts = {
+        'format': 'best[height<=720]',
+        'outtmpl': os.path.join(tempfile.gettempdir(), '%(title)s.%(ext)s'),
         'quiet': True,
         'no_warnings': True,
         'noplaylist': True,
-        'simulate': True,
-        'skip_download': True,
-        'http_headers': {'User-Agent': user_agents[0]}
-    })
+        'retries': 10,
+        'fragment_retries': 10,
+        'ignoreerrors': True,
+        # Use the least tracked clients: tv and mweb
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['tv', 'mweb', 'web_safari', 'android_vr'],
+                'player_skip': ['webpage', 'configs']
+            }
+        },
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15'
+        }
+    }
     
     filename = None
-    last_error = ""
-    for opts in ydl_opts_list:
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+    except Exception as e:
+        # Fallback: Try the android client method
+        ydl_opts['extractor_args']['youtube']['player_client'] = ['android']
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=not opts.get('simulate'))
-                if opts.get('simulate'):
-                    # If simulated, try sending the direct URL
-                    direct_url = info.get('url') or info.get('webpage_url') or url
-                    await status_msg.edit_text("✅ Video detected! Sending direct link...")
-                    await update.message.reply_text(f"🎬 **Direct Video Link:**\n{direct_url}")
-                    context.user_data['state'] = None
-                    return
-                
+            await status_msg.edit_text("⚠️ Initial method blocked. Trying Android client...")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
                 filename = ydl.prepare_filename(info)
-                if os.path.exists(filename) and os.path.getsize(filename) > 0:
-                    break
-        except Exception as e:
-            last_error = str(e)
-            continue
+        except Exception as e2:
+            await status_msg.edit_text(f"❌ Download failed. Platforms are blocking the server IP.\n**Error:** {str(e2)[:200]}")
+            context.user_data['state'] = None
+            return
     
     if not filename or not os.path.exists(filename):
-        await status_msg.edit_text(
-            f"❌ Could not download video despite advanced methods.\n"
-            f"Last Error: {last_error[:200]}"
-        )
+        await status_msg.edit_text("❌ Could not download video.")
         context.user_data['state'] = None
         return
     
