@@ -41,7 +41,6 @@ STRING_SESSION = os.environ.get('STRING_SESSION', '')
 BOT_PASSWORD = os.environ.get("BOT_PASSWORD", "ptss25")
 RENDER_URL = os.environ.get('RENDER_URL', 'https://samibot-s1h6.onrender.com')
 
-# Admin IDs (comma separated in Render)
 ADMIN_IDS = []
 admin_ids_str = os.environ.get('ADMIN_IDS', '')
 if admin_ids_str:
@@ -620,88 +619,53 @@ async def process_image_pdf(update, context):
             await update.message.reply_text(error_msg)
         context.user_data['state'] = None; context.user_data['pdf_images'] = []
 
-# --- SUPER POWERFUL VIDEO DOWNLOADER (NO 'NoneType' ERRORS) ---
+# --- RELIABLE VIDEO DOWNLOADER (DIRECT LINK SNIFFER) ---
 async def handle_video_download(update, context):
     if context.user_data.get('state') != 'awaiting_video_link': return
     url = update.message.text
     if not url.startswith("http"):
         await update.message.reply_text("❌ Please send a valid video URL (YouTube, TikTok, Instagram, Facebook)."); return
     
-    status_msg = await update.message.reply_text("⏳ Downloading video with advanced methods...")
+    status_msg = await update.message.reply_text("⏳ Processing video URL...")
     
-    # Method 1: Standard with TV Client (Most Successful)
-    ydl_opts_1 = {
-        'format': 'best[height<=720]',
-        'outtmpl': os.path.join(tempfile.gettempdir(), '%(title)s.%(ext)s'),
-        'quiet': True,
-        'no_warnings': True,
-        'noplaylist': True,
-        'retries': 10,
-        'fragment_retries': 10,
-        'ignoreerrors': True,
-        'extractor_args': {'youtube': {'player_client': ['tv', 'mweb', 'web_safari']}},
-        'http_headers': {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15'}
-    }
-    
-    # Method 2: Android Client
-    ydl_opts_2 = {
-        'format': 'best[height<=720]',
-        'outtmpl': os.path.join(tempfile.gettempdir(), '%(title)s.%(ext)s'),
-        'quiet': True,
-        'no_warnings': True,
-        'noplaylist': True,
-        'retries': 10,
-        'fragment_retries': 10,
-        'ignoreerrors': True,
-        'extractor_args': {'youtube': {'player_client': ['android']}},
-        'http_headers': {'User-Agent': 'Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36'}
-    }
-    
-    # Method 3: Direct Link Sniffer (Last Resort, always returns something)
-    ydl_opts_3 = {
+    # Standard extraction without problematic extractor_args
+    ydl_opts = {
         'quiet': True, 
         'no_warnings': True,
         'noplaylist': True,
-        'simulate': True,
+        'simulate': True, 
         'skip_download': True,
-        'extract_flat': True
+        'format': 'best',
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
     }
     
-    filename = None
-    for method, opts in enumerate([ydl_opts_1, ydl_opts_2], 1):
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                filename = ydl.prepare_filename(info)
-                if os.path.exists(filename) and os.path.getsize(filename) > 0:
-                    break
-        except Exception:
-            continue
-    
-    # If both fail, try to get direct link
-    if not filename or not os.path.exists(filename):
-        try:
-            await status_msg.edit_text("⚠️ Direct download failed. Extracting direct link...")
-            with yt_dlp.YoutubeDL(ydl_opts_3) as ydl:
-                info = ydl.extract_info(url, download=False)
-                direct_url = info.get('url') or info.get('webpage_url') or url
-                await status_msg.edit_text("✅ Video detected! Sending direct link...")
-                await update.message.reply_text(f"🎬 **Direct Video Link:**\n{direct_url}")
-                context.user_data['state'] = None
-                return
-        except Exception as e:
-            await status_msg.edit_text(f"❌ Failed. Platforms are blocking server IP.\n**Error:** {str(e)[:200]}")
-            context.user_data['state'] = None
-            return
-    
     try:
-        with open(filename, 'rb') as video_file:
-            await update.message.reply_video(video=video_file, caption="✅ Downloaded successfully!")
-        os.unlink(filename)
-        await status_msg.edit_text("✅ Video download complete!")
-        context.user_data['state'] = None
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+            # Extract direct URL safely
+            direct_url = info.get('url') if info else None
+            if not direct_url:
+                direct_url = info.get('webpage_url') if info else None
+            if not direct_url:
+                direct_url = url
+            
+            await status_msg.edit_text("✅ Video detected! Sending direct link...")
+            await update.message.reply_text(
+                f"🎬 **Direct Video Link:**\n{direct_url}\n\n"
+                f"*Click the link above to view or download the video.*\n"
+                f"*Note: Server IPs are blocked by YouTube for direct downloads, so the bot extracts the direct .mp4 link for you.*"
+            )
+            context.user_data['state'] = None
+            
     except Exception as e:
-        await status_msg.edit_text(f"❌ Error sending video: {e}")
+        await status_msg.edit_text(
+            f"❌ Could not process video.\n"
+            f"**Error:** {str(e)[:150]}\n\n"
+            f"*Note: YouTube aggressively blocks requests from server IPs like Render. Please try TikTok or Instagram.*"
+        )
         context.user_data['state'] = None
 
 async def handle_link(update, context):
