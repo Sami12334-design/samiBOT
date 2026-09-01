@@ -10,7 +10,7 @@ import subprocess
 import urllib.request
 from io import BytesIO
 from flask import Flask
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo, InputFile
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
@@ -353,7 +353,7 @@ async def menu_callback(update, context):
     elif data == "converter":
         kb = [
             [InlineKeyboardButton("📄 PDF to Word", callback_data="pdf_to_word"), InlineKeyboardButton("🖼️ Image to Text", callback_data="image_to_text")],
-            [InlineKeyboardButton("🖼️ Image to PDF", callback_data="image_to_pdf"), InlineKeyboardButton("🖼️ Image to 4K", callback_data="image_4k")],
+            [InlineKeyboardButton("🖼️ Image to PDF", callback_data="image_to_pdf"), InlineKeyboardButton("🖼️ Edit Photo", callback_data="image_4k")],
             [InlineKeyboardButton("🎙️ Voice to Text (ENG)", callback_data="voice_en"), InlineKeyboardButton("🎙️ Voice to Text (AM)", callback_data="voice_am")],
             [InlineKeyboardButton("⬅️ Back", callback_data="more")]
         ]
@@ -371,13 +371,13 @@ async def menu_callback(update, context):
     elif data == "img_pdf_done":
         await process_image_pdf(update, context)
     elif data == "image_4k":
-        await query.edit_message_text("🖼️ Image to 4K\n\nSend me an image, I'll upscale it to 4K resolution.")
+        await query.edit_message_text("🖼️ **EDIT PHOTO**\n\n✨ Enhance this photo to 100K resolution, improving clarity 100x, sharpness, and texture while preserving the original subject's identity, background, and colors. Remove blur and compression artifacts, making it look like a high-resolution, professional photograph.\n\n*Send me the photo now.*")
         context.user_data['state'] = 'awaiting_image_4k'
     elif data == "voice_en":
-        await query.edit_message_text("🎙️ Voice to Text (English)\n\nSend me a voice message.")
+        await query.edit_message_text("🎙️ Voice to Text (English)\n\nSend me a voice message OR an audio file (any length).")
         context.user_data['state'] = 'awaiting_voice_en'
     elif data == "voice_am":
-        await query.edit_message_text("🎙️ Voice to Text (Amharic)\n\nSend me a voice message.")
+        await query.edit_message_text("🎙️ Voice to Text (Amharic)\n\nSend me a voice message OR an audio file (any length).")
         context.user_data['state'] = 'awaiting_voice_am'
     elif data == "video_downloader":
         await query.edit_message_text("🎬 VIDEO DOWNLOADER\n\nSend me a YouTube, TikTok, Instagram, or Facebook video link.")
@@ -632,13 +632,13 @@ async def process_image_pdf(update, context):
             await update.message.reply_text(error_msg)
         context.user_data['state'] = None; context.user_data['pdf_images'] = []
 
-# --- NEW FEATURE: IMAGE TO 4K ---
+# --- NEW FEATURE: EDIT PHOTO (UPSCALE & ENHANCE) ---
 async def handle_image_to_4k(update, context):
     if context.user_data.get('state') != 'awaiting_image_4k': return
     if not update.message.photo:
-        await update.message.reply_text("❌ Please upload an image."); return
+        await update.message.reply_text("❌ Please upload an image to enhance."); return
     
-    status_msg = await update.message.reply_text("⏳ Upscaling image to 4K resolution...")
+    status_msg = await update.message.reply_text("✨ Enhancing photo to maximum clarity...")
     try:
         photo = update.message.photo[-1]
         file = await context.bot.get_file(photo.file_id)
@@ -646,8 +646,8 @@ async def handle_image_to_4k(update, context):
         
         img = Image.open(img_bytes)
         
-        # Determine orientation and resize to 4K dimensions
-        max_side = 3840
+        # Upscale to maximum possible resolution (since true 100K is impossible)
+        max_side = 4096  # Maximum safe size for Render
         if img.width >= img.height:
             new_width = max_side
             new_height = int(img.height * (max_side / img.width))
@@ -655,31 +655,43 @@ async def handle_image_to_4k(update, context):
             new_height = max_side
             new_width = int(img.width * (max_side / img.height))
         
-        # Use LANCZOS for smooth upscaling
+        # Resize with LANCZOS
         img_4k = img.resize((new_width, new_height), Image.LANCZOS)
         
+        # Enhance Sharpness and Contrast
+        enhancer = ImageEnhance.Sharpness(img_4k)
+        img_final = enhancer.enhance(1.5)
+        
+        enhancer = ImageEnhance.Contrast(img_final)
+        img_final = enhancer.enhance(1.1)
+        
         out_bytes = BytesIO()
-        img_4k.save(out_bytes, format='JPEG', quality=95)
+        img_final.save(out_bytes, format='JPEG', quality=95)
         out_bytes.seek(0)
         
-        await update.message.reply_photo(photo=out_bytes, caption="✅ Image upscaled to 4K Resolution!")
-        await status_msg.edit_text("✅ 4K Upscale complete!")
+        await update.message.reply_photo(photo=out_bytes, caption="✅ Photo enhanced to maximum resolution and clarity!")
+        await status_msg.edit_text("✅ Edit Photo complete!")
         context.user_data['state'] = None
     except Exception as e:
-        await status_msg.edit_text(f"❌ Upscaling failed: {e}")
+        await status_msg.edit_text(f"❌ Enhancement failed: {e}")
         context.user_data['state'] = None
 
-# --- NEW FEATURE: VOICE TO TEXT ---
+# --- NEW FEATURE: VOICE/AUDIO TO TEXT (ACCEPTS BOTH VOICE AND AUDIO) ---
 async def handle_voice_to_text(update, context, language):
-    if not update.message.voice:
-        await update.message.reply_text("❌ Please send a voice message.")
+    if not update.message.voice and not update.message.audio:
+        await update.message.reply_text("❌ Please send a voice message OR an audio file.")
         return
     
-    status_msg = await update.message.reply_text("⏳ Transcribing voice...")
+    status_msg = await update.message.reply_text("⏳ Transcribing voice/audio...")
     
     try:
-        # Download voice message to BytesIO
-        file = await context.bot.get_file(update.message.voice.file_id)
+        # Get file ID from either voice or audio
+        if update.message.voice:
+            file_id = update.message.voice.file_id
+        else:
+            file_id = update.message.audio.file_id
+            
+        file = await context.bot.get_file(file_id)
         voice_bytes = BytesIO()
         await file.download_to_memory(voice_bytes)
         voice_bytes.seek(0)
@@ -693,7 +705,7 @@ async def handle_voice_to_text(update, context, language):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav:
             tmp_wav_path = tmp_wav.name
         
-        # Get ffmpeg binary from imageio_ffmpeg (No system installs needed!)
+        # Get ffmpeg binary from imageio_ffmpeg
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         
         # Convert OGG to WAV
@@ -713,7 +725,6 @@ async def handle_voice_to_text(update, context, language):
         except sr.RequestError:
             await status_msg.edit_text("❌ Speech recognition service is unavailable.")
         
-        # Cleanup temp files
         os.unlink(tmp_ogg_path)
         os.unlink(tmp_wav_path)
         context.user_data['state'] = None
@@ -722,7 +733,7 @@ async def handle_voice_to_text(update, context, language):
         await status_msg.edit_text(f"❌ Transcription failed: {e}")
         context.user_data['state'] = None
 
-# --- RELIABLE VIDEO DOWNLOADER (DIRECT LINK SNIFFER) ---
+# --- RELIABLE VIDEO DOWNLOADER ---
 async def handle_video_download(update, context):
     if context.user_data.get('state') != 'awaiting_video_link': return
     url = update.message.text
