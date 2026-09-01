@@ -9,3 +9,4 @@ yt-dlp
 Pillow
 SpeechRecognition
 imageio-ffmpeg
+groq
