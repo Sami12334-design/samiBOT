@@ -11,7 +11,7 @@ import urllib.request
 from io import BytesIO
 from flask import Flask
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageChops
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo, InputFile
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
 from telethon import TelegramClient, events, functions, types
@@ -21,10 +21,9 @@ import pymupdf
 import img2pdf
 from pdf2docx import Converter
 from pptx import Presentation
-from pptx.util import Inches, Pt
+from pptx.util import Inches
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
-from reportlab.lib.utils import ImageReader
 import yt_dlp
 import speech_recognition as sr
 import imageio_ffmpeg
@@ -61,24 +60,6 @@ if admin_ids_str:
     ADMIN_IDS = [int(x.strip()) for x in admin_ids_str.split(',') if x.strip().isdigit()]
 
 telethon_client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
-
-LOCK_FILE = '/tmp/samibot.lock'
-def acquire_lock():
-    if os.path.exists(LOCK_FILE):
-        with open(LOCK_FILE, 'r') as f:
-            pid = f.read().strip()
-        print(f"❌ Conflict Detected! Another instance (PID: {pid}) may still be running.")
-        return False
-    with open(LOCK_FILE, 'w') as f:
-        f.write(str(os.getpid()))
-    return True
-
-def release_lock():
-    try:
-        if os.path.exists(LOCK_FILE):
-            os.unlink(LOCK_FILE)
-    except Exception:
-        pass
 
 def self_ping():
     try:
@@ -187,7 +168,6 @@ def get_media_type(event):
     elif event.sticker: return "🧩"
     else: return "💬"
 
-# --- HELPER: TOOL COMPLETION KEYBOARD ---
 def tool_done_kb():
     kb = [
         [InlineKeyboardButton("🔄 Continue", callback_data="converter"), InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
@@ -322,7 +302,6 @@ async def restart_command(update, context):
         await update.message.reply_text("🔒 Admin only command.")
         return
     await update.message.reply_text("🔄 Restarting bot... Please wait.")
-    release_lock()
     try:
         app = context.application
         await app.stop()
@@ -700,13 +679,11 @@ async def handle_pdf_to_pptx(update, context):
         pdf_bytes = BytesIO(); await file.download_to_memory(pdf_bytes); pdf_bytes.seek(0)
         doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
         prs = Presentation()
-        blank_slide_layout = prs.slide_layouts[6]  # Blank layout
+        blank_slide_layout = prs.slide_layouts[6]
         for page in doc:
             slide = prs.slides.add_slide(blank_slide_layout)
-            # Render page as image
             pix = page.get_pixmap(matrix=pymupdf.Matrix(2, 2))
             img_bytes = BytesIO(pix.tobytes("png"))
-            # Insert image into slide
             slide.shapes.add_picture(img_bytes, Inches(0), Inches(0), width=Inches(10), height=Inches(5.63))
         doc.close()
         pptx_bytes = BytesIO()
@@ -1056,7 +1033,7 @@ async def process_image_pdf(update, context):
         else: await update.message.reply_text(error_msg)
         context.user_data['state'] = None; context.user_data['pdf_images'] = []
 
-# --- OTHER FEATURES (KEEPING EXISTING LOGIC) ---
+# --- OTHER FEATURES ---
 async def fetch_profile(update, context, target):
     try:
         entity = await telethon_client.get_entity(target)
@@ -1247,10 +1224,8 @@ async def inbox_listener(event):
         except Exception as e:
             print(f"Inbox Error: {e}")
 
+# --- MAIN EXECUTION (FIXED NO CONFLICT) ---
 async def main():
-    if not acquire_lock():
-        print("❌ Another instance is already running. Exiting...")
-        return
     init_db()
     def keep_alive():
         while True:
@@ -1260,7 +1235,7 @@ async def main():
     try:
         await telethon_client.start(); print("Telethon connected!")
     except Exception as e:
-        print(f"Telethon fail: {e}"); release_lock(); return
+        print(f"Telethon fail: {e}"); return
     bot_app = Application.builder().token(BOT_TOKEN).build()
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("logout", logout))
@@ -1273,11 +1248,14 @@ async def main():
     bot_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_link))
     print("Bot running...")
     await bot_app.initialize(); await bot_app.start(); await bot_app.updater.start_polling()
+    
+    # FIXED: Ensure Flask binds to 0.0.0.0:10000 so Render doesn't timeout
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
+    
     await asyncio.Event().wait()
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
-    finally:
-        release_lock()
+    except Exception as e:
+        print(f"Bot crashed: {e}")
