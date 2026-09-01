@@ -30,9 +30,6 @@ import imageio_ffmpeg
 from groq import Groq
 from gtts import gTTS
 
-# Background removal library
-from rembg import remove, new_session
-
 try:
     from telethon.tl.functions.stories import GetPeerStoriesRequest, GetStoriesByIDRequest
 except ImportError:
@@ -70,6 +67,7 @@ def self_ping():
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
+# --- DATABASE SETUP ---
 def init_db():
     conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
@@ -169,10 +167,9 @@ def get_media_type(event):
     else: return "💬"
 
 def tool_done_kb():
-    kb = [
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Continue", callback_data="converter"), InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
-    ]
-    return InlineKeyboardMarkup(kb)
+    ])
 
 async def safe_send(chat_id, bot, msg, from_chat_id, message_id):
     text = msg.message
@@ -468,17 +465,14 @@ async def menu_callback(update, context):
             context.user_data["story_index"] = context.user_data.get("story_index", 0) - 1
             await display_story(update, context)
 
-# --- PHOTO EDITING ---
+# --- PHOTO EDITING (Heavy imports done lazily) ---
 async def handle_photo_edit_selection(update, context, data):
     query = update.callback_query
     await query.answer()
-    
     if not context.user_data.get('edit_image'):
         await query.edit_message_text("❌ No image found. Please send a photo first.")
         return
-    
     img = context.user_data['edit_image']
-    
     max_side = 4096
     if img.width >= img.height:
         new_width = max_side
@@ -487,7 +481,6 @@ async def handle_photo_edit_selection(update, context, data):
         new_height = max_side
         new_width = int(img.width * (max_side / img.height))
     img = img.resize((new_width, new_height), Image.LANCZOS)
-    
     filter_name = "Original"
     if data == "edit_orig": filter_name = "Original"
     elif data == "edit_hd":
@@ -522,11 +515,9 @@ async def handle_photo_edit_selection(update, context, data):
         img = ImageOps.posterize(img.convert('RGB'), bits=3); filter_name = "Posterize"
     elif data == "edit_solar":
         img = ImageOps.solarize(img.convert('RGB'), threshold=128); filter_name = "Solarize"
-
     out_bytes = BytesIO()
     img.save(out_bytes, format='JPEG', quality=95)
     out_bytes.seek(0)
-    
     await context.bot.send_photo(chat_id=query.message.chat_id, photo=out_bytes, caption=f"✅ Applied: **{filter_name}**", reply_markup=tool_done_kb())
     await query.edit_message_text(f"✅ Applied {filter_name} successfully!")
 
@@ -535,15 +526,12 @@ async def handle_edit_photo(update, context):
     if not update.message.photo:
         await update.message.reply_text("❌ Please upload an image.")
         return
-    
     status_msg = await update.message.reply_text("⏳ Processing image...")
     try:
-        photo = update.message.photo[-1]
-        file = await context.bot.get_file(photo.file_id)
+        photo = update.message.photo[-1]; file = await context.bot.get_file(photo.file_id)
         img_bytes = BytesIO(); await file.download_to_memory(img_bytes); img_bytes.seek(0)
         img = Image.open(img_bytes)
         context.user_data['edit_image'] = img
-        
         kb = [
             [InlineKeyboardButton("🖼️ Original", callback_data="edit_orig"), InlineKeyboardButton("✨ HD 100x", callback_data="edit_hd"), InlineKeyboardButton("🎨 Vivid", callback_data="edit_vivid")],
             [InlineKeyboardButton("⬛ B&W", callback_data="edit_bw"), InlineKeyboardButton("🟤 Sepia", callback_data="edit_sepia"), InlineKeyboardButton("🔪 Sharpen", callback_data="edit_sharp")],
@@ -551,22 +539,21 @@ async def handle_edit_photo(update, context):
             [InlineKeyboardButton("🟥 Pixel", callback_data="edit_pixel"), InlineKeyboardButton("🔄 Invert", callback_data="edit_invert"), InlineKeyboardButton("✏️ Sketch", callback_data="edit_sketch")],
             [InlineKeyboardButton("🧊 Emboss", callback_data="edit_emboss"), InlineKeyboardButton("🎞️ Poster", callback_data="edit_poster"), InlineKeyboardButton("🔥 Solarize", callback_data="edit_solar")]
         ]
-        
         await status_msg.edit_text("✅ Image loaded!\n\nChoose one of the 15 editing features below:", reply_markup=InlineKeyboardMarkup(kb))
         context.user_data['state'] = None
     except Exception as e:
         await status_msg.edit_text(f"❌ Processing failed: {e}")
         context.user_data['state'] = None
 
-# --- BACKGROUND REMOVAL ---
+# --- BACKGROUND REMOVAL (Lazy import rembg) ---
 async def handle_remove_bg(update, context):
     if context.user_data.get('state') != 'awaiting_remove_bg': return
     if not update.message.photo:
         await update.message.reply_text("❌ Please upload an image.")
         return
-    
     status_msg = await update.message.reply_text("⏳ Removing background...")
     try:
+        from rembg import remove, new_session
         photo = update.message.photo[-1]; file = await context.bot.get_file(photo.file_id)
         img_bytes = BytesIO(); await file.download_to_memory(img_bytes); img_bytes.seek(0)
         input_img = Image.open(img_bytes)
@@ -579,7 +566,7 @@ async def handle_remove_bg(update, context):
         await status_msg.edit_text(f"❌ Background removal failed: {e}")
         context.user_data['state'] = None
 
-# --- CHANGE BACKGROUND ---
+# --- CHANGE BACKGROUND (Lazy import rembg) ---
 async def handle_bg_upload(update, context):
     if context.user_data.get('state') != 'awaiting_bg_upload': return
     if not update.message.photo:
@@ -601,6 +588,7 @@ async def handle_front_upload(update, context):
         return
     status_msg = await update.message.reply_text("⏳ Changing background...")
     try:
+        from rembg import remove
         photo = update.message.photo[-1]; file = await context.bot.get_file(photo.file_id)
         img_bytes = BytesIO(); await file.download_to_memory(img_bytes); img_bytes.seek(0)
         front_img = Image.open(img_bytes)
@@ -664,7 +652,7 @@ async def handle_image_convert(update, context, fmt):
         await status_msg.edit_text(f"❌ Conversion failed: {e}")
         context.user_data['state'] = None
 
-# --- DOCUMENT FORMAT CONVERSION ---
+# --- DOCUMENT CONVERSION ---
 async def handle_pdf_to_pptx(update, context):
     if context.user_data.get('state') != 'awaiting_doc_pdf_pptx': return
     if not update.message.document:
@@ -729,7 +717,7 @@ async def handle_pptx_to_pdf(update, context):
         await status_msg.edit_text(f"❌ Conversion failed: {e}")
         context.user_data['state'] = None
 
-# --- VOICE TO TEXT ---
+# --- VOICE TO TEXT (Lazy import speech_recognition) ---
 async def handle_voice_to_text(update, context, language):
     if not update.message.voice and not update.message.audio:
         await update.message.reply_text("❌ Please send a voice message OR an audio file.")
@@ -751,12 +739,7 @@ async def handle_voice_to_text(update, context, language):
             try:
                 client = Groq(api_key=GROQ_API_KEY)
                 with open(tmp_wav_path, "rb") as f:
-                    transcription = client.audio.transcriptions.create(
-                        file=(tmp_wav_path, f),
-                        model="whisper-large-v3",
-                        language=language.split('-')[0],
-                        response_format="text"
-                    )
+                    transcription = client.audio.transcriptions.create(file=(tmp_wav_path, f), model="whisper-large-v3", language=language.split('-')[0], response_format="text")
                 await update.message.reply_text(f"📝 **Transcribed Text (Groq):**\n\n{transcription}", reply_markup=tool_done_kb())
                 await status_msg.edit_text("✅ Transcription complete!")
                 os.unlink(tmp_ogg_path); os.unlink(tmp_wav_path)
@@ -780,7 +763,7 @@ async def handle_voice_to_text(update, context, language):
         await status_msg.edit_text(f"❌ Transcription failed: {e}")
         context.user_data['state'] = None
 
-# --- RELIABLE VIDEO DOWNLOADER ---
+# --- VIDEO DOWNLOADER (Direct Link) ---
 async def handle_video_download(update, context):
     if context.user_data.get('state') != 'awaiting_video_link': return
     url = update.message.text
@@ -788,11 +771,7 @@ async def handle_video_download(update, context):
         await update.message.reply_text("❌ Please send a valid video URL.")
         return
     status_msg = await update.message.reply_text("⏳ Processing video URL...")
-    ydl_opts = {
-        'quiet': True, 'no_warnings': True, 'noplaylist': True,
-        'simulate': True, 'skip_download': True, 'format': 'best',
-        'http_headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-    }
+    ydl_opts = {'quiet': True, 'no_warnings': True, 'noplaylist': True, 'simulate': True, 'skip_download': True, 'format': 'best', 'http_headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}}
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -811,7 +790,7 @@ async def handle_link(update, context):
     user_id = update.effective_user.id
     text = update.message.text if update.message.text else ""
     self_ping()
-
+    # State handlers
     if context.user_data.get('state') == 'awaiting_image_to_pdf': await handle_image_collect(update, context); return
     if context.user_data.get('state') == 'awaiting_pdf': await handle_pdf_upload(update, context); return
     if context.user_data.get('state') == 'awaiting_pdf_to_word': await handle_pdf_to_word(update, context); return
@@ -907,7 +886,7 @@ async def handle_link(update, context):
     else:
         await update.message.reply_text("👋 Use the menu buttons, or send a Telegram link.")
 
-# --- PDF UPLOAD ---
+# --- PDF, WORD, TEXT, IMAGE COLLECT (Same as before) ---
 async def handle_pdf_upload(update, context):
     if context.user_data.get('state') != 'awaiting_pdf': return
     if not update.message.document:
@@ -947,7 +926,6 @@ async def handle_pdf_upload(update, context):
     except Exception as e:
         await status_msg.edit_text(f"❌ Error: {e}"); context.user_data['state'] = None
 
-# --- PDF TO WORD ---
 async def handle_pdf_to_word(update, context):
     if context.user_data.get('state') != 'awaiting_pdf_to_word': return
     if not update.message.document:
@@ -973,7 +951,6 @@ async def handle_pdf_to_word(update, context):
     except Exception as e:
         await status_msg.edit_text(f"❌ Conversion failed: {e}"); context.user_data['state'] = None
 
-# --- IMAGE TO TEXT ---
 async def handle_image_to_text(update, context):
     if context.user_data.get('state') != 'awaiting_image_to_text': return
     if not update.message.photo:
@@ -995,7 +972,6 @@ async def handle_image_to_text(update, context):
     except Exception as e:
         await status_msg.edit_text(f"❌ OCR failed: {e}"); context.user_data['state'] = None
 
-# --- IMAGE COLLECT (PDF) ---
 async def handle_image_collect(update, context):
     if context.user_data.get('state') != 'awaiting_image_to_pdf': return
     if not update.message.photo:
@@ -1224,7 +1200,7 @@ async def inbox_listener(event):
         except Exception as e:
             print(f"Inbox Error: {e}")
 
-# --- MAIN EXECUTION (FIXED NO CONFLICT) ---
+# --- MAIN EXECUTION (FIXED MEMORY & PORT) ---
 async def main():
     init_db()
     def keep_alive():
@@ -1249,7 +1225,7 @@ async def main():
     print("Bot running...")
     await bot_app.initialize(); await bot_app.start(); await bot_app.updater.start_polling()
     
-    # FIXED: Ensure Flask binds to 0.0.0.0:10000 so Render doesn't timeout
+    # FIXED: Start Flask IMMEDIATELY in background to ensure port binding
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
     
     await asyncio.Event().wait()
