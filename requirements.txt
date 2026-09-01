@@ -10,3 +10,4 @@ Pillow
 SpeechRecognition
 imageio-ffmpeg
 groq
+rembg
