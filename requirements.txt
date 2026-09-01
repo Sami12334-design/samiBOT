@@ -4,13 +4,11 @@ flask
 pymupdf
 pdf2docx
 img2pdf
-rapidocr_onnxruntime
 yt-dlp
 Pillow
 SpeechRecognition
 imageio-ffmpeg
 groq
-rembg
 gTTS
 python-pptx
 reportlab
