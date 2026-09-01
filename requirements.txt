@@ -9,6 +9,8 @@ Pillow
 SpeechRecognition
 imageio-ffmpeg
 groq
-gTTS
+edge-tts
 python-pptx
 reportlab
+rembg
+onnxruntime
