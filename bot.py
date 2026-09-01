@@ -41,6 +41,7 @@ STRING_SESSION = os.environ.get('STRING_SESSION', '')
 BOT_PASSWORD = os.environ.get("BOT_PASSWORD", "ptss25")
 RENDER_URL = os.environ.get('RENDER_URL', 'https://samibot-s1h6.onrender.com')
 
+# Admin IDs (comma separated in Render)
 ADMIN_IDS = []
 admin_ids_str = os.environ.get('ADMIN_IDS', '')
 if admin_ids_str:
@@ -619,17 +620,17 @@ async def process_image_pdf(update, context):
             await update.message.reply_text(error_msg)
         context.user_data['state'] = None; context.user_data['pdf_images'] = []
 
-# --- SUPER POWERFUL VIDEO DOWNLOADER (FIXED WITH PLAYER CLIENTS) ---
+# --- SUPER POWERFUL VIDEO DOWNLOADER (NO 'NoneType' ERRORS) ---
 async def handle_video_download(update, context):
     if context.user_data.get('state') != 'awaiting_video_link': return
     url = update.message.text
     if not url.startswith("http"):
         await update.message.reply_text("❌ Please send a valid video URL (YouTube, TikTok, Instagram, Facebook)."); return
     
-    status_msg = await update.message.reply_text("⏳ Downloading video with advanced anti-bot methods...")
+    status_msg = await update.message.reply_text("⏳ Downloading video with advanced methods...")
     
-    # The key to bypassing IP blocks is using specific Player Clients like 'tv' or 'mweb'
-    ydl_opts = {
+    # Method 1: Standard with TV Client (Most Successful)
+    ydl_opts_1 = {
         'format': 'best[height<=720]',
         'outtmpl': os.path.join(tempfile.gettempdir(), '%(title)s.%(ext)s'),
         'quiet': True,
@@ -638,40 +639,60 @@ async def handle_video_download(update, context):
         'retries': 10,
         'fragment_retries': 10,
         'ignoreerrors': True,
-        # Use the least tracked clients: tv and mweb
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['tv', 'mweb', 'web_safari', 'android_vr'],
-                'player_skip': ['webpage', 'configs']
-            }
-        },
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15'
-        }
+        'extractor_args': {'youtube': {'player_client': ['tv', 'mweb', 'web_safari']}},
+        'http_headers': {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15'}
+    }
+    
+    # Method 2: Android Client
+    ydl_opts_2 = {
+        'format': 'best[height<=720]',
+        'outtmpl': os.path.join(tempfile.gettempdir(), '%(title)s.%(ext)s'),
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'retries': 10,
+        'fragment_retries': 10,
+        'ignoreerrors': True,
+        'extractor_args': {'youtube': {'player_client': ['android']}},
+        'http_headers': {'User-Agent': 'Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36'}
+    }
+    
+    # Method 3: Direct Link Sniffer (Last Resort, always returns something)
+    ydl_opts_3 = {
+        'quiet': True, 
+        'no_warnings': True,
+        'noplaylist': True,
+        'simulate': True,
+        'skip_download': True,
+        'extract_flat': True
     }
     
     filename = None
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-    except Exception as e:
-        # Fallback: Try the android client method
-        ydl_opts['extractor_args']['youtube']['player_client'] = ['android']
+    for method, opts in enumerate([ydl_opts_1, ydl_opts_2], 1):
         try:
-            await status_msg.edit_text("⚠️ Initial method blocked. Trying Android client...")
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 filename = ydl.prepare_filename(info)
-        except Exception as e2:
-            await status_msg.edit_text(f"❌ Download failed. Platforms are blocking the server IP.\n**Error:** {str(e2)[:200]}")
+                if os.path.exists(filename) and os.path.getsize(filename) > 0:
+                    break
+        except Exception:
+            continue
+    
+    # If both fail, try to get direct link
+    if not filename or not os.path.exists(filename):
+        try:
+            await status_msg.edit_text("⚠️ Direct download failed. Extracting direct link...")
+            with yt_dlp.YoutubeDL(ydl_opts_3) as ydl:
+                info = ydl.extract_info(url, download=False)
+                direct_url = info.get('url') or info.get('webpage_url') or url
+                await status_msg.edit_text("✅ Video detected! Sending direct link...")
+                await update.message.reply_text(f"🎬 **Direct Video Link:**\n{direct_url}")
+                context.user_data['state'] = None
+                return
+        except Exception as e:
+            await status_msg.edit_text(f"❌ Failed. Platforms are blocking server IP.\n**Error:** {str(e)[:200]}")
             context.user_data['state'] = None
             return
-    
-    if not filename or not os.path.exists(filename):
-        await status_msg.edit_text("❌ Could not download video.")
-        context.user_data['state'] = None
-        return
     
     try:
         with open(filename, 'rb') as video_file:
