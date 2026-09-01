@@ -6,6 +6,7 @@ import time
 import threading
 import sqlite3
 import tempfile
+import subprocess
 import urllib.request
 from io import BytesIO
 from flask import Flask
@@ -20,6 +21,8 @@ import pymupdf
 import img2pdf
 from pdf2docx import Converter
 import yt_dlp
+import speech_recognition as sr
+import imageio_ffmpeg
 
 try:
     from telethon.tl.functions.stories import GetPeerStoriesRequest, GetStoriesByIDRequest
@@ -350,10 +353,11 @@ async def menu_callback(update, context):
     elif data == "converter":
         kb = [
             [InlineKeyboardButton("📄 PDF to Word", callback_data="pdf_to_word"), InlineKeyboardButton("🖼️ Image to Text", callback_data="image_to_text")],
-            [InlineKeyboardButton("🖼️ Image to PDF", callback_data="image_to_pdf")],
+            [InlineKeyboardButton("🖼️ Image to PDF", callback_data="image_to_pdf"), InlineKeyboardButton("🖼️ Image to 4K", callback_data="image_4k")],
+            [InlineKeyboardButton("🎙️ Voice to Text (ENG)", callback_data="voice_en"), InlineKeyboardButton("🎙️ Voice to Text (AM)", callback_data="voice_am")],
             [InlineKeyboardButton("⬅️ Back", callback_data="more")]
         ]
-        await query.edit_message_text("🔄 MEDIA CONVERTER\n\nChoose an option:", reply_markup=InlineKeyboardMarkup(kb))
+        await query.edit_message_text("🔄 MEDIA CONVERTER & AI TOOLS\n\nChoose an option:", reply_markup=InlineKeyboardMarkup(kb))
     elif data == "pdf_to_word":
         await query.edit_message_text("📄 PDF to Word\n\nPlease upload the PDF file.")
         context.user_data['state'] = 'awaiting_pdf_to_word'
@@ -366,6 +370,15 @@ async def menu_callback(update, context):
         context.user_data['pdf_images'] = []
     elif data == "img_pdf_done":
         await process_image_pdf(update, context)
+    elif data == "image_4k":
+        await query.edit_message_text("🖼️ Image to 4K\n\nSend me an image, I'll upscale it to 4K resolution.")
+        context.user_data['state'] = 'awaiting_image_4k'
+    elif data == "voice_en":
+        await query.edit_message_text("🎙️ Voice to Text (English)\n\nSend me a voice message.")
+        context.user_data['state'] = 'awaiting_voice_en'
+    elif data == "voice_am":
+        await query.edit_message_text("🎙️ Voice to Text (Amharic)\n\nSend me a voice message.")
+        context.user_data['state'] = 'awaiting_voice_am'
     elif data == "video_downloader":
         await query.edit_message_text("🎬 VIDEO DOWNLOADER\n\nSend me a YouTube, TikTok, Instagram, or Facebook video link.")
         context.user_data['state'] = 'awaiting_video_link'
@@ -619,6 +632,96 @@ async def process_image_pdf(update, context):
             await update.message.reply_text(error_msg)
         context.user_data['state'] = None; context.user_data['pdf_images'] = []
 
+# --- NEW FEATURE: IMAGE TO 4K ---
+async def handle_image_to_4k(update, context):
+    if context.user_data.get('state') != 'awaiting_image_4k': return
+    if not update.message.photo:
+        await update.message.reply_text("❌ Please upload an image."); return
+    
+    status_msg = await update.message.reply_text("⏳ Upscaling image to 4K resolution...")
+    try:
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        img_bytes = BytesIO(); await file.download_to_memory(img_bytes); img_bytes.seek(0)
+        
+        img = Image.open(img_bytes)
+        
+        # Determine orientation and resize to 4K dimensions
+        max_side = 3840
+        if img.width >= img.height:
+            new_width = max_side
+            new_height = int(img.height * (max_side / img.width))
+        else:
+            new_height = max_side
+            new_width = int(img.width * (max_side / img.height))
+        
+        # Use LANCZOS for smooth upscaling
+        img_4k = img.resize((new_width, new_height), Image.LANCZOS)
+        
+        out_bytes = BytesIO()
+        img_4k.save(out_bytes, format='JPEG', quality=95)
+        out_bytes.seek(0)
+        
+        await update.message.reply_photo(photo=out_bytes, caption="✅ Image upscaled to 4K Resolution!")
+        await status_msg.edit_text("✅ 4K Upscale complete!")
+        context.user_data['state'] = None
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Upscaling failed: {e}")
+        context.user_data['state'] = None
+
+# --- NEW FEATURE: VOICE TO TEXT ---
+async def handle_voice_to_text(update, context, language):
+    if not update.message.voice:
+        await update.message.reply_text("❌ Please send a voice message.")
+        return
+    
+    status_msg = await update.message.reply_text("⏳ Transcribing voice...")
+    
+    try:
+        # Download voice message to BytesIO
+        file = await context.bot.get_file(update.message.voice.file_id)
+        voice_bytes = BytesIO()
+        await file.download_to_memory(voice_bytes)
+        voice_bytes.seek(0)
+        
+        # Save to temp .ogg file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as tmp_ogg:
+            tmp_ogg.write(voice_bytes.read())
+            tmp_ogg_path = tmp_ogg.name
+            
+        # Save to temp .wav file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav:
+            tmp_wav_path = tmp_wav.name
+        
+        # Get ffmpeg binary from imageio_ffmpeg (No system installs needed!)
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        
+        # Convert OGG to WAV
+        cmd = [ffmpeg_exe, "-i", tmp_ogg_path, "-ar", "16000", "-ac", "1", tmp_wav_path, "-y"]
+        subprocess.run(cmd, check=True, capture_output=True)
+        
+        # Recognize text
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(tmp_wav_path) as source:
+            audio_data = recognizer.record(source)
+        
+        try:
+            text = recognizer.recognize_google(audio_data, language=language)
+            await status_msg.edit_text(f"📝 **Transcribed Text:**\n\n{text}")
+        except sr.UnknownValueError:
+            await status_msg.edit_text("❌ Could not understand the audio.")
+        except sr.RequestError:
+            await status_msg.edit_text("❌ Speech recognition service is unavailable.")
+        
+        # Cleanup temp files
+        os.unlink(tmp_ogg_path)
+        os.unlink(tmp_wav_path)
+        context.user_data['state'] = None
+        
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Transcription failed: {e}")
+        context.user_data['state'] = None
+
 # --- RELIABLE VIDEO DOWNLOADER (DIRECT LINK SNIFFER) ---
 async def handle_video_download(update, context):
     if context.user_data.get('state') != 'awaiting_video_link': return
@@ -628,7 +731,6 @@ async def handle_video_download(update, context):
     
     status_msg = await update.message.reply_text("⏳ Processing video URL...")
     
-    # Standard extraction without problematic extractor_args
     ydl_opts = {
         'quiet': True, 
         'no_warnings': True,
@@ -644,8 +746,6 @@ async def handle_video_download(update, context):
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            
-            # Extract direct URL safely
             direct_url = info.get('url') if info else None
             if not direct_url:
                 direct_url = info.get('webpage_url') if info else None
@@ -655,8 +755,7 @@ async def handle_video_download(update, context):
             await status_msg.edit_text("✅ Video detected! Sending direct link...")
             await update.message.reply_text(
                 f"🎬 **Direct Video Link:**\n{direct_url}\n\n"
-                f"*Click the link above to view or download the video.*\n"
-                f"*Note: Server IPs are blocked by YouTube for direct downloads, so the bot extracts the direct .mp4 link for you.*"
+                f"*Click the link above to view or download the video.*"
             )
             context.user_data['state'] = None
             
@@ -664,7 +763,7 @@ async def handle_video_download(update, context):
         await status_msg.edit_text(
             f"❌ Could not process video.\n"
             f"**Error:** {str(e)[:150]}\n\n"
-            f"*Note: YouTube aggressively blocks requests from server IPs like Render. Please try TikTok or Instagram.*"
+            f"*Note: YouTube aggressively blocks requests from server IPs like Render.*"
         )
         context.user_data['state'] = None
 
@@ -681,6 +780,12 @@ async def handle_link(update, context):
         await handle_pdf_to_word(update, context); return
     if context.user_data.get('state') == 'awaiting_image_to_text':
         await handle_image_to_text(update, context); return
+    if context.user_data.get('state') == 'awaiting_image_4k':
+        await handle_image_to_4k(update, context); return
+    if context.user_data.get('state') == 'awaiting_voice_en':
+        await handle_voice_to_text(update, context, 'en-US'); return
+    if context.user_data.get('state') == 'awaiting_voice_am':
+        await handle_voice_to_text(update, context, 'am-ET'); return
     if context.user_data.get('state') == 'awaiting_video_link':
         await handle_video_download(update, context); return
     if context.user_data.get('state') == 'awaiting_password':
