@@ -41,13 +41,32 @@ STRING_SESSION = os.environ.get('STRING_SESSION', '')
 BOT_PASSWORD = os.environ.get("BOT_PASSWORD", "ptss25")
 RENDER_URL = os.environ.get('RENDER_URL', 'https://samibot-s1h6.onrender.com')
 
-# ADMIN IDs (comma separated in Render)
+# Admin IDs (comma separated in Render)
 ADMIN_IDS = []
 admin_ids_str = os.environ.get('ADMIN_IDS', '')
 if admin_ids_str:
     ADMIN_IDS = [int(x.strip()) for x in admin_ids_str.split(',') if x.strip().isdigit()]
 
 telethon_client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
+
+# --- INSTANCE LOCK (Prevents Conflict Error) ---
+LOCK_FILE = '/tmp/samibot.lock'
+def acquire_lock():
+    if os.path.exists(LOCK_FILE):
+        with open(LOCK_FILE, 'r') as f:
+            pid = f.read().strip()
+        print(f"❌ Conflict Detected! Another instance (PID: {pid}) may still be running.")
+        return False
+    with open(LOCK_FILE, 'w') as f:
+        f.write(str(os.getpid()))
+    return True
+
+def release_lock():
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.unlink(LOCK_FILE)
+    except Exception:
+        pass
 
 def self_ping():
     try:
@@ -196,7 +215,7 @@ async def handle_telethon_error(update, error):
 # --- COMMAND HANDLERS ---
 async def start(update, context):
     user_id = update.effective_user.id
-    self_ping()
+    self_ping() 
     if not is_authenticated(user_id):
         context.user_data['state'] = 'awaiting_password'
         await update.message.reply_text("🔐 TELEGRAM ASSISTANT\n\nPassword required.\nPlease enter the password to continue.")
@@ -222,17 +241,19 @@ async def broadcast_command(update, context):
     if len(context.args) == 0:
         await update.message.reply_text("📢 Usage: /broadcast <message>")
         return
+    
+    # FIXED: Removed "Broadcast" prefix, delivering ONLY the message
     message_text = " ".join(context.args)
     users = get_all_authenticated_users()
     sent = 0
     failed = 0
     for uid in users:
         try:
-            await context.bot.send_message(chat_id=uid, text=f"📢 **Broadcast**\n\n{message_text}", parse_mode=ParseMode.MARKDOWN)
+            await context.bot.send_message(chat_id=uid, text=message_text)
             sent += 1
         except Exception:
             failed += 1
-    await update.message.reply_text(f"📢 Broadcast sent!\n✅ Sent: {sent}\n❌ Failed: {failed}")
+    await update.message.reply_text(f"✅ Broadcast sent to {sent} users! ❌ Failed: {failed}")
 
 async def set_bot_name(update, context):
     user_id = update.effective_user.id
@@ -289,6 +310,7 @@ async def restart_command(update, context):
         await update.message.reply_text("🔒 Admin only command.")
         return
     await update.message.reply_text("🔄 Restarting bot... Please wait.")
+    release_lock()  # Release the lock before restarting
     try:
         app = context.application
         await app.stop()
@@ -316,15 +338,12 @@ async def menu_callback(update, context):
         await query.edit_message_text("🤖 TELEGRAM ASSISTANT", reply_markup=InlineKeyboardMarkup(keyboard))
 
     elif data == "more":
-        # Standard user buttons
         kb = [
             [InlineKeyboardButton("🔎 Search", callback_data="search"), InlineKeyboardButton("📊 Statistics", callback_data="stats")],
             [InlineKeyboardButton("📄 PDF Fetch", callback_data="pdf_fetch")],
             [InlineKeyboardButton("🔄 Converter", callback_data="converter")],
             [InlineKeyboardButton("🎬 Video Downloader", callback_data="video_downloader")]
         ]
-
-        # Admin specific buttons
         if is_admin(user_id):
             admin_buttons = [
                 [InlineKeyboardButton("🔔 Track", callback_data="track"), InlineKeyboardButton("🔗 Names", callback_data="names")],
@@ -337,7 +356,6 @@ async def menu_callback(update, context):
                 [InlineKeyboardButton("📢 Broadcast", callback_data="broadcast")]
             ]
             kb = admin_buttons + kb
-
         kb.append([InlineKeyboardButton("⬅️ Back", callback_data="main_menu")])
         await query.edit_message_text("➕ MORE COMMANDS", reply_markup=InlineKeyboardMarkup(kb))
 
@@ -352,73 +370,32 @@ async def menu_callback(update, context):
     elif data == "pdf_to_word":
         await query.edit_message_text("📄 PDF to Word\n\nPlease upload the PDF file.")
         context.user_data['state'] = 'awaiting_pdf_to_word'
-
     elif data == "image_to_text":
         await query.edit_message_text("🖼️ Image to Text\n\nPlease upload an image.")
         context.user_data['state'] = 'awaiting_image_to_text'
-
     elif data == "image_to_pdf":
         await query.edit_message_text("🖼️ Image to PDF\n\nSend images (1-10). Click Done when finished.")
         context.user_data['state'] = 'awaiting_image_to_pdf'
         context.user_data['pdf_images'] = []
-
     elif data == "img_pdf_done":
         await process_image_pdf(update, context)
-
     elif data == "video_downloader":
         await query.edit_message_text("🎬 VIDEO DOWNLOADER\n\nSend me a YouTube, TikTok, Instagram, or Facebook video link.")
         context.user_data['state'] = 'awaiting_video_link'
-
     elif data == "broadcast":
         await query.edit_message_text("📢 BROADCAST\n\nUsage: /broadcast <message>")
-
     elif data == "profile":
         await query.edit_message_text("👤 PROFILE\n\nEnter a Telegram username or ID to generate the Profile Card:")
         context.user_data['state'] = 'profile_query'
-
     elif data == "fetch":
         await query.edit_message_text("🔗 Fetch Telegram\n\nSend me a link (e.g., t.me/channel/123 or t.me/channel/123-130):")
         context.user_data['state'] = 'fetch_link'
-
     elif data == "search":
         await query.edit_message_text("🔎 SEARCH\n\nEnter any keyword to search across your chats:\nExample: Logic mid")
         context.user_data['state'] = 'search_query'
-
     elif data == "pdf_fetch":
         await query.edit_message_text("📄 PDF FETCH\n\nPlease upload the PDF file directly to this chat.")
         context.user_data['state'] = 'awaiting_pdf'
-
-    elif data.startswith("posts_"):
-        page = int(data.split("_")[1])
-        await handle_posts_pagination(update, context, page)
-
-    elif data.startswith("story_"):
-        if data == "story_start":
-            context.user_data["story_index"] = 0
-            entity = context.user_data.get("story_entity") or context.user_data.get("profile_entity")
-            if not entity:
-                await query.edit_message_text("❌ No profile selected.")
-                return
-            await query.answer("Fetching Stories…")
-            try:
-                if not GetPeerStoriesRequest:
-                    await query.edit_message_text("❌ Telethon does not support stories in this installation.")
-                    return
-                response = await telethon_client(GetPeerStoriesRequest(peer=entity))
-                stories = list(getattr(response, "stories", []) or [])
-                if not stories:
-                    await query.edit_message_text("❌ No active Stories are available.")
-                    return
-                context.user_data["stories_list"] = stories
-                await display_story(update, context)
-            except Exception as e:
-                await query.edit_message_text(f"❌ Could not retrieve Stories: {e}")
-        elif data == "story_next":
-            context.user_data["story_index"] = context.user_data.get("story_index", 0) + 1
-            await display_story(update, context)
-        elif data == "story_prev":
-            context.user_data["story_index"] = context.user_data.get("story_index", 0) - 1
-            await display_story(update, context)
 
 # --- FEATURES ---
 async def fetch_profile(update, context, target):
@@ -444,65 +421,6 @@ async def fetch_profile(update, context, target):
             await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {type(e).__name__}: {e}")
-
-async def handle_posts_pagination(update, context, page):
-    query = update.callback_query
-    await query.answer()
-    entity = context.user_data.get("post_entity") or context.user_data.get("profile_entity")
-    if not entity:
-        await query.edit_message_text("❌ No profile selected.")
-        return
-    per_page = 5
-    try:
-        messages = await telethon_client.get_messages(entity, limit=(page * per_page))
-    except Exception as e:
-        await query.edit_message_text(f"❌ Could not fetch posts: {e}")
-        return
-    total_posts = len(messages)
-    start = (page - 1) * per_page
-    end = min(start + per_page, total_posts)
-    page_items = messages[start:end]
-    if not page_items:
-        await query.edit_message_text("No more posts to show.")
-        return
-    title = getattr(entity, "title", None) or getattr(entity, "first_name", "User")
-    text = f"📰 POSTS OF {title}\nPage {page}\n\n"
-    for m in page_items:
-        content = (m.message or "").strip()[:80] if m.message else f"[{get_media_type(m)}]"
-        text += f"• {content}\n"
-    kb = []
-    if page > 1: kb.append([InlineKeyboardButton("⬅️ Previous", callback_data=f"posts_{page-1}")])
-    if end < total_posts: kb.append([InlineKeyboardButton("Next ➡️", callback_data=f"posts_{page+1}")])
-    kb.append([InlineKeyboardButton("⬅️ Back to Profile", callback_data="profile")])
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
-
-async def display_story(update, context):
-    query = update.callback_query
-    await query.answer()
-    stories = context.user_data.get("stories_list", [])
-    index = context.user_data.get("story_index", 0)
-    if not stories:
-        await query.edit_message_text("❌ No accessible active Stories found.")
-        return
-    index = max(0, min(index, len(stories) - 1))
-    context.user_data["story_index"] = index
-    story = stories[index]
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Previous", callback_data="story_prev"), InlineKeyboardButton("Next ➡️", callback_data="story_next")], [InlineKeyboardButton("⬅️ Back to Profile", callback_data="profile")]])
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg" if story.media.photo else ".mp4") as tmp:
-            await telethon_client.download_media(story, file=tmp.name)
-            tmp_path = tmp.name
-        caption = getattr(story, "caption", None) or ""
-        caption = f"{caption}\n\n📖 Story {index + 1}/{len(stories)}".strip()
-        with open(tmp_path, "rb") as f:
-            if hasattr(story.media, 'photo') and story.media.photo:
-                media = InputMediaPhoto(media=InputFile(f), caption=caption)
-            else:
-                media = InputMediaVideo(media=InputFile(f), caption=caption)
-            await query.edit_message_media(media=media, reply_markup=kb)
-        os.unlink(tmp_path)
-    except Exception as e:
-        await query.edit_message_text(f"❌ Could not fetch story: {e}", reply_markup=kb)
 
 async def fetch_search(update, context, query):
     status_msg = await update.message.reply_text(f"🔎 Searching accessible chats and public Telegram chats for: {query}")
@@ -573,9 +491,7 @@ async def handle_pdf_to_word(update, context):
     status_msg = await update.message.reply_text("⏳ Converting PDF to Word...")
     try:
         file = await context.bot.get_file(update.message.document.file_id)
-        pdf_bytes = BytesIO()
-        await file.download_to_memory(pdf_bytes)
-        pdf_bytes.seek(0)
+        pdf_bytes = BytesIO(); await file.download_to_memory(pdf_bytes); pdf_bytes.seek(0)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
             tmp_pdf.write(pdf_bytes.read()); tmp_pdf_path = tmp_pdf.name
         with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp_docx:
@@ -614,22 +530,17 @@ async def handle_image_collect(update, context):
     if context.user_data.get('state') != 'awaiting_image_to_pdf': return
     if not update.message.photo:
         await update.message.reply_text("❌ Please upload an image or click /done to finish."); return
-    
     if 'pdf_images' not in context.user_data:
         context.user_data['pdf_images'] = []
-    
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
-    img_bytes = BytesIO()
-    await file.download_to_memory(img_bytes)
-    img_bytes.seek(0)
+    img_bytes = BytesIO(); await file.download_to_memory(img_bytes); img_bytes.seek(0)
     context.user_data['pdf_images'].append(img_bytes)
-    
     count = len(context.user_data['pdf_images'])
     if count >= 10:
         await process_image_pdf(update, context)
     else:
-        await update.message.reply_text(f"✅ Image {count}/10 added.\nSend another image, or click /done to process.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done", callback_data="img_pdf_done")]]))
+        await update.message.reply_text(f"✅ Image {count}/10 added.\nSend another image, or click Done to process.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done", callback_data="img_pdf_done")]]))
 
 async def process_image_pdf(update, context):
     if isinstance(update, Update) and update.callback_query:
@@ -637,53 +548,34 @@ async def process_image_pdf(update, context):
         await query.answer()
     else:
         query = None
-
     if not context.user_data.get('pdf_images'):
-        if query:
-            await query.edit_message_text("❌ No images received.")
-        else:
-            await update.message.reply_text("❌ No images received.")
-        context.user_data['state'] = None
-        return
-
+        if query: await query.edit_message_text("❌ No images received.")
+        else: await update.message.reply_text("❌ No images received.")
+        context.user_data['state'] = None; return
     status_msg = None
-    if query:
-        status_msg = await query.edit_message_text("⏳ Converting images to PDF...")
-    else:
-        status_msg = await update.message.reply_text("⏳ Converting images to PDF...")
-
+    if query: status_msg = await query.edit_message_text("⏳ Converting images to PDF...")
+    else: status_msg = await update.message.reply_text("⏳ Converting images to PDF...")
     try:
         images = context.user_data['pdf_images']
-        # Convert all images to PDF
         pdf_bytes = img2pdf.convert([img.getvalue() for img in images])
-        
         await update.message.reply_document(document=BytesIO(pdf_bytes), filename="images.pdf")
-        
-        if status_msg:
-            await status_msg.edit_text("✅ Images converted to PDF!")
-        context.user_data['state'] = None
-        context.user_data['pdf_images'] = []
+        if status_msg: await status_msg.edit_text("✅ Images converted to PDF!")
+        context.user_data['state'] = None; context.user_data['pdf_images'] = []
     except Exception as e:
-        if status_msg:
-            await status_msg.edit_text(f"❌ Conversion failed: {e}")
-        context.user_data['state'] = None
-        context.user_data['pdf_images'] = []
+        if status_msg: await status_msg.edit_text(f"❌ Conversion failed: {e}")
+        context.user_data['state'] = None; context.user_data['pdf_images'] = []
 
-# --- VIDEO DOWNLOADER LOGIC (WITH FALLBACK) ---
+# --- VIDEO DOWNLOADER LOGIC ---
 async def handle_video_download(update, context):
     if context.user_data.get('state') != 'awaiting_video_link': return
     url = update.message.text
     if not url.startswith("http"):
         await update.message.reply_text("❌ Please send a valid video URL (YouTube, TikTok, Instagram, Facebook)."); return
-    
     status_msg = await update.message.reply_text("⏳ Downloading video... This may take a while.")
-    
-    # Different options to try in case of failure
     ydl_opts_list = [
         {'format': 'best[height<=720]', 'outtmpl': '%(title)s.%(ext)s', 'quiet': True, 'no_warnings': True},
         {'format': 'best', 'outtmpl': '%(title)s.%(ext)s', 'quiet': True, 'no_warnings': True, 'http_headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}}
     ]
-    
     filename = None
     for opts in ydl_opts_list:
         try:
@@ -692,13 +584,10 @@ async def handle_video_download(update, context):
                 filename = ydl.prepare_filename(info)
             break
         except Exception as e:
-            await status_msg.edit_text(f"⚠️ A method failed, trying another...")
+            await status_msg.edit_text("⚠️ A method failed, trying another...")
             continue
-    
     if not filename:
-        await status_msg.edit_text("❌ Download failed. The platform requires authentication or specific cookies.")
-        return
-    
+        await status_msg.edit_text("❌ Download failed. The platform requires authentication or specific cookies."); return
     try:
         with open(filename, 'rb') as video_file:
             await update.message.reply_video(video=video_file, caption="✅ Downloaded!")
@@ -715,10 +604,8 @@ async def handle_link(update, context):
     text = update.message.text if update.message.text else ""
     self_ping()
 
-    # State handling for multi-image PDF
     if context.user_data.get('state') == 'awaiting_image_to_pdf':
         await handle_image_collect(update, context); return
-
     if context.user_data.get('state') == 'awaiting_pdf':
         await handle_pdf_upload(update, context); return
     if context.user_data.get('state') == 'awaiting_pdf_to_word':
@@ -727,7 +614,6 @@ async def handle_link(update, context):
         await handle_image_to_text(update, context); return
     if context.user_data.get('state') == 'awaiting_video_link':
         await handle_video_download(update, context); return
-
     if context.user_data.get('state') == 'awaiting_password':
         if text == BOT_PASSWORD:
             add_authenticated_user(user_id); context.user_data['state'] = None
@@ -737,10 +623,8 @@ async def handle_link(update, context):
         else:
             await update.message.reply_text("❌ Incorrect password. Please try again.")
         return
-
     if not is_authenticated(user_id):
         await update.message.reply_text("🔐 Password required. Please run /start and authenticate first."); return
-
     if context.user_data.get('reply_to'):
         target_chat = context.user_data['reply_to']
         try:
@@ -749,7 +633,6 @@ async def handle_link(update, context):
         except Exception as e:
             await update.message.reply_text(f"❌ Failed: {e}")
         return
-
     state = context.user_data.get('state')
     if state:
         context.user_data['state'] = None
@@ -759,7 +642,6 @@ async def handle_link(update, context):
         elif state == 'friends': await fetch_friends(update, context, text)
         elif state == 'names': await fetch_names(update, context, text)
         return
-
     if "t.me" in text:
         username, msg_id, comment_id = parse_tg_link(text)
         if not username:
@@ -849,7 +731,7 @@ async def handle_pdf_upload(update, context):
     except Exception as e:
         await status_msg.edit_text(f"❌ Error: {e}"); context.user_data['state'] = None
 
-# --- OTHER FEATURES (Admin Only - Hidden from users) ---
+# --- OTHER FEATURES (ADMIN ONLY) ---
 async def fetch_words(update, context, target):
     try:
         entity = await telethon_client.get_entity(target)
@@ -931,16 +813,23 @@ async def inbox_listener(event):
 
 # --- MAIN EXECUTION ---
 async def main():
+    # Acquire Lock to prevent conflicts
+    if not acquire_lock():
+        print("❌ Another instance is already running. Exiting...")
+        return
+
     init_db()
     def keep_alive():
         while True:
             self_ping()
             time.sleep(600)
     threading.Thread(target=keep_alive, daemon=True).start()
+
     try:
         await telethon_client.start(); print("Telethon connected!")
     except Exception as e:
-        print(f"Telethon fail: {e}"); return
+        print(f"Telethon fail: {e}"); release_lock(); return
+
     bot_app = Application.builder().token(BOT_TOKEN).build()
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("logout", logout))
@@ -951,10 +840,14 @@ async def main():
     bot_app.add_handler(CommandHandler("restart", restart_command))
     bot_app.add_handler(CallbackQueryHandler(menu_callback))
     bot_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_link))
+
     print("Bot running...")
     await bot_app.initialize(); await bot_app.start(); await bot_app.updater.start_polling()
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
     await asyncio.Event().wait()
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    finally:
+        release_lock()
