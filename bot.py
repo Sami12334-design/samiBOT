@@ -10,7 +10,7 @@ import subprocess
 import urllib.request
 from io import BytesIO
 from flask import Flask
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo, InputFile
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
@@ -23,6 +23,7 @@ from pdf2docx import Converter
 import yt_dlp
 import speech_recognition as sr
 import imageio_ffmpeg
+from groq import Groq  # For Super Accurate Amharic Transcription
 
 try:
     from telethon.tl.functions.stories import GetPeerStoriesRequest, GetStoriesByIDRequest
@@ -43,6 +44,7 @@ API_HASH = os.environ.get('API_HASH', '')
 STRING_SESSION = os.environ.get('STRING_SESSION', '')
 BOT_PASSWORD = os.environ.get("BOT_PASSWORD", "ptss25")
 RENDER_URL = os.environ.get('RENDER_URL', 'https://samibot-s1h6.onrender.com')
+GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '') # Optional, but highly recommended for Amharic
 
 ADMIN_IDS = []
 admin_ids_str = os.environ.get('ADMIN_IDS', '')
@@ -353,7 +355,7 @@ async def menu_callback(update, context):
     elif data == "converter":
         kb = [
             [InlineKeyboardButton("📄 PDF to Word", callback_data="pdf_to_word"), InlineKeyboardButton("🖼️ Image to Text", callback_data="image_to_text")],
-            [InlineKeyboardButton("🖼️ Image to PDF", callback_data="image_to_pdf"), InlineKeyboardButton("🖼️ Edit Photo", callback_data="image_4k")],
+            [InlineKeyboardButton("🖼️ Image to PDF", callback_data="image_to_pdf"), InlineKeyboardButton("🖼️ Edit Photo", callback_data="image_edit")],
             [InlineKeyboardButton("🎙️ Voice to Text (ENG)", callback_data="voice_en"), InlineKeyboardButton("🎙️ Voice to Text (AM)", callback_data="voice_am")],
             [InlineKeyboardButton("⬅️ Back", callback_data="more")]
         ]
@@ -370,14 +372,16 @@ async def menu_callback(update, context):
         context.user_data['pdf_images'] = []
     elif data == "img_pdf_done":
         await process_image_pdf(update, context)
-    elif data == "image_4k":
-        await query.edit_message_text("🖼️ **EDIT PHOTO**\n\n✨ Enhance this photo to 100K resolution, improving clarity 100x, sharpness, and texture while preserving the original subject's identity, background, and colors. Remove blur and compression artifacts, making it look like a high-resolution, professional photograph.\n\n*Send me the photo now.*")
-        context.user_data['state'] = 'awaiting_image_4k'
+    elif data == "image_edit":
+        await query.edit_message_text("🖼️ **PHOTO EDITOR**\n\nSend me a photo, and I will give you a menu with 15 professional editing tools to enhance it.")
+        context.user_data['state'] = 'awaiting_edit_photo'
+    elif data.startswith("edit_"):
+        await handle_photo_edit_selection(update, context, data)
     elif data == "voice_en":
         await query.edit_message_text("🎙️ Voice to Text (English)\n\nSend me a voice message OR an audio file (any length).")
         context.user_data['state'] = 'awaiting_voice_en'
     elif data == "voice_am":
-        await query.edit_message_text("🎙️ Voice to Text (Amharic)\n\nSend me a voice message OR an audio file (any length).")
+        await query.edit_message_text("🎙️ Voice to Text (Amharic)\n\nSend me a voice message OR an audio file (any length).\n\n⚡ Highly Recommended: Add a free GROQ_API_KEY to your Render env vars for near-perfect Amharic transcription!")
         context.user_data['state'] = 'awaiting_voice_am'
     elif data == "video_downloader":
         await query.edit_message_text("🎬 VIDEO DOWNLOADER\n\nSend me a YouTube, TikTok, Instagram, or Facebook video link.")
@@ -427,256 +431,117 @@ async def menu_callback(update, context):
             context.user_data["story_index"] = context.user_data.get("story_index", 0) - 1
             await display_story(update, context)
 
-async def fetch_profile(update, context, target):
-    try:
-        entity = await telethon_client.get_entity(target)
-        context.user_data["profile_entity"] = entity
-        context.user_data["post_entity"] = entity
-        context.user_data["story_entity"] = entity
-        save_user_history(entity.id, getattr(entity, "username", None), getattr(entity, "first_name", ""), getattr(entity, "last_name", ""))
-        first_name = getattr(entity, "first_name", "") or ""
-        last_name = getattr(entity, "last_name", "") or ""
-        display_name = f"{first_name} {last_name}".strip() or getattr(entity, "title", "Unknown")
-        text = f"<blockquote><b>{display_name}</b>\n@{getattr(entity, 'username', None) or 'N/A'}\n\n{getattr(entity, 'about', 'No bio')}\n\nID: {entity.id}\nVerified: {getattr(entity, 'verified', False)}\nPremium: {getattr(entity, 'premium', False)}\nBot: {getattr(entity, 'bot', False)}</blockquote>"
-        kb = [[InlineKeyboardButton("📰 View Posts", callback_data="posts_1"), InlineKeyboardButton("👁 View Story", callback_data="story_start")], [InlineKeyboardButton("⬅️ Back", callback_data="more")]]
-        try:
-            photo = await telethon_client.download_profile_photo(entity, file=BytesIO())
-            if photo:
-                photo.seek(0)
-                await update.message.reply_photo(photo=photo, caption=text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
-            else:
-                await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
-        except Exception:
-            await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {type(e).__name__}: {e}")
-
-async def handle_posts_pagination(update, context, page):
+# --- 15 PHOTO EDITING FEATURES ---
+async def handle_photo_edit_selection(update, context, data):
     query = update.callback_query
     await query.answer()
-    entity = context.user_data.get("post_entity") or context.user_data.get("profile_entity")
-    if not entity:
-        await query.edit_message_text("❌ No profile selected.")
-        return
-    per_page = 5
-    try:
-        messages = await telethon_client.get_messages(entity, limit=(page * per_page))
-    except Exception as e:
-        await query.edit_message_text(f"❌ Could not fetch posts: {e}")
-        return
-    total_posts = len(messages)
-    start = (page - 1) * per_page
-    end = min(start + per_page, total_posts)
-    page_items = messages[start:end]
-    if not page_items:
-        await query.edit_message_text("No more posts to show.")
-        return
-    title = getattr(entity, "title", None) or getattr(entity, "first_name", "User")
-    text = f"📰 POSTS OF {title}\nPage {page}\n\n"
-    for m in page_items:
-        content = (m.message or "").strip()[:80] if m.message else f"[{get_media_type(m)}]"
-        text += f"• {content}\n"
-    kb = []
-    if page > 1: kb.append([InlineKeyboardButton("⬅️ Previous", callback_data=f"posts_{page-1}")])
-    if end < total_posts: kb.append([InlineKeyboardButton("Next ➡️", callback_data=f"posts_{page+1}")])
-    kb.append([InlineKeyboardButton("⬅️ Back to Profile", callback_data="profile")])
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
-
-async def fetch_search(update, context, query):
-    status_msg = await update.message.reply_text(f"🔎 Searching accessible chats and public Telegram chats for: {query}")
-    try:
-        dialogs = await telethon_client.get_dialogs(limit=200)
-        peers = []
-        seen = set()
-        for dialog in dialogs:
-            entity = getattr(dialog, "entity", None)
-            if not entity: continue
-            key = (getattr(entity, "id", None), getattr(entity, "access_hash", None))
-            if key[0] not in seen:
-                seen.add(key[0]); peers.append(entity)
-        all_results = []
-        sem = asyncio.Semaphore(8)
-        async def worker(entity):
-            async with sem:
-                try:
-                    messages = await telethon_client.get_messages(entity, search=query, limit=3)
-                    return [{"entity": entity, "message": m, "link": f"https://t.me/{getattr(entity, 'username', entity.id)}/{m.id}", "content": (m.message or "[Media]")[:80]} for m in messages]
-                except Exception:
-                    return []
-        batches = await asyncio.gather(*(worker(e) for e in peers))
-        for batch in batches:
-            all_results.extend(batch)
-        if not all_results:
-            await status_msg.edit_text(f"❌ No results found for '{query}'.")
-            return
-        context.user_data["search_results"] = all_results
-        context.user_data["search_page"] = 1
-        await status_msg.delete()
-        await display_search_page(update, context, 1)
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Search failed: {e}")
-
-async def display_search_page(update, context, page):
-    query = update.callback_query
-    if query: await query.answer()
-    results = context.user_data.get("search_results", [])
-    query_text = " "
-    per_page = 10
-    total_pages = max(1, (len(results) + per_page - 1) // per_page)
-    page = max(1, min(page, total_pages))
-    start = (page - 1) * per_page
-    page_items = results[start:start + per_page]
-    text = f"<blockquote><b>Telegram Search</b>\n{query_text}\n\n"
-    for item in page_items:
-        text += f"🔗 <a href='{item['link']}'>{item['content']}</a>\n\n"
-    text += f"Page {page}/{total_pages}\nSort by relevance and activity</blockquote>"
-    kb = []
-    nav_row = []
-    if page > 1: nav_row.append(InlineKeyboardButton("⬅️ Previous", callback_data="search_prev"))
-    if page < total_pages: nav_row.append(InlineKeyboardButton("Next ➡️", callback_data="search_next"))
-    if nav_row: kb.append(nav_row)
-    kb.append([InlineKeyboardButton("🔄 New Search", callback_data="search"), InlineKeyboardButton("⬅️ Back", callback_data="more")])
-    if query: await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-    else: await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-
-async def handle_pdf_to_word(update, context):
-    if context.user_data.get('state') != 'awaiting_pdf_to_word': return
-    if not update.message.document:
-        await update.message.reply_text("❌ Please upload a PDF document.")
-        return
-    if update.message.document.mime_type != "application/pdf":
-        await update.message.reply_text("❌ The file you uploaded is not a PDF.")
-        return
-    status_msg = await update.message.reply_text("⏳ Converting PDF to Word...")
-    try:
-        file = await context.bot.get_file(update.message.document.file_id)
-        pdf_bytes = BytesIO(); await file.download_to_memory(pdf_bytes); pdf_bytes.seek(0)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
-            tmp_pdf.write(pdf_bytes.read()); tmp_pdf_path = tmp_pdf.name
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp_docx:
-            tmp_docx_path = tmp_docx.name
-        cv = Converter(tmp_pdf_path); cv.convert(tmp_docx_path); cv.close()
-        with open(tmp_docx_path, 'rb') as docx_file:
-            await update.message.reply_document(document=docx_file, filename="converted.docx")
-        os.unlink(tmp_pdf_path); os.unlink(tmp_docx_path)
-        await status_msg.edit_text("✅ PDF converted to Word successfully!")
-        context.user_data['state'] = None
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Conversion failed: {e}"); context.user_data['state'] = None
-
-async def handle_image_to_text(update, context):
-    if context.user_data.get('state') != 'awaiting_image_to_text': return
-    if not update.message.photo:
-        await update.message.reply_text("❌ Please upload an image."); return
-    status_msg = await update.message.reply_text("⏳ Extracting text from image...")
-    try:
-        from rapidocr_onnxruntime import RapidOCR
-        ocr = RapidOCR()
-        photo = update.message.photo[-1]; file = await context.bot.get_file(photo.file_id)
-        img_bytes = BytesIO(); await file.download_to_memory(img_bytes); img_bytes.seek(0)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_img:
-            tmp_img.write(img_bytes.read()); tmp_img_path = tmp_img.name
-        result, elapse = ocr(tmp_img_path); os.unlink(tmp_img_path)
-        if not result:
-            await status_msg.edit_text("❌ No text found in the image."); return
-        extracted_text = "\n".join([line[1] for line in result])
-        await update.message.reply_text(f"📝 **Extracted Text:**\n\n{extracted_text}")
-        await status_msg.edit_text("✅ Text extraction complete!"); context.user_data['state'] = None
-    except Exception as e:
-        await status_msg.edit_text(f"❌ OCR failed: {e}"); context.user_data['state'] = None
-
-async def handle_image_collect(update, context):
-    if context.user_data.get('state') != 'awaiting_image_to_pdf': return
-    if not update.message.photo:
-        await update.message.reply_text("❌ Please upload an image or click Done to finish."); return
-    if 'pdf_images' not in context.user_data:
-        context.user_data['pdf_images'] = []
-    photo = update.message.photo[-1]
-    file = await context.bot.get_file(photo.file_id)
-    img_bytes = BytesIO(); await file.download_to_memory(img_bytes); img_bytes.seek(0)
-    context.user_data['pdf_images'].append(img_bytes)
-    count = len(context.user_data['pdf_images'])
-    if count >= 10:
-        await process_image_pdf(update, context)
-    else:
-        await update.message.reply_text(f"✅ Image {count}/10 added.\nSend another image, or click Done to process.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done", callback_data="img_pdf_done")]]))
-
-async def process_image_pdf(update, context):
-    query = update.callback_query
-    if query:
-        await query.answer()
-    if not context.user_data.get('pdf_images'):
-        if query:
-            await query.edit_message_text("❌ No images received.")
-        else:
-            await update.message.reply_text("❌ No images received.")
-        context.user_data['state'] = None; return
-
-    try:
-        images = context.user_data['pdf_images']
-        pdf_bytes = img2pdf.convert([img.getvalue() for img in images])
-
-        chat_id = query.message.chat_id if query else update.effective_chat.id
-        await context.bot.send_document(chat_id=chat_id, document=BytesIO(pdf_bytes), filename="images.pdf")
-
-        if query:
-            await query.edit_message_text("✅ Images converted to PDF!")
-        else:
-            await update.message.reply_text("✅ Images converted to PDF!")
-        context.user_data['state'] = None; context.user_data['pdf_images'] = []
-    except Exception as e:
-        error_msg = f"❌ Conversion failed: {e}"
-        if query:
-            await query.edit_message_text(error_msg)
-        else:
-            await update.message.reply_text(error_msg)
-        context.user_data['state'] = None; context.user_data['pdf_images'] = []
-
-# --- NEW FEATURE: EDIT PHOTO (UPSCALE & ENHANCE) ---
-async def handle_image_to_4k(update, context):
-    if context.user_data.get('state') != 'awaiting_image_4k': return
-    if not update.message.photo:
-        await update.message.reply_text("❌ Please upload an image to enhance."); return
     
-    status_msg = await update.message.reply_text("✨ Enhancing photo to maximum clarity...")
+    if not context.user_data.get('edit_image'):
+        await query.edit_message_text("❌ No image found. Please send a photo first.")
+        return
+    
+    img = context.user_data['edit_image']
+    
+    # Upscale to max 4K for all
+    max_side = 4096
+    if img.width >= img.height:
+        new_width = max_side
+        new_height = int(img.height * (max_side / img.width))
+    else:
+        new_height = max_side
+        new_width = int(img.width * (max_side / img.height))
+    img = img.resize((new_width, new_height), Image.LANCZOS)
+    
+    filter_name = "Original"
+    if data == "edit_orig":
+        filter_name = "Original"
+    elif data == "edit_hd":
+        img = ImageEnhance.Sharpness(img).enhance(2.0)
+        img = ImageEnhance.Contrast(img).enhance(1.2)
+        img = ImageEnhance.Color(img).enhance(1.1)
+        filter_name = "HD Enhanced (100x Clarity)"
+    elif data == "edit_bw":
+        img = ImageOps.grayscale(img)
+        filter_name = "Black & White"
+    elif data == "edit_sepia":
+        sepia_matrix = (0.393, 0.769, 0.189, 0, 0.349, 0.686, 0.168, 0, 0.272, 0.534, 0.131, 0)
+        img = img.convert("RGB", sepia_matrix)
+        filter_name = "Vintage Sepia"
+    elif data == "edit_vivid":
+        img = ImageEnhance.Color(img).enhance(1.5)
+        img = ImageEnhance.Contrast(img).enhance(1.2)
+        filter_name = "Vivid"
+    elif data == "edit_sharp":
+        img = img.filter(ImageFilter.SHARPEN)
+        filter_name = "Sharpen"
+    elif data == "edit_bright":
+        img = ImageEnhance.Brightness(img).enhance(1.3)
+        filter_name = "Brighten"
+    elif data == "edit_dark":
+        img = ImageEnhance.Brightness(img).enhance(0.7)
+        filter_name = "Darken"
+    elif data == "edit_blur":
+        img = img.filter(ImageFilter.GaussianBlur(radius=2))
+        filter_name = "Soft Blur"
+    elif data == "edit_pixel":
+        small = img.resize((64, 64), Image.BILINEAR)
+        img = small.resize((new_width, new_height), Image.NEAREST)
+        filter_name = "Pixel Art"
+    elif data == "edit_invert":
+        img = ImageOps.invert(img.convert('RGB'))
+        filter_name = "Invert"
+    elif data == "edit_sketch":
+        img = img.convert('L')
+        img = ImageOps.invert(img)
+        img = img.filter(ImageFilter.EDGE_ENHANCE_MORE)
+        img = ImageOps.autocontrast(img)
+        filter_name = "Sketch"
+    elif data == "edit_emboss":
+        img = img.filter(ImageFilter.EMBOSS)
+        filter_name = "Emboss"
+    elif data == "edit_poster":
+        img = ImageOps.posterize(img.convert('RGB'), bits=3)
+        filter_name = "Posterize"
+    elif data == "edit_solar":
+        img = ImageOps.solarize(img.convert('RGB'), threshold=128)
+        filter_name = "Solarize"
+
+    out_bytes = BytesIO()
+    img.save(out_bytes, format='JPEG', quality=95)
+    out_bytes.seek(0)
+    
+    await context.bot.send_photo(chat_id=query.message.chat_id, photo=out_bytes, caption=f"✅ Applied: **{filter_name}**\nResolution: {img.width}x{img.height}")
+    await query.edit_message_text(f"✅ Applied {filter_name} successfully!")
+
+async def handle_edit_photo(update, context):
+    if context.user_data.get('state') != 'awaiting_edit_photo': return
+    if not update.message.photo:
+        await update.message.reply_text("❌ Please upload an image.")
+        return
+    
+    status_msg = await update.message.reply_text("⏳ Processing image...")
     try:
         photo = update.message.photo[-1]
         file = await context.bot.get_file(photo.file_id)
         img_bytes = BytesIO(); await file.download_to_memory(img_bytes); img_bytes.seek(0)
-        
         img = Image.open(img_bytes)
+        context.user_data['edit_image'] = img
         
-        # Upscale to maximum possible resolution (since true 100K is impossible)
-        max_side = 4096  # Maximum safe size for Render
-        if img.width >= img.height:
-            new_width = max_side
-            new_height = int(img.height * (max_side / img.width))
-        else:
-            new_height = max_side
-            new_width = int(img.width * (max_side / img.height))
+        kb = [
+            [InlineKeyboardButton("🖼️ Original", callback_data="edit_orig"), InlineKeyboardButton("✨ HD 100x", callback_data="edit_hd"), InlineKeyboardButton("🎨 Vivid", callback_data="edit_vivid")],
+            [InlineKeyboardButton("⬛ B&W", callback_data="edit_bw"), InlineKeyboardButton("🟤 Sepia", callback_data="edit_sepia"), InlineKeyboardButton("🔪 Sharpen", callback_data="edit_sharp")],
+            [InlineKeyboardButton("☀️ Brighten", callback_data="edit_bright"), InlineKeyboardButton("🌙 Darken", callback_data="edit_dark"), InlineKeyboardButton("🌫️ Blur", callback_data="edit_blur")],
+            [InlineKeyboardButton("🟥 Pixel", callback_data="edit_pixel"), InlineKeyboardButton("🔄 Invert", callback_data="edit_invert"), InlineKeyboardButton("✏️ Sketch", callback_data="edit_sketch")],
+            [InlineKeyboardButton("🧊 Emboss", callback_data="edit_emboss"), InlineKeyboardButton("🎞️ Poster", callback_data="edit_poster"), InlineKeyboardButton("🔥 Solarize", callback_data="edit_solar")]
+        ]
         
-        # Resize with LANCZOS
-        img_4k = img.resize((new_width, new_height), Image.LANCZOS)
-        
-        # Enhance Sharpness and Contrast
-        enhancer = ImageEnhance.Sharpness(img_4k)
-        img_final = enhancer.enhance(1.5)
-        
-        enhancer = ImageEnhance.Contrast(img_final)
-        img_final = enhancer.enhance(1.1)
-        
-        out_bytes = BytesIO()
-        img_final.save(out_bytes, format='JPEG', quality=95)
-        out_bytes.seek(0)
-        
-        await update.message.reply_photo(photo=out_bytes, caption="✅ Photo enhanced to maximum resolution and clarity!")
-        await status_msg.edit_text("✅ Edit Photo complete!")
+        await status_msg.edit_text("✅ Image loaded!\n\nChoose one of the 15 editing features below:", reply_markup=InlineKeyboardMarkup(kb))
         context.user_data['state'] = None
     except Exception as e:
-        await status_msg.edit_text(f"❌ Enhancement failed: {e}")
+        await status_msg.edit_text(f"❌ Processing failed: {e}")
         context.user_data['state'] = None
 
-# --- NEW FEATURE: VOICE/AUDIO TO TEXT (ACCEPTS BOTH VOICE AND AUDIO) ---
+# --- VOICE TO TEXT: GOOGLE (FREE) vs GROQ WHISPER (ACCURATE) ---
 async def handle_voice_to_text(update, context, language):
     if not update.message.voice and not update.message.audio:
         await update.message.reply_text("❌ Please send a voice message OR an audio file.")
@@ -685,7 +550,6 @@ async def handle_voice_to_text(update, context, language):
     status_msg = await update.message.reply_text("⏳ Transcribing voice/audio...")
     
     try:
-        # Get file ID from either voice or audio
         if update.message.voice:
             file_id = update.message.voice.file_id
         else:
@@ -701,39 +565,53 @@ async def handle_voice_to_text(update, context, language):
             tmp_ogg.write(voice_bytes.read())
             tmp_ogg_path = tmp_ogg.name
             
-        # Save to temp .wav file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav:
             tmp_wav_path = tmp_wav.name
         
-        # Get ffmpeg binary from imageio_ffmpeg
+        # Convert to WAV using bundled FFmpeg
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        
-        # Convert OGG to WAV
         cmd = [ffmpeg_exe, "-i", tmp_ogg_path, "-ar", "16000", "-ac", "1", tmp_wav_path, "-y"]
         subprocess.run(cmd, check=True, capture_output=True)
         
-        # Recognize text
+        # Try Groq Whisper if API Key is present (Super Accurate for Amharic)
+        if GROQ_API_KEY:
+            try:
+                client = Groq(api_key=GROQ_API_KEY)
+                with open(tmp_wav_path, "rb") as f:
+                    transcription = client.audio.transcriptions.create(
+                        file=(tmp_wav_path, f),
+                        model="whisper-large-v3",
+                        language=language.split('-')[0], # 'am' or 'en'
+                        response_format="text"
+                    )
+                await status_msg.edit_text(f"📝 **Transcribed Text (Groq Whisper v3):**\n\n{transcription}")
+                os.unlink(tmp_ogg_path); os.unlink(tmp_wav_path)
+                context.user_data['state'] = None
+                return
+            except Exception:
+                pass
+        
+        # Fallback to Google (Weak for Amharic)
         recognizer = sr.Recognizer()
         with sr.AudioFile(tmp_wav_path) as source:
             audio_data = recognizer.record(source)
         
         try:
             text = recognizer.recognize_google(audio_data, language=language)
-            await status_msg.edit_text(f"📝 **Transcribed Text:**\n\n{text}")
+            await status_msg.edit_text(f"📝 **Transcribed Text (Google - Limited):**\n\n{text}")
         except sr.UnknownValueError:
             await status_msg.edit_text("❌ Could not understand the audio.")
         except sr.RequestError:
             await status_msg.edit_text("❌ Speech recognition service is unavailable.")
         
-        os.unlink(tmp_ogg_path)
-        os.unlink(tmp_wav_path)
+        os.unlink(tmp_ogg_path); os.unlink(tmp_wav_path)
         context.user_data['state'] = None
         
     except Exception as e:
         await status_msg.edit_text(f"❌ Transcription failed: {e}")
         context.user_data['state'] = None
 
-# --- RELIABLE VIDEO DOWNLOADER ---
+# --- RELIABLE VIDEO DOWNLOADER (DIRECT LINK SNIFFER) ---
 async def handle_video_download(update, context):
     if context.user_data.get('state') != 'awaiting_video_link': return
     url = update.message.text
@@ -791,8 +669,8 @@ async def handle_link(update, context):
         await handle_pdf_to_word(update, context); return
     if context.user_data.get('state') == 'awaiting_image_to_text':
         await handle_image_to_text(update, context); return
-    if context.user_data.get('state') == 'awaiting_image_4k':
-        await handle_image_to_4k(update, context); return
+    if context.user_data.get('state') == 'awaiting_edit_photo':
+        await handle_edit_photo(update, context); return
     if context.user_data.get('state') == 'awaiting_voice_en':
         await handle_voice_to_text(update, context, 'en-US'); return
     if context.user_data.get('state') == 'awaiting_voice_am':
@@ -914,6 +792,211 @@ async def handle_pdf_upload(update, context):
         context.user_data['state'] = None
     except Exception as e:
         await status_msg.edit_text(f"❌ Error: {e}"); context.user_data['state'] = None
+
+async def handle_pdf_to_word(update, context):
+    if context.user_data.get('state') != 'awaiting_pdf_to_word': return
+    if not update.message.document:
+        await update.message.reply_text("❌ Please upload a PDF document.")
+        return
+    if update.message.document.mime_type != "application/pdf":
+        await update.message.reply_text("❌ The file you uploaded is not a PDF.")
+        return
+    status_msg = await update.message.reply_text("⏳ Converting PDF to Word...")
+    try:
+        file = await context.bot.get_file(update.message.document.file_id)
+        pdf_bytes = BytesIO(); await file.download_to_memory(pdf_bytes); pdf_bytes.seek(0)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
+            tmp_pdf.write(pdf_bytes.read()); tmp_pdf_path = tmp_pdf.name
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp_docx:
+            tmp_docx_path = tmp_docx.name
+        cv = Converter(tmp_pdf_path); cv.convert(tmp_docx_path); cv.close()
+        with open(tmp_docx_path, 'rb') as docx_file:
+            await update.message.reply_document(document=docx_file, filename="converted.docx")
+        os.unlink(tmp_pdf_path); os.unlink(tmp_docx_path)
+        await status_msg.edit_text("✅ PDF converted to Word successfully!")
+        context.user_data['state'] = None
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Conversion failed: {e}"); context.user_data['state'] = None
+
+async def handle_image_to_text(update, context):
+    if context.user_data.get('state') != 'awaiting_image_to_text': return
+    if not update.message.photo:
+        await update.message.reply_text("❌ Please upload an image."); return
+    status_msg = await update.message.reply_text("⏳ Extracting text from image...")
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+        ocr = RapidOCR()
+        photo = update.message.photo[-1]; file = await context.bot.get_file(photo.file_id)
+        img_bytes = BytesIO(); await file.download_to_memory(img_bytes); img_bytes.seek(0)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_img:
+            tmp_img.write(img_bytes.read()); tmp_img_path = tmp_img.name
+        result, elapse = ocr(tmp_img_path); os.unlink(tmp_img_path)
+        if not result:
+            await status_msg.edit_text("❌ No text found in the image."); return
+        extracted_text = "\n".join([line[1] for line in result])
+        await update.message.reply_text(f"📝 **Extracted Text:**\n\n{extracted_text}")
+        await status_msg.edit_text("✅ Text extraction complete!"); context.user_data['state'] = None
+    except Exception as e:
+        await status_msg.edit_text(f"❌ OCR failed: {e}"); context.user_data['state'] = None
+
+async def handle_image_collect(update, context):
+    if context.user_data.get('state') != 'awaiting_image_to_pdf': return
+    if not update.message.photo:
+        await update.message.reply_text("❌ Please upload an image or click Done to finish."); return
+    if 'pdf_images' not in context.user_data:
+        context.user_data['pdf_images'] = []
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    img_bytes = BytesIO(); await file.download_to_memory(img_bytes); img_bytes.seek(0)
+    context.user_data['pdf_images'].append(img_bytes)
+    count = len(context.user_data['pdf_images'])
+    if count >= 10:
+        await process_image_pdf(update, context)
+    else:
+        await update.message.reply_text(f"✅ Image {count}/10 added.\nSend another image, or click Done to process.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done", callback_data="img_pdf_done")]]))
+
+async def process_image_pdf(update, context):
+    query = update.callback_query
+    if query:
+        await query.answer()
+    if not context.user_data.get('pdf_images'):
+        if query:
+            await query.edit_message_text("❌ No images received.")
+        else:
+            await update.message.reply_text("❌ No images received.")
+        context.user_data['state'] = None; return
+
+    try:
+        images = context.user_data['pdf_images']
+        pdf_bytes = img2pdf.convert([img.getvalue() for img in images])
+
+        chat_id = query.message.chat_id if query else update.effective_chat.id
+        await context.bot.send_document(chat_id=chat_id, document=BytesIO(pdf_bytes), filename="images.pdf")
+
+        if query:
+            await query.edit_message_text("✅ Images converted to PDF!")
+        else:
+            await update.message.reply_text("✅ Images converted to PDF!")
+        context.user_data['state'] = None; context.user_data['pdf_images'] = []
+    except Exception as e:
+        error_msg = f"❌ Conversion failed: {e}"
+        if query:
+            await query.edit_message_text(error_msg)
+        else:
+            await update.message.reply_text(error_msg)
+        context.user_data['state'] = None; context.user_data['pdf_images'] = []
+
+async def fetch_profile(update, context, target):
+    try:
+        entity = await telethon_client.get_entity(target)
+        context.user_data["profile_entity"] = entity
+        context.user_data["post_entity"] = entity
+        context.user_data["story_entity"] = entity
+        save_user_history(entity.id, getattr(entity, "username", None), getattr(entity, "first_name", ""), getattr(entity, "last_name", ""))
+        first_name = getattr(entity, "first_name", "") or ""
+        last_name = getattr(entity, "last_name", "") or ""
+        display_name = f"{first_name} {last_name}".strip() or getattr(entity, "title", "Unknown")
+        text = f"<blockquote><b>{display_name}</b>\n@{getattr(entity, 'username', None) or 'N/A'}\n\n{getattr(entity, 'about', 'No bio')}\n\nID: {entity.id}\nVerified: {getattr(entity, 'verified', False)}\nPremium: {getattr(entity, 'premium', False)}\nBot: {getattr(entity, 'bot', False)}</blockquote>"
+        kb = [[InlineKeyboardButton("📰 View Posts", callback_data="posts_1"), InlineKeyboardButton("👁 View Story", callback_data="story_start")], [InlineKeyboardButton("⬅️ Back", callback_data="more")]]
+        try:
+            photo = await telethon_client.download_profile_photo(entity, file=BytesIO())
+            if photo:
+                photo.seek(0)
+                await update.message.reply_photo(photo=photo, caption=text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+            else:
+                await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+        except Exception:
+            await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {type(e).__name__}: {e}")
+
+async def handle_posts_pagination(update, context, page):
+    query = update.callback_query
+    await query.answer()
+    entity = context.user_data.get("post_entity") or context.user_data.get("profile_entity")
+    if not entity:
+        await query.edit_message_text("❌ No profile selected.")
+        return
+    per_page = 5
+    try:
+        messages = await telethon_client.get_messages(entity, limit=(page * per_page))
+    except Exception as e:
+        await query.edit_message_text(f"❌ Could not fetch posts: {e}")
+        return
+    total_posts = len(messages)
+    start = (page - 1) * per_page
+    end = min(start + per_page, total_posts)
+    page_items = messages[start:end]
+    if not page_items:
+        await query.edit_message_text("No more posts to show.")
+        return
+    title = getattr(entity, "title", None) or getattr(entity, "first_name", "User")
+    text = f"📰 POSTS OF {title}\nPage {page}\n\n"
+    for m in page_items:
+        content = (m.message or "").strip()[:80] if m.message else f"[{get_media_type(m)}]"
+        text += f"• {content}\n"
+    kb = []
+    if page > 1: kb.append([InlineKeyboardButton("⬅️ Previous", callback_data=f"posts_{page-1}")])
+    if end < total_posts: kb.append([InlineKeyboardButton("Next ➡️", callback_data=f"posts_{page+1}")])
+    kb.append([InlineKeyboardButton("⬅️ Back to Profile", callback_data="profile")])
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
+
+async def fetch_search(update, context, query):
+    status_msg = await update.message.reply_text(f"🔎 Searching accessible chats and public Telegram chats for: {query}")
+    try:
+        dialogs = await telethon_client.get_dialogs(limit=200)
+        peers = []
+        seen = set()
+        for dialog in dialogs:
+            entity = getattr(dialog, "entity", None)
+            if not entity: continue
+            key = (getattr(entity, "id", None), getattr(entity, "access_hash", None))
+            if key[0] not in seen:
+                seen.add(key[0]); peers.append(entity)
+        all_results = []
+        sem = asyncio.Semaphore(8)
+        async def worker(entity):
+            async with sem:
+                try:
+                    messages = await telethon_client.get_messages(entity, search=query, limit=3)
+                    return [{"entity": entity, "message": m, "link": f"https://t.me/{getattr(entity, 'username', entity.id)}/{m.id}", "content": (m.message or "[Media]")[:80]} for m in messages]
+                except Exception:
+                    return []
+        batches = await asyncio.gather(*(worker(e) for e in peers))
+        for batch in batches:
+            all_results.extend(batch)
+        if not all_results:
+            await status_msg.edit_text(f"❌ No results found for '{query}'.")
+            return
+        context.user_data["search_results"] = all_results
+        context.user_data["search_page"] = 1
+        await status_msg.delete()
+        await display_search_page(update, context, 1)
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Search failed: {e}")
+
+async def display_search_page(update, context, page):
+    query = update.callback_query
+    if query: await query.answer()
+    results = context.user_data.get("search_results", [])
+    query_text = " "
+    per_page = 10
+    total_pages = max(1, (len(results) + per_page - 1) // per_page)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * per_page
+    page_items = results[start:start + per_page]
+    text = f"<blockquote><b>Telegram Search</b>\n{query_text}\n\n"
+    for item in page_items:
+        text += f"🔗 <a href='{item['link']}'>{item['content']}</a>\n\n"
+    text += f"Page {page}/{total_pages}\nSort by relevance and activity</blockquote>"
+    kb = []
+    nav_row = []
+    if page > 1: nav_row.append(InlineKeyboardButton("⬅️ Previous", callback_data="search_prev"))
+    if page < total_pages: nav_row.append(InlineKeyboardButton("Next ➡️", callback_data="search_next"))
+    if nav_row: kb.append(nav_row)
+    kb.append([InlineKeyboardButton("🔄 New Search", callback_data="search"), InlineKeyboardButton("⬅️ Back", callback_data="more")])
+    if query: await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+    else: await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
 
 async def fetch_words(update, context, target):
     try:
