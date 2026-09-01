@@ -28,7 +28,7 @@ import yt_dlp
 import speech_recognition as sr
 import imageio_ffmpeg
 from groq import Groq
-from gtts import gTTS
+import edge_tts
 
 try:
     from telethon.tl.functions.stories import GetPeerStoriesRequest, GetStoriesByIDRequest
@@ -67,7 +67,6 @@ def self_ping():
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
-# --- DATABASE SETUP ---
 def init_db():
     conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
@@ -167,6 +166,7 @@ def get_media_type(event):
     else: return "💬"
 
 def tool_done_kb():
+    # Sends a new message for Continue/Main Menu instead of editing the media message
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Continue", callback_data="converter"), InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
     ])
@@ -316,13 +316,14 @@ async def menu_callback(update, context):
         return
 
     data = query.data
+    # FIX: Always send a new message for menus so it works after sending docs/photos
     if data == "main_menu":
         keyboard = [
             [InlineKeyboardButton("📥 Inbox", callback_data="inbox"), InlineKeyboardButton("👤 Profile", callback_data="profile")],
             [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")],
             [InlineKeyboardButton("➕ More Commands", callback_data="more")]
         ]
-        await query.edit_message_text("🤖 TELEGRAM ASSISTANT", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.message.reply_text("🤖 TELEGRAM ASSISTANT", reply_markup=InlineKeyboardMarkup(keyboard))
     elif data == "more":
         kb = [
             [InlineKeyboardButton("🔎 Search", callback_data="search"), InlineKeyboardButton("📊 Statistics", callback_data="stats")],
@@ -343,96 +344,91 @@ async def menu_callback(update, context):
             ]
             kb = admin_buttons + kb
         kb.append([InlineKeyboardButton("⬅️ Back", callback_data="main_menu")])
-        await query.edit_message_text("➕ MORE COMMANDS", reply_markup=InlineKeyboardMarkup(kb))
+        await query.message.reply_text("➕ MORE COMMANDS", reply_markup=InlineKeyboardMarkup(kb))
     elif data == "converter":
         kb = [
             [InlineKeyboardButton("📄 PDF to Word", callback_data="pdf_to_word"), InlineKeyboardButton("🖼️ Image to Text", callback_data="image_to_text")],
             [InlineKeyboardButton("🖼️ Image to PDF", callback_data="image_to_pdf"), InlineKeyboardButton("🖼️ Edit Photo", callback_data="image_edit")],
-            [InlineKeyboardButton("🖼️ Remove BG", callback_data="remove_bg"), InlineKeyboardButton("🖼️ Change BG", callback_data="change_bg")],
             [InlineKeyboardButton("🗣️ Text to Voice (ENG)", callback_data="tts_en"), InlineKeyboardButton("🗣️ Text to Voice (AM)", callback_data="tts_am")],
             [InlineKeyboardButton("📷 Image Format", callback_data="img_fmt_menu"), InlineKeyboardButton("📚 Document Format", callback_data="doc_fmt_menu")],
             [InlineKeyboardButton("🎙️ Voice to Text (ENG)", callback_data="voice_en"), InlineKeyboardButton("🎙️ Voice to Text (AM)", callback_data="voice_am")],
             [InlineKeyboardButton("⬅️ Back", callback_data="more")]
         ]
-        await query.edit_message_text("🔄 MEDIA CONVERTER & AI TOOLS\n\nChoose an option:", reply_markup=InlineKeyboardMarkup(kb))
+        await query.message.reply_text("🔄 MEDIA CONVERTER & AI TOOLS\n\nChoose an option:", reply_markup=InlineKeyboardMarkup(kb))
     elif data == "img_fmt_menu":
         kb = [
             [InlineKeyboardButton("PNG to JPG", callback_data="img_png_jpg"), InlineKeyboardButton("JPG to PNG", callback_data="img_jpg_png")],
             [InlineKeyboardButton("Image to GIF", callback_data="img_gif"), InlineKeyboardButton("⬅️ Back", callback_data="converter")]
         ]
-        await query.edit_message_text("📷 **IMAGE FORMAT CONVERTER**\n\nChoose a conversion:", reply_markup=InlineKeyboardMarkup(kb))
+        await query.message.reply_text("📷 **IMAGE FORMAT CONVERTER**\n\nChoose a conversion:", reply_markup=InlineKeyboardMarkup(kb))
     elif data == "doc_fmt_menu":
         kb = [
             [InlineKeyboardButton("PDF to PPTX", callback_data="doc_pdf_pptx"), InlineKeyboardButton("PPTX to PDF", callback_data="doc_pptx_pdf")],
             [InlineKeyboardButton("⬅️ Back", callback_data="converter")]
         ]
-        await query.edit_message_text("📚 **DOCUMENT FORMAT CONVERTER**\n\nChoose a conversion:", reply_markup=InlineKeyboardMarkup(kb))
+        await query.message.reply_text("📚 **DOCUMENT FORMAT CONVERTER**\n\nChoose a conversion:", reply_markup=InlineKeyboardMarkup(kb))
+    elif data == "image_edit":
+        await query.message.reply_text("🖼️ **PHOTO EDITOR**\n\nSend me a photo, and I will give you a menu with professional editing tools to enhance it.")
+        context.user_data['state'] = 'awaiting_edit_photo'
+    elif data.startswith("edit_"):
+        await handle_photo_edit_selection(update, context, data)
     elif data == "pdf_to_word":
-        await query.edit_message_text("📄 PDF to Word\n\nPlease upload the PDF file.")
+        await query.message.reply_text("📄 PDF to Word\n\nPlease upload the PDF file.")
         context.user_data['state'] = 'awaiting_pdf_to_word'
     elif data == "image_to_text":
-        await query.edit_message_text("🖼️ Image to Text\n\nPlease upload an image.")
+        await query.message.reply_text("🖼️ Image to Text\n\nPlease upload an image.")
         context.user_data['state'] = 'awaiting_image_to_text'
     elif data == "image_to_pdf":
-        await query.edit_message_text("🖼️ Image to PDF\n\nSend images (1-10). Click Done when finished.")
+        await query.message.reply_text("🖼️ Image to PDF\n\nSend images (1-10). Click Done when finished.")
         context.user_data['state'] = 'awaiting_image_to_pdf'
         context.user_data['pdf_images'] = []
     elif data == "img_pdf_done":
         await process_image_pdf(update, context)
-    elif data == "image_edit":
-        await query.edit_message_text("🖼️ **PHOTO EDITOR**\n\nSend me a photo, and I will give you a menu with professional editing tools to enhance it.")
-        context.user_data['state'] = 'awaiting_edit_photo'
-    elif data.startswith("edit_"):
-        await handle_photo_edit_selection(update, context, data)
-    elif data == "remove_bg":
-        await query.edit_message_text("🖼️ **REMOVE BACKGROUND**\n\nSend me an image, and I will remove its background.")
-        context.user_data['state'] = 'awaiting_remove_bg'
-    elif data == "change_bg":
-        await query.edit_message_text("🖼️ **CHANGE BACKGROUND**\n\nStep 1/2: Please upload the **background image** you want to use.")
-        context.user_data['state'] = 'awaiting_bg_upload'
     elif data == "tts_en":
-        await query.edit_message_text("🗣️ **Text to Voice (English)**\n\nSend me the text you want to convert to speech.")
+        await query.message.reply_text("🗣️ **Text to Voice (English)**\n\nSend me the text you want to convert to speech.")
         context.user_data['state'] = 'awaiting_tts_en'
     elif data == "tts_am":
-        await query.edit_message_text("🗣️ **Text to Voice (Amharic)**\n\nSend me the text you want to convert to speech.")
+        await query.message.reply_text("🗣️ **Text to Voice (Amharic)**\n\nSend me the text you want to convert to speech.")
         context.user_data['state'] = 'awaiting_tts_am'
+    elif data.startswith("tts_voice_"):
+        await handle_tts_voice_selection(update, context, data)
     elif data == "img_png_jpg":
-        await query.edit_message_text("📷 **PNG to JPG**\n\nSend me a PNG image.")
+        await query.message.reply_text("📷 **PNG to JPG**\n\nSend me a PNG image.")
         context.user_data['state'] = 'awaiting_img_png_jpg'
     elif data == "img_jpg_png":
-        await query.edit_message_text("📷 **JPG to PNG**\n\nSend me a JPG image.")
+        await query.message.reply_text("📷 **JPG to PNG**\n\nSend me a JPG image.")
         context.user_data['state'] = 'awaiting_img_jpg_png'
     elif data == "img_gif":
-        await query.edit_message_text("📷 **Image to GIF**\n\nSend me an image (it will be converted to a GIF).")
+        await query.message.reply_text("📷 **Image to GIF**\n\nSend me an image (it will be converted to a GIF).")
         context.user_data['state'] = 'awaiting_img_gif'
     elif data == "doc_pdf_pptx":
-        await query.edit_message_text("📚 **PDF to PPTX**\n\nPlease upload the PDF file.")
+        await query.message.reply_text("📚 **PDF to PPTX**\n\nPlease upload the PDF file.")
         context.user_data['state'] = 'awaiting_doc_pdf_pptx'
     elif data == "doc_pptx_pdf":
-        await query.edit_message_text("📚 **PPTX to PDF**\n\nPlease upload the PPTX file.")
+        await query.message.reply_text("📚 **PPTX to PDF**\n\nPlease upload the PPTX file.")
         context.user_data['state'] = 'awaiting_doc_pptx_pdf'
     elif data == "voice_en":
-        await query.edit_message_text("🎙️ **Voice to Text (English)**\n\nSend a clear voice message or audio file.")
+        await query.message.reply_text("🎙️ **Voice to Text (English)**\n\nSend a clear voice message or audio file.")
         context.user_data['state'] = 'awaiting_voice_en'
     elif data == "voice_am":
-        await query.edit_message_text("🎙️ **Voice to Text (Amharic)**\n\nSend a clear voice message or audio file.")
+        await query.message.reply_text("🎙️ **Voice to Text (Amharic)**\n\nSend a clear voice message or audio file.")
         context.user_data['state'] = 'awaiting_voice_am'
     elif data == "video_downloader":
-        await query.edit_message_text("🎬 VIDEO DOWNLOADER\n\nSend me a YouTube, TikTok, Instagram, or Facebook video link.")
+        await query.message.reply_text("🎬 VIDEO DOWNLOADER\n\nSend me a YouTube, TikTok, Instagram, or Facebook video link.")
         context.user_data['state'] = 'awaiting_video_link'
     elif data == "broadcast":
-        await query.edit_message_text("📢 BROADCAST\n\nUsage: /broadcast <message>")
+        await query.message.reply_text("📢 BROADCAST\n\nUsage: /broadcast <message>")
     elif data == "profile":
-        await query.edit_message_text("👤 PROFILE\n\nEnter a Telegram username or ID to generate the Profile Card:")
+        await query.message.reply_text("👤 PROFILE\n\nEnter a Telegram username or ID to generate the Profile Card:")
         context.user_data['state'] = 'profile_query'
     elif data == "fetch":
-        await query.edit_message_text("🔗 Fetch Telegram\n\nSend me a link (e.g., t.me/channel/123 or t.me/channel/123-130):")
+        await query.message.reply_text("🔗 Fetch Telegram\n\nSend me a link (e.g., t.me/channel/123 or t.me/channel/123-130):")
         context.user_data['state'] = 'fetch_link'
     elif data == "search":
-        await query.edit_message_text("🔎 SEARCH\n\nEnter any keyword to search across your chats:\nExample: Logic mid")
+        await query.message.reply_text("🔎 SEARCH\n\nEnter any keyword to search across your chats:\nExample: Logic mid")
         context.user_data['state'] = 'search_query'
     elif data == "pdf_fetch":
-        await query.edit_message_text("📄 PDF FETCH\n\nPlease upload the PDF file directly to this chat.")
+        await query.message.reply_text("📄 PDF FETCH\n\nPlease upload the PDF file directly to this chat.")
         context.user_data['state'] = 'awaiting_pdf'
     elif data.startswith("posts_"):
         page = int(data.split("_")[1])
@@ -442,22 +438,22 @@ async def menu_callback(update, context):
             context.user_data["story_index"] = 0
             entity = context.user_data.get("story_entity") or context.user_data.get("profile_entity")
             if not entity:
-                await query.edit_message_text("❌ No profile selected.")
+                await query.message.reply_text("❌ No profile selected.")
                 return
             await query.answer("Fetching Stories…")
             try:
                 if not GetPeerStoriesRequest:
-                    await query.edit_message_text("❌ Telethon does not support stories in this installation.")
+                    await query.message.reply_text("❌ Telethon does not support stories in this installation.")
                     return
                 response = await telethon_client(GetPeerStoriesRequest(peer=entity))
                 stories = list(getattr(response, "stories", []) or [])
                 if not stories:
-                    await query.edit_message_text("❌ No active Stories are available.")
+                    await query.message.reply_text("❌ No active Stories are available.")
                     return
                 context.user_data["stories_list"] = stories
                 await display_story(update, context)
             except Exception as e:
-                await query.edit_message_text(f"❌ Could not retrieve Stories: {e}")
+                await query.message.reply_text(f"❌ Could not retrieve Stories: {e}")
         elif data == "story_next":
             context.user_data["story_index"] = context.user_data.get("story_index", 0) + 1
             await display_story(update, context)
@@ -465,14 +461,32 @@ async def menu_callback(update, context):
             context.user_data["story_index"] = context.user_data.get("story_index", 0) - 1
             await display_story(update, context)
 
-# --- PHOTO EDITING (Heavy imports done lazily) ---
+# --- PHOTO EDITING (Merged with BG functions) ---
 async def handle_photo_edit_selection(update, context, data):
     query = update.callback_query
     await query.answer()
     if not context.user_data.get('edit_image'):
-        await query.edit_message_text("❌ No image found. Please send a photo first.")
+        await query.message.reply_text("❌ No image found. Please send a photo first.")
         return
     img = context.user_data['edit_image']
+    
+    # Handle Background Removal Button
+    if data == "edit_remove_bg":
+        session = new_session("u2netp")  # Lightweight model to prevent OOM
+        out_img = remove(img, session=session)
+        out_bytes = BytesIO()
+        out_img.save(out_bytes, format='PNG')
+        out_bytes.seek(0)
+        await query.message.reply_document(document=out_bytes, filename="no_bg.png", caption="✅ Background removed!", reply_markup=tool_done_kb())
+        return
+    
+    # Handle Change Background Button
+    if data == "edit_change_bg":
+        await query.message.reply_text("🖼️ **CHANGE BACKGROUND**\n\nStep 1/2: Please upload the **background image** you want to use.")
+        context.user_data['state'] = 'awaiting_bg_upload'
+        return
+
+    # Standard Filters
     max_side = 4096
     if img.width >= img.height:
         new_width = max_side
@@ -481,6 +495,7 @@ async def handle_photo_edit_selection(update, context, data):
         new_height = max_side
         new_width = int(img.width * (max_side / img.height))
     img = img.resize((new_width, new_height), Image.LANCZOS)
+    
     filter_name = "Original"
     if data == "edit_orig": filter_name = "Original"
     elif data == "edit_hd":
@@ -515,11 +530,11 @@ async def handle_photo_edit_selection(update, context, data):
         img = ImageOps.posterize(img.convert('RGB'), bits=3); filter_name = "Posterize"
     elif data == "edit_solar":
         img = ImageOps.solarize(img.convert('RGB'), threshold=128); filter_name = "Solarize"
+
     out_bytes = BytesIO()
     img.save(out_bytes, format='JPEG', quality=95)
     out_bytes.seek(0)
-    await context.bot.send_photo(chat_id=query.message.chat_id, photo=out_bytes, caption=f"✅ Applied: **{filter_name}**", reply_markup=tool_done_kb())
-    await query.edit_message_text(f"✅ Applied {filter_name} successfully!")
+    await query.message.reply_photo(photo=out_bytes, caption=f"✅ Applied: **{filter_name}**", reply_markup=tool_done_kb())
 
 async def handle_edit_photo(update, context):
     if context.user_data.get('state') != 'awaiting_edit_photo': return
@@ -537,36 +552,16 @@ async def handle_edit_photo(update, context):
             [InlineKeyboardButton("⬛ B&W", callback_data="edit_bw"), InlineKeyboardButton("🟤 Sepia", callback_data="edit_sepia"), InlineKeyboardButton("🔪 Sharpen", callback_data="edit_sharp")],
             [InlineKeyboardButton("☀️ Brighten", callback_data="edit_bright"), InlineKeyboardButton("🌙 Darken", callback_data="edit_dark"), InlineKeyboardButton("🌫️ Blur", callback_data="edit_blur")],
             [InlineKeyboardButton("🟥 Pixel", callback_data="edit_pixel"), InlineKeyboardButton("🔄 Invert", callback_data="edit_invert"), InlineKeyboardButton("✏️ Sketch", callback_data="edit_sketch")],
-            [InlineKeyboardButton("🧊 Emboss", callback_data="edit_emboss"), InlineKeyboardButton("🎞️ Poster", callback_data="edit_poster"), InlineKeyboardButton("🔥 Solarize", callback_data="edit_solar")]
+            [InlineKeyboardButton("🧊 Emboss", callback_data="edit_emboss"), InlineKeyboardButton("🎞️ Poster", callback_data="edit_poster"), InlineKeyboardButton("🔥 Solarize", callback_data="edit_solar")],
+            [InlineKeyboardButton("🖼️ Remove BG", callback_data="edit_remove_bg"), InlineKeyboardButton("🖼️ Change BG", callback_data="edit_change_bg")]
         ]
-        await status_msg.edit_text("✅ Image loaded!\n\nChoose one of the 15 editing features below:", reply_markup=InlineKeyboardMarkup(kb))
+        await status_msg.edit_text("✅ Image loaded!\n\nChoose an editing feature below:", reply_markup=InlineKeyboardMarkup(kb))
         context.user_data['state'] = None
     except Exception as e:
         await status_msg.edit_text(f"❌ Processing failed: {e}")
         context.user_data['state'] = None
 
-# --- BACKGROUND REMOVAL (Lazy import rembg) ---
-async def handle_remove_bg(update, context):
-    if context.user_data.get('state') != 'awaiting_remove_bg': return
-    if not update.message.photo:
-        await update.message.reply_text("❌ Please upload an image.")
-        return
-    status_msg = await update.message.reply_text("⏳ Removing background...")
-    try:
-        from rembg import remove, new_session
-        photo = update.message.photo[-1]; file = await context.bot.get_file(photo.file_id)
-        img_bytes = BytesIO(); await file.download_to_memory(img_bytes); img_bytes.seek(0)
-        input_img = Image.open(img_bytes)
-        output_img = remove(input_img)
-        out_bytes = BytesIO(); output_img.save(out_bytes, format='PNG'); out_bytes.seek(0)
-        await update.message.reply_document(document=out_bytes, filename="no_bg.png", caption="✅ Background removed!", reply_markup=tool_done_kb())
-        await status_msg.edit_text("✅ Background removal complete!")
-        context.user_data['state'] = None
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Background removal failed: {e}")
-        context.user_data['state'] = None
-
-# --- CHANGE BACKGROUND (Lazy import rembg) ---
+# --- CHANGE BACKGROUND HANDLERS ---
 async def handle_bg_upload(update, context):
     if context.user_data.get('state') != 'awaiting_bg_upload': return
     if not update.message.photo:
@@ -588,12 +583,13 @@ async def handle_front_upload(update, context):
         return
     status_msg = await update.message.reply_text("⏳ Changing background...")
     try:
-        from rembg import remove
+        from rembg import remove, new_session
+        session = new_session("u2netp")  # Prevent OOM
         photo = update.message.photo[-1]; file = await context.bot.get_file(photo.file_id)
         img_bytes = BytesIO(); await file.download_to_memory(img_bytes); img_bytes.seek(0)
         front_img = Image.open(img_bytes)
         bg_img = context.user_data['bg_image']
-        front_cutout = remove(front_img)
+        front_cutout = remove(front_img, session=session)
         bg_img = bg_img.resize(front_cutout.size)
         bg_img.paste(front_cutout, (0, 0), front_cutout)
         out_bytes = BytesIO(); bg_img.save(out_bytes, format='JPEG', quality=95); out_bytes.seek(0)
@@ -604,23 +600,70 @@ async def handle_front_upload(update, context):
         await status_msg.edit_text(f"❌ Background change failed: {e}")
         context.user_data.pop('bg_image', None); context.user_data['state'] = None
 
-# --- TEXT TO VOICE ---
+# --- TEXT TO VOICE (With Voice Selection) ---
 async def handle_tts(update, context, lang):
     if not update.message.text:
         await update.message.reply_text("❌ Please send the text you want to convert.")
         return
-    status_msg = await update.message.reply_text("🗣️ Generating voice...")
+    context.user_data['tts_text'] = update.message.text
+    context.user_data['tts_lang'] = lang
+    kb = [
+        [InlineKeyboardButton("🧑 Male", callback_data=f"tts_voice_{lang}_male"),
+         InlineKeyboardButton("👩 Female", callback_data=f"tts_voice_{lang}_female")],
+        [InlineKeyboardButton("👴 Old", callback_data=f"tts_voice_{lang}_old"),
+         InlineKeyboardButton("👶 Child", callback_data=f"tts_voice_{lang}_child")]
+    ]
+    await update.message.reply_text("🎙️ **Choose Voice Type:**", reply_markup=InlineKeyboardMarkup(kb))
+    context.user_data['state'] = None
+
+async def handle_tts_voice_selection(update, context, data):
+    query = update.callback_query
+    await query.answer()
+    
+    parts = data.split("_")  # ['tts', 'voice', 'lang', 'type']
+    lang = parts[2]
+    voice_type = parts[3]
+    
+    text = context.user_data.get('tts_text')
+    if not text:
+        await query.message.reply_text("❌ No text found. Please send the text again.")
+        return
+    
+    # Edge TTS Voices
+    if lang == 'en':
+        voice_map = {
+            'male': 'en-US-GuyNeural',
+            'female': 'en-US-JennyNeural',
+            'old': 'en-US-SteffanNeural',
+            'child': 'en-US-AnaNeural'
+        }
+    else:  # Amharic
+        voice_map = {
+            'male': 'am-ET-AmehaNeural',
+            'female': 'am-ET-MekdesNeural',
+            'old': 'am-ET-MekdesNeural',
+            'child': 'am-ET-MekdesNeural'
+        }
+        
+    selected_voice = voice_map.get(voice_type, 'en-US-GuyNeural')
+    
+    status_msg = await query.message.reply_text("🗣️ Generating voice...")
     try:
-        tts = gTTS(text=update.message.text, lang=lang)
-        audio_bytes = BytesIO()
-        tts.write_to_fp(audio_bytes)
-        audio_bytes.seek(0)
-        await update.message.reply_voice(voice=audio_bytes, caption="✅ Voice generated!", reply_markup=tool_done_kb())
-        await status_msg.edit_text("✅ Text to Voice complete!")
-        context.user_data['state'] = None
+        communicate = edge_tts.Communicate(text, selected_voice)
+        audio_path = "output.mp3"
+        await communicate.save(audio_path)
+        
+        with open(audio_path, "rb") as audio:
+            await query.message.reply_audio(audio=audio, title=f"Voice ({voice_type})", reply_markup=tool_done_kb())
+        
+        os.unlink(audio_path)
+        await status_msg.edit_text("✅ Voice generated!")
+        
+        # Clean up user data
+        context.user_data.pop('tts_text', None)
+        context.user_data.pop('tts_lang', None)
     except Exception as e:
         await status_msg.edit_text(f"❌ TTS failed: {e}")
-        context.user_data['state'] = None
 
 # --- IMAGE FORMAT CONVERSION ---
 async def handle_image_convert(update, context, fmt):
@@ -717,7 +760,7 @@ async def handle_pptx_to_pdf(update, context):
         await status_msg.edit_text(f"❌ Conversion failed: {e}")
         context.user_data['state'] = None
 
-# --- VOICE TO TEXT (Lazy import speech_recognition) ---
+# --- VOICE TO TEXT ---
 async def handle_voice_to_text(update, context, language):
     if not update.message.voice and not update.message.audio:
         await update.message.reply_text("❌ Please send a voice message OR an audio file.")
@@ -763,7 +806,7 @@ async def handle_voice_to_text(update, context, language):
         await status_msg.edit_text(f"❌ Transcription failed: {e}")
         context.user_data['state'] = None
 
-# --- VIDEO DOWNLOADER (Direct Link) ---
+# --- VIDEO DOWNLOADER ---
 async def handle_video_download(update, context):
     if context.user_data.get('state') != 'awaiting_video_link': return
     url = update.message.text
@@ -785,108 +828,7 @@ async def handle_video_download(update, context):
         await status_msg.edit_text(f"❌ Could not process video.\n**Error:** {str(e)[:150]}")
         context.user_data['state'] = None
 
-# --- MAIN HANDLER ---
-async def handle_link(update, context):
-    user_id = update.effective_user.id
-    text = update.message.text if update.message.text else ""
-    self_ping()
-    # State handlers
-    if context.user_data.get('state') == 'awaiting_image_to_pdf': await handle_image_collect(update, context); return
-    if context.user_data.get('state') == 'awaiting_pdf': await handle_pdf_upload(update, context); return
-    if context.user_data.get('state') == 'awaiting_pdf_to_word': await handle_pdf_to_word(update, context); return
-    if context.user_data.get('state') == 'awaiting_image_to_text': await handle_image_to_text(update, context); return
-    if context.user_data.get('state') == 'awaiting_edit_photo': await handle_edit_photo(update, context); return
-    if context.user_data.get('state') == 'awaiting_remove_bg': await handle_remove_bg(update, context); return
-    if context.user_data.get('state') == 'awaiting_bg_upload': await handle_bg_upload(update, context); return
-    if context.user_data.get('state') == 'awaiting_front_upload': await handle_front_upload(update, context); return
-    if context.user_data.get('state') == 'awaiting_tts_en': await handle_tts(update, context, 'en'); return
-    if context.user_data.get('state') == 'awaiting_tts_am': await handle_tts(update, context, 'am'); return
-    if context.user_data.get('state') == 'awaiting_img_png_jpg': await handle_image_convert(update, context, 'png_jpg'); return
-    if context.user_data.get('state') == 'awaiting_img_jpg_png': await handle_image_convert(update, context, 'jpg_png'); return
-    if context.user_data.get('state') == 'awaiting_img_gif': await handle_image_convert(update, context, 'gif'); return
-    if context.user_data.get('state') == 'awaiting_doc_pdf_pptx': await handle_pdf_to_pptx(update, context); return
-    if context.user_data.get('state') == 'awaiting_doc_pptx_pdf': await handle_pptx_to_pdf(update, context); return
-    if context.user_data.get('state') == 'awaiting_voice_en': await handle_voice_to_text(update, context, 'en-US'); return
-    if context.user_data.get('state') == 'awaiting_voice_am': await handle_voice_to_text(update, context, 'am-ET'); return
-    if context.user_data.get('state') == 'awaiting_video_link': await handle_video_download(update, context); return
-    if context.user_data.get('state') == 'awaiting_password':
-        if text == BOT_PASSWORD:
-            add_authenticated_user(user_id); context.user_data['state'] = None
-            await update.message.reply_text("✅ Access granted!")
-            keyboard = [[InlineKeyboardButton("📥 Inbox", callback_data="inbox"), InlineKeyboardButton("👤 Profile", callback_data="profile")], [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")], [InlineKeyboardButton("➕ More Commands", callback_data="more")]]
-            await update.message.reply_text("🤖 TELEGRAM ASSISTANT", reply_markup=InlineKeyboardMarkup(keyboard))
-        else:
-            await update.message.reply_text("❌ Incorrect password. Please try again.")
-        return
-    if not is_authenticated(user_id):
-        await update.message.reply_text("🔐 Password required. Please run /start and authenticate first."); return
-    if context.user_data.get('reply_to'):
-        target_chat = context.user_data['reply_to']
-        try:
-            await telethon_client.send_message(target_chat, text); context.user_data['reply_to'] = None
-            await update.message.reply_text("✅ Reply sent!")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Failed: {e}")
-        return
-    state = context.user_data.get('state')
-    if state:
-        context.user_data['state'] = None
-        if state == 'profile_query': await fetch_profile(update, context, text)
-        elif state == 'search_query': await fetch_search(update, context, text)
-        elif state == 'words': await fetch_words(update, context, text)
-        elif state == 'friends': await fetch_friends(update, context, text)
-        elif state == 'names': await fetch_names(update, context, text)
-        return
-    if "t.me" in text:
-        username, msg_id, comment_id = parse_tg_link(text)
-        if not username:
-            await update.message.reply_text("Invalid link format."); return
-        try:
-            entity = await telethon_client.get_entity(username)
-            if msg_id and comment_id:
-                status_msg = await update.message.reply_text(f"⏳ Fetching comment {comment_id}...")
-                try:
-                    msg = await telethon_client.get_messages(entity, ids=comment_id)
-                    if msg:
-                        await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=comment_id)
-                        await status_msg.edit_text("✅ Comment fetched!")
-                    else:
-                        await status_msg.edit_text("❌ Comment ID not found.")
-                except Exception as e:
-                    await status_msg.edit_text(f"❌ Could not fetch comment: {e}")
-            elif msg_id and "-" in text:
-                range_pattern = r'https?://t\.me/([a-zA-Z0-9_]+)/(\d+)-(\d+)'
-                m = re.search(range_pattern, text)
-                if m:
-                    msg_id_start = int(m.group(2)); msg_id_end = int(m.group(3))
-                    status_msg = await update.message.reply_text(f"⏳ Fetching {msg_id_start} to {msg_id_end}...")
-                    messages = await telethon_client.get_messages(entity, min_id=msg_id_start, max_id=msg_id_end + 1)
-                    if not messages:
-                        await status_msg.edit_text("❌ No messages in that range."); return
-                    for idx, msg in enumerate(messages, 1):
-                        if idx % 5 == 0: await status_msg.edit_text(f"Fetching {idx}/{len(messages)}...")
-                        await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=msg.id)
-                    await status_msg.edit_text(f"✅ Range complete! Fetched {len(messages)} messages."); return
-            elif msg_id:
-                msg = await telethon_client.get_messages(entity, ids=msg_id)
-                if not msg:
-                    await update.message.reply_text("❌ Message not found."); return
-                await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=msg.id)
-            else:
-                status_msg = await update.message.reply_text("Fetching batch (max 20)...")
-                messages = await telethon_client.get_messages(entity, limit=20)
-                if not messages:
-                    await status_msg.edit_text("No messages found."); return
-                for idx, msg in enumerate(messages, 1):
-                    if idx % 5 == 0: await status_msg.edit_text(f"Fetching {idx}/{len(messages)}...")
-                    await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=msg.id)
-                await status_msg.edit_text(f"✅ Batch complete!")
-        except Exception as e:
-            await handle_telethon_error(update, e)
-    else:
-        await update.message.reply_text("👋 Use the menu buttons, or send a Telegram link.")
-
-# --- PDF, WORD, TEXT, IMAGE COLLECT (Same as before) ---
+# --- PDF, WORD, IMAGE, ETC. (Other handlers) ---
 async def handle_pdf_upload(update, context):
     if context.user_data.get('state') != 'awaiting_pdf': return
     if not update.message.document:
@@ -1009,7 +951,7 @@ async def process_image_pdf(update, context):
         else: await update.message.reply_text(error_msg)
         context.user_data['state'] = None; context.user_data['pdf_images'] = []
 
-# --- OTHER FEATURES ---
+# --- INBOX, PROFILE, SEARCH, STORIES, ETC. (Keeping existing logic) ---
 async def fetch_profile(update, context, target):
     try:
         entity = await telethon_client.get_entity(target)
@@ -1191,6 +1133,34 @@ async def fetch_names(update, context, target):
         await update.message.reply_text(text, parse_mode=ParseMode.HTML)
     except Exception as e: await update.message.reply_text(f"❌ Error: {e}")
 
+async def display_story(update, context):
+    query = update.callback_query
+    await query.answer()
+    stories = context.user_data.get("stories_list", [])
+    index = context.user_data.get("story_index", 0)
+    if not stories:
+        await query.edit_message_text("❌ No accessible active Stories found.")
+        return
+    index = max(0, min(index, len(stories) - 1))
+    context.user_data["story_index"] = index
+    story = stories[index]
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Previous", callback_data="story_prev"), InlineKeyboardButton("Next ➡️", callback_data="story_next")], [InlineKeyboardButton("⬅️ Back to Profile", callback_data="profile")]])
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg" if story.media.photo else ".mp4") as tmp:
+            await telethon_client.download_media(story, file=tmp.name)
+            tmp_path = tmp.name
+        caption = getattr(story, "caption", None) or ""
+        caption = f"{caption}\n\n📖 Story {index + 1}/{len(stories)}".strip()
+        with open(tmp_path, "rb") as f:
+            if hasattr(story.media, 'photo') and story.media.photo:
+                media = InputMediaPhoto(media=InputFile(f), caption=caption)
+            else:
+                media = InputMediaVideo(media=InputFile(f), caption=caption)
+            await query.edit_message_media(media=media, reply_markup=kb)
+        os.unlink(tmp_path)
+    except Exception as e:
+        await query.edit_message_text(f"❌ Could not fetch story: {e}", reply_markup=kb)
+
 @telethon_client.on(events.NewMessage(incoming=True))
 async def inbox_listener(event):
     if event.is_private and not event.out:
@@ -1200,7 +1170,106 @@ async def inbox_listener(event):
         except Exception as e:
             print(f"Inbox Error: {e}")
 
-# --- MAIN EXECUTION (FIXED MEMORY & PORT) ---
+# --- MAIN HANDLER ---
+async def handle_link(update, context):
+    user_id = update.effective_user.id
+    text = update.message.text if update.message.text else ""
+    self_ping()
+    if context.user_data.get('state') == 'awaiting_image_to_pdf': await handle_image_collect(update, context); return
+    if context.user_data.get('state') == 'awaiting_pdf': await handle_pdf_upload(update, context); return
+    if context.user_data.get('state') == 'awaiting_pdf_to_word': await handle_pdf_to_word(update, context); return
+    if context.user_data.get('state') == 'awaiting_image_to_text': await handle_image_to_text(update, context); return
+    if context.user_data.get('state') == 'awaiting_edit_photo': await handle_edit_photo(update, context); return
+    if context.user_data.get('state') == 'awaiting_bg_upload': await handle_bg_upload(update, context); return
+    if context.user_data.get('state') == 'awaiting_front_upload': await handle_front_upload(update, context); return
+    if context.user_data.get('state') == 'awaiting_tts_en': await handle_tts(update, context, 'en'); return
+    if context.user_data.get('state') == 'awaiting_tts_am': await handle_tts(update, context, 'am'); return
+    if context.user_data.get('state') == 'awaiting_img_png_jpg': await handle_image_convert(update, context, 'png_jpg'); return
+    if context.user_data.get('state') == 'awaiting_img_jpg_png': await handle_image_convert(update, context, 'jpg_png'); return
+    if context.user_data.get('state') == 'awaiting_img_gif': await handle_image_convert(update, context, 'gif'); return
+    if context.user_data.get('state') == 'awaiting_doc_pdf_pptx': await handle_pdf_to_pptx(update, context); return
+    if context.user_data.get('state') == 'awaiting_doc_pptx_pdf': await handle_pptx_to_pdf(update, context); return
+    if context.user_data.get('state') == 'awaiting_voice_en': await handle_voice_to_text(update, context, 'en-US'); return
+    if context.user_data.get('state') == 'awaiting_voice_am': await handle_voice_to_text(update, context, 'am-ET'); return
+    if context.user_data.get('state') == 'awaiting_video_link': await handle_video_download(update, context); return
+    if context.user_data.get('state') == 'awaiting_password':
+        if text == BOT_PASSWORD:
+            add_authenticated_user(user_id); context.user_data['state'] = None
+            await update.message.reply_text("✅ Access granted!")
+            keyboard = [[InlineKeyboardButton("📥 Inbox", callback_data="inbox"), InlineKeyboardButton("👤 Profile", callback_data="profile")], [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")], [InlineKeyboardButton("➕ More Commands", callback_data="more")]]
+            await update.message.reply_text("🤖 TELEGRAM ASSISTANT", reply_markup=InlineKeyboardMarkup(keyboard))
+        else:
+            await update.message.reply_text("❌ Incorrect password. Please try again.")
+        return
+    if not is_authenticated(user_id):
+        await update.message.reply_text("🔐 Password required. Please run /start and authenticate first."); return
+    if context.user_data.get('reply_to'):
+        target_chat = context.user_data['reply_to']
+        try:
+            await telethon_client.send_message(target_chat, text); context.user_data['reply_to'] = None
+            await update.message.reply_text("✅ Reply sent!")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Failed: {e}")
+        return
+    state = context.user_data.get('state')
+    if state:
+        context.user_data['state'] = None
+        if state == 'profile_query': await fetch_profile(update, context, text)
+        elif state == 'search_query': await fetch_search(update, context, text)
+        elif state == 'words': await fetch_words(update, context, text)
+        elif state == 'friends': await fetch_friends(update, context, text)
+        elif state == 'names': await fetch_names(update, context, text)
+        return
+    if "t.me" in text:
+        username, msg_id, comment_id = parse_tg_link(text)
+        if not username:
+            await update.message.reply_text("Invalid link format."); return
+        try:
+            entity = await telethon_client.get_entity(username)
+            if msg_id and comment_id:
+                status_msg = await update.message.reply_text(f"⏳ Fetching comment {comment_id}...")
+                try:
+                    msg = await telethon_client.get_messages(entity, ids=comment_id)
+                    if msg:
+                        await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=comment_id)
+                        await status_msg.edit_text("✅ Comment fetched!")
+                    else:
+                        await status_msg.edit_text("❌ Comment ID not found.")
+                except Exception as e:
+                    await status_msg.edit_text(f"❌ Could not fetch comment: {e}")
+            elif msg_id and "-" in text:
+                range_pattern = r'https?://t\.me/([a-zA-Z0-9_]+)/(\d+)-(\d+)'
+                m = re.search(range_pattern, text)
+                if m:
+                    msg_id_start = int(m.group(2)); msg_id_end = int(m.group(3))
+                    status_msg = await update.message.reply_text(f"⏳ Fetching {msg_id_start} to {msg_id_end}...")
+                    messages = await telethon_client.get_messages(entity, min_id=msg_id_start, max_id=msg_id_end + 1)
+                    if not messages:
+                        await status_msg.edit_text("❌ No messages in that range."); return
+                    for idx, msg in enumerate(messages, 1):
+                        if idx % 5 == 0: await status_msg.edit_text(f"Fetching {idx}/{len(messages)}...")
+                        await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=msg.id)
+                    await status_msg.edit_text(f"✅ Range complete! Fetched {len(messages)} messages."); return
+            elif msg_id:
+                msg = await telethon_client.get_messages(entity, ids=msg_id)
+                if not msg:
+                    await update.message.reply_text("❌ Message not found."); return
+                await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=msg.id)
+            else:
+                status_msg = await update.message.reply_text("Fetching batch (max 20)...")
+                messages = await telethon_client.get_messages(entity, limit=20)
+                if not messages:
+                    await status_msg.edit_text("No messages found."); return
+                for idx, msg in enumerate(messages, 1):
+                    if idx % 5 == 0: await status_msg.edit_text(f"Fetching {idx}/{len(messages)}...")
+                    await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=msg.id)
+                await status_msg.edit_text(f"✅ Batch complete!")
+        except Exception as e:
+            await handle_telethon_error(update, e)
+    else:
+        await update.message.reply_text("👋 Use the menu buttons, or send a Telegram link.")
+
+# --- MAIN EXECUTION ---
 async def main():
     init_db()
     def keep_alive():
@@ -1224,10 +1293,7 @@ async def main():
     bot_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_link))
     print("Bot running...")
     await bot_app.initialize(); await bot_app.start(); await bot_app.updater.start_polling()
-    
-    # FIXED: Start Flask IMMEDIATELY in background to ensure port binding
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
-    
     await asyncio.Event().wait()
 
 if __name__ == '__main__':
