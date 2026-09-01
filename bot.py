@@ -11,7 +11,7 @@ import urllib.request
 from io import BytesIO
 from flask import Flask
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageChops
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
 from telethon import TelegramClient, events, functions, types
@@ -166,7 +166,6 @@ def get_media_type(event):
     else: return "💬"
 
 def tool_done_kb():
-    # Sends a new message for Continue/Main Menu instead of editing the media message
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Continue", callback_data="converter"), InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
     ])
@@ -316,59 +315,27 @@ async def menu_callback(update, context):
         return
 
     data = query.data
-    # FIX: Always send a new message for menus so it works after sending docs/photos
     if data == "main_menu":
-        keyboard = [
-            [InlineKeyboardButton("📥 Inbox", callback_data="inbox"), InlineKeyboardButton("👤 Profile", callback_data="profile")],
-            [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")],
-            [InlineKeyboardButton("➕ More Commands", callback_data="more")]
-        ]
+        keyboard = [[InlineKeyboardButton("📥 Inbox", callback_data="inbox"), InlineKeyboardButton("👤 Profile", callback_data="profile")], [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")], [InlineKeyboardButton("➕ More Commands", callback_data="more")]]
         await query.message.reply_text("🤖 TELEGRAM ASSISTANT", reply_markup=InlineKeyboardMarkup(keyboard))
     elif data == "more":
-        kb = [
-            [InlineKeyboardButton("🔎 Search", callback_data="search"), InlineKeyboardButton("📊 Statistics", callback_data="stats")],
-            [InlineKeyboardButton("📄 PDF Fetch", callback_data="pdf_fetch")],
-            [InlineKeyboardButton("🔄 Converter", callback_data="converter")],
-            [InlineKeyboardButton("🎬 Video Downloader", callback_data="video_downloader")]
-        ]
+        kb = [[InlineKeyboardButton("🔎 Search", callback_data="search"), InlineKeyboardButton("📊 Statistics", callback_data="stats")], [InlineKeyboardButton("📄 PDF Fetch", callback_data="pdf_fetch")], [InlineKeyboardButton("🔄 Converter", callback_data="converter")], [InlineKeyboardButton("🎬 Video Downloader", callback_data="video_downloader")]]
         if is_admin(user_id):
-            admin_buttons = [
-                [InlineKeyboardButton("🔔 Track", callback_data="track"), InlineKeyboardButton("🔗 Names", callback_data="names")],
-                [InlineKeyboardButton("👥 Groups", callback_data="groups"), InlineKeyboardButton("💬 Messages", callback_data="messages")],
-                [InlineKeyboardButton("🔎 Analysis", callback_data="analysis"), InlineKeyboardButton("📢 Channels", callback_data="channels")],
-                [InlineKeyboardButton("👍 Reputation", callback_data="rep"), InlineKeyboardButton("👥 Friends", callback_data="friends")],
-                [InlineKeyboardButton("🔄 Reactions", callback_data="reactions"), InlineKeyboardButton("🎁 Gifts", callback_data="gifts")],
-                [InlineKeyboardButton("📤 Share", callback_data="share"), InlineKeyboardButton("🔵 Words Frequency", callback_data="words")],
-                [InlineKeyboardButton("👥 Common Groups", callback_data="common")],
-                [InlineKeyboardButton("📢 Broadcast", callback_data="broadcast")]
-            ]
+            admin_buttons = [[InlineKeyboardButton("🔔 Track", callback_data="track"), InlineKeyboardButton("🔗 Names", callback_data="names")], [InlineKeyboardButton("👥 Groups", callback_data="groups"), InlineKeyboardButton("💬 Messages", callback_data="messages")], [InlineKeyboardButton("🔎 Analysis", callback_data="analysis"), InlineKeyboardButton("📢 Channels", callback_data="channels")], [InlineKeyboardButton("👍 Reputation", callback_data="rep"), InlineKeyboardButton("👥 Friends", callback_data="friends")], [InlineKeyboardButton("🔄 Reactions", callback_data="reactions"), InlineKeyboardButton("🎁 Gifts", callback_data="gifts")], [InlineKeyboardButton("📤 Share", callback_data="share"), InlineKeyboardButton("🔵 Words Frequency", callback_data="words")], [InlineKeyboardButton("👥 Common Groups", callback_data="common")], [InlineKeyboardButton("📢 Broadcast", callback_data="broadcast")]]
             kb = admin_buttons + kb
         kb.append([InlineKeyboardButton("⬅️ Back", callback_data="main_menu")])
         await query.message.reply_text("➕ MORE COMMANDS", reply_markup=InlineKeyboardMarkup(kb))
     elif data == "converter":
-        kb = [
-            [InlineKeyboardButton("📄 PDF to Word", callback_data="pdf_to_word"), InlineKeyboardButton("🖼️ Image to Text", callback_data="image_to_text")],
-            [InlineKeyboardButton("🖼️ Image to PDF", callback_data="image_to_pdf"), InlineKeyboardButton("🖼️ Edit Photo", callback_data="image_edit")],
-            [InlineKeyboardButton("🗣️ Text to Voice (ENG)", callback_data="tts_en"), InlineKeyboardButton("🗣️ Text to Voice (AM)", callback_data="tts_am")],
-            [InlineKeyboardButton("📷 Image Format", callback_data="img_fmt_menu"), InlineKeyboardButton("📚 Document Format", callback_data="doc_fmt_menu")],
-            [InlineKeyboardButton("🎙️ Voice to Text (ENG)", callback_data="voice_en"), InlineKeyboardButton("🎙️ Voice to Text (AM)", callback_data="voice_am")],
-            [InlineKeyboardButton("⬅️ Back", callback_data="more")]
-        ]
+        kb = [[InlineKeyboardButton("📄 PDF to Word", callback_data="pdf_to_word"), InlineKeyboardButton("🖼️ Image to Text", callback_data="image_to_text")], [InlineKeyboardButton("🖼️ Image to PDF", callback_data="image_to_pdf"), InlineKeyboardButton("🖼️ Edit Photo", callback_data="image_edit")], [InlineKeyboardButton("🗣️ Text to Voice (ENG)", callback_data="tts_en"), InlineKeyboardButton("🗣️ Text to Voice (AM)", callback_data="tts_am")], [InlineKeyboardButton("📷 Image Format", callback_data="img_fmt_menu"), InlineKeyboardButton("📚 Document Format", callback_data="doc_fmt_menu")], [InlineKeyboardButton("🎙️ Voice to Text (ENG)", callback_data="voice_en"), InlineKeyboardButton("🎙️ Voice to Text (AM)", callback_data="voice_am")], [InlineKeyboardButton("⬅️ Back", callback_data="more")]]
         await query.message.reply_text("🔄 MEDIA CONVERTER & AI TOOLS\n\nChoose an option:", reply_markup=InlineKeyboardMarkup(kb))
     elif data == "img_fmt_menu":
-        kb = [
-            [InlineKeyboardButton("PNG to JPG", callback_data="img_png_jpg"), InlineKeyboardButton("JPG to PNG", callback_data="img_jpg_png")],
-            [InlineKeyboardButton("Image to GIF", callback_data="img_gif"), InlineKeyboardButton("⬅️ Back", callback_data="converter")]
-        ]
+        kb = [[InlineKeyboardButton("PNG to JPG", callback_data="img_png_jpg"), InlineKeyboardButton("JPG to PNG", callback_data="img_jpg_png")], [InlineKeyboardButton("Image to GIF", callback_data="img_gif"), InlineKeyboardButton("⬅️ Back", callback_data="converter")]]
         await query.message.reply_text("📷 **IMAGE FORMAT CONVERTER**\n\nChoose a conversion:", reply_markup=InlineKeyboardMarkup(kb))
     elif data == "doc_fmt_menu":
-        kb = [
-            [InlineKeyboardButton("PDF to PPTX", callback_data="doc_pdf_pptx"), InlineKeyboardButton("PPTX to PDF", callback_data="doc_pptx_pdf")],
-            [InlineKeyboardButton("⬅️ Back", callback_data="converter")]
-        ]
+        kb = [[InlineKeyboardButton("PDF to PPTX", callback_data="doc_pdf_pptx"), InlineKeyboardButton("PPTX to PDF", callback_data="doc_pptx_pdf")], [InlineKeyboardButton("⬅️ Back", callback_data="converter")]]
         await query.message.reply_text("📚 **DOCUMENT FORMAT CONVERTER**\n\nChoose a conversion:", reply_markup=InlineKeyboardMarkup(kb))
     elif data == "image_edit":
-        await query.message.reply_text("🖼️ **PHOTO EDITOR**\n\nSend me a photo, and I will give you a menu with professional editing tools to enhance it.")
+        await query.message.reply_text("🖼️ **PHOTO EDITOR**\n\nSend me a photo, and I will give you a menu with professional editing tools.")
         context.user_data['state'] = 'awaiting_edit_photo'
     elif data.startswith("edit_"):
         await handle_photo_edit_selection(update, context, data)
@@ -461,7 +428,7 @@ async def menu_callback(update, context):
             context.user_data["story_index"] = context.user_data.get("story_index", 0) - 1
             await display_story(update, context)
 
-# --- PHOTO EDITING (Merged with BG functions) ---
+# --- PHOTO EDITING ---
 async def handle_photo_edit_selection(update, context, data):
     query = update.callback_query
     await query.answer()
@@ -469,24 +436,26 @@ async def handle_photo_edit_selection(update, context, data):
         await query.message.reply_text("❌ No image found. Please send a photo first.")
         return
     img = context.user_data['edit_image']
-    
-    # Handle Background Removal Button
     if data == "edit_remove_bg":
-        session = new_session("u2netp")  # Lightweight model to prevent OOM
-        out_img = remove(img, session=session)
-        out_bytes = BytesIO()
-        out_img.save(out_bytes, format='PNG')
-        out_bytes.seek(0)
-        await query.message.reply_document(document=out_bytes, filename="no_bg.png", caption="✅ Background removed!", reply_markup=tool_done_kb())
+        async def run_bg_removal():
+            def do_work():
+                from rembg import remove, new_session
+                session = new_session("u2netp")
+                return remove(img, session=session)
+            return await asyncio.to_thread(do_work)
+        try:
+            out_img = await run_bg_removal()
+            out_bytes = BytesIO()
+            out_img.save(out_bytes, format='PNG')
+            out_bytes.seek(0)
+            await query.message.reply_document(document=out_bytes, filename="no_bg.png", caption="✅ Background removed!", reply_markup=tool_done_kb())
+        except Exception as e:
+            await query.message.reply_text(f"❌ Background removal failed: {e}")
         return
-    
-    # Handle Change Background Button
     if data == "edit_change_bg":
         await query.message.reply_text("🖼️ **CHANGE BACKGROUND**\n\nStep 1/2: Please upload the **background image** you want to use.")
         context.user_data['state'] = 'awaiting_bg_upload'
         return
-
-    # Standard Filters
     max_side = 4096
     if img.width >= img.height:
         new_width = max_side
@@ -495,7 +464,6 @@ async def handle_photo_edit_selection(update, context, data):
         new_height = max_side
         new_width = int(img.width * (max_side / img.height))
     img = img.resize((new_width, new_height), Image.LANCZOS)
-    
     filter_name = "Original"
     if data == "edit_orig": filter_name = "Original"
     elif data == "edit_hd":
@@ -530,7 +498,6 @@ async def handle_photo_edit_selection(update, context, data):
         img = ImageOps.posterize(img.convert('RGB'), bits=3); filter_name = "Posterize"
     elif data == "edit_solar":
         img = ImageOps.solarize(img.convert('RGB'), threshold=128); filter_name = "Solarize"
-
     out_bytes = BytesIO()
     img.save(out_bytes, format='JPEG', quality=95)
     out_bytes.seek(0)
@@ -547,21 +514,13 @@ async def handle_edit_photo(update, context):
         img_bytes = BytesIO(); await file.download_to_memory(img_bytes); img_bytes.seek(0)
         img = Image.open(img_bytes)
         context.user_data['edit_image'] = img
-        kb = [
-            [InlineKeyboardButton("🖼️ Original", callback_data="edit_orig"), InlineKeyboardButton("✨ HD 100x", callback_data="edit_hd"), InlineKeyboardButton("🎨 Vivid", callback_data="edit_vivid")],
-            [InlineKeyboardButton("⬛ B&W", callback_data="edit_bw"), InlineKeyboardButton("🟤 Sepia", callback_data="edit_sepia"), InlineKeyboardButton("🔪 Sharpen", callback_data="edit_sharp")],
-            [InlineKeyboardButton("☀️ Brighten", callback_data="edit_bright"), InlineKeyboardButton("🌙 Darken", callback_data="edit_dark"), InlineKeyboardButton("🌫️ Blur", callback_data="edit_blur")],
-            [InlineKeyboardButton("🟥 Pixel", callback_data="edit_pixel"), InlineKeyboardButton("🔄 Invert", callback_data="edit_invert"), InlineKeyboardButton("✏️ Sketch", callback_data="edit_sketch")],
-            [InlineKeyboardButton("🧊 Emboss", callback_data="edit_emboss"), InlineKeyboardButton("🎞️ Poster", callback_data="edit_poster"), InlineKeyboardButton("🔥 Solarize", callback_data="edit_solar")],
-            [InlineKeyboardButton("🖼️ Remove BG", callback_data="edit_remove_bg"), InlineKeyboardButton("🖼️ Change BG", callback_data="edit_change_bg")]
-        ]
+        kb = [[InlineKeyboardButton("🖼️ Original", callback_data="edit_orig"), InlineKeyboardButton("✨ HD 100x", callback_data="edit_hd"), InlineKeyboardButton("🎨 Vivid", callback_data="edit_vivid")], [InlineKeyboardButton("⬛ B&W", callback_data="edit_bw"), InlineKeyboardButton("🟤 Sepia", callback_data="edit_sepia"), InlineKeyboardButton("🔪 Sharpen", callback_data="edit_sharp")], [InlineKeyboardButton("☀️ Brighten", callback_data="edit_bright"), InlineKeyboardButton("🌙 Darken", callback_data="edit_dark"), InlineKeyboardButton("🌫️ Blur", callback_data="edit_blur")], [InlineKeyboardButton("🟥 Pixel", callback_data="edit_pixel"), InlineKeyboardButton("🔄 Invert", callback_data="edit_invert"), InlineKeyboardButton("✏️ Sketch", callback_data="edit_sketch")], [InlineKeyboardButton("🧊 Emboss", callback_data="edit_emboss"), InlineKeyboardButton("🎞️ Poster", callback_data="edit_poster"), InlineKeyboardButton("🔥 Solarize", callback_data="edit_solar")], [InlineKeyboardButton("🖼️ Remove BG", callback_data="edit_remove_bg"), InlineKeyboardButton("🖼️ Change BG", callback_data="edit_change_bg")]]
         await status_msg.edit_text("✅ Image loaded!\n\nChoose an editing feature below:", reply_markup=InlineKeyboardMarkup(kb))
         context.user_data['state'] = None
     except Exception as e:
         await status_msg.edit_text(f"❌ Processing failed: {e}")
         context.user_data['state'] = None
 
-# --- CHANGE BACKGROUND HANDLERS ---
 async def handle_bg_upload(update, context):
     if context.user_data.get('state') != 'awaiting_bg_upload': return
     if not update.message.photo:
@@ -581,18 +540,23 @@ async def handle_front_upload(update, context):
     if not update.message.photo:
         await update.message.reply_text("❌ Please upload the **front image**.")
         return
-    status_msg = await update.message.reply_text("⏳ Changing background...")
+    status_msg = await update.message.reply_text("⏳ Changing background... (May take up to 30 seconds)")
     try:
-        from rembg import remove, new_session
-        session = new_session("u2netp")  # Prevent OOM
         photo = update.message.photo[-1]; file = await context.bot.get_file(photo.file_id)
         img_bytes = BytesIO(); await file.download_to_memory(img_bytes); img_bytes.seek(0)
         front_img = Image.open(img_bytes)
         bg_img = context.user_data['bg_image']
-        front_cutout = remove(front_img, session=session)
-        bg_img = bg_img.resize(front_cutout.size)
-        bg_img.paste(front_cutout, (0, 0), front_cutout)
-        out_bytes = BytesIO(); bg_img.save(out_bytes, format='JPEG', quality=95); out_bytes.seek(0)
+        async def run_bg_change():
+            def do_work():
+                from rembg import remove, new_session
+                session = new_session("u2netp")
+                front_cutout = remove(front_img, session=session)
+                bg_img_resized = bg_img.resize(front_cutout.size)
+                bg_img_resized.paste(front_cutout, (0, 0), front_cutout)
+                return bg_img_resized
+            return await asyncio.to_thread(do_work)
+        new_img = await run_bg_change()
+        out_bytes = BytesIO(); new_img.save(out_bytes, format='JPEG', quality=95); out_bytes.seek(0)
         await update.message.reply_photo(photo=out_bytes, caption="✅ Background changed!", reply_markup=tool_done_kb())
         await status_msg.edit_text("✅ Background change complete!")
         context.user_data.pop('bg_image', None); context.user_data['state'] = None
@@ -600,68 +564,42 @@ async def handle_front_upload(update, context):
         await status_msg.edit_text(f"❌ Background change failed: {e}")
         context.user_data.pop('bg_image', None); context.user_data['state'] = None
 
-# --- TEXT TO VOICE (With Voice Selection) ---
+# --- TEXT TO VOICE ---
 async def handle_tts(update, context, lang):
     if not update.message.text:
         await update.message.reply_text("❌ Please send the text you want to convert.")
         return
     context.user_data['tts_text'] = update.message.text
     context.user_data['tts_lang'] = lang
-    kb = [
-        [InlineKeyboardButton("🧑 Male", callback_data=f"tts_voice_{lang}_male"),
-         InlineKeyboardButton("👩 Female", callback_data=f"tts_voice_{lang}_female")],
-        [InlineKeyboardButton("👴 Old", callback_data=f"tts_voice_{lang}_old"),
-         InlineKeyboardButton("👶 Child", callback_data=f"tts_voice_{lang}_child")]
-    ]
+    kb = [[InlineKeyboardButton("🧑 Male", callback_data=f"tts_voice_{lang}_male"), InlineKeyboardButton("👩 Female", callback_data=f"tts_voice_{lang}_female")], [InlineKeyboardButton("👴 Old", callback_data=f"tts_voice_{lang}_old"), InlineKeyboardButton("👶 Child", callback_data=f"tts_voice_{lang}_child")]]
     await update.message.reply_text("🎙️ **Choose Voice Type:**", reply_markup=InlineKeyboardMarkup(kb))
     context.user_data['state'] = None
 
 async def handle_tts_voice_selection(update, context, data):
     query = update.callback_query
     await query.answer()
-    
-    parts = data.split("_")  # ['tts', 'voice', 'lang', 'type']
+    parts = data.split("_")
     lang = parts[2]
     voice_type = parts[3]
-    
     text = context.user_data.get('tts_text')
     if not text:
         await query.message.reply_text("❌ No text found. Please send the text again.")
         return
-    
-    # Edge TTS Voices
     if lang == 'en':
-        voice_map = {
-            'male': 'en-US-GuyNeural',
-            'female': 'en-US-JennyNeural',
-            'old': 'en-US-SteffanNeural',
-            'child': 'en-US-AnaNeural'
-        }
-    else:  # Amharic
-        voice_map = {
-            'male': 'am-ET-AmehaNeural',
-            'female': 'am-ET-MekdesNeural',
-            'old': 'am-ET-MekdesNeural',
-            'child': 'am-ET-MekdesNeural'
-        }
-        
+        voice_map = {'male': 'en-US-GuyNeural', 'female': 'en-US-JennyNeural', 'old': 'en-US-SteffanNeural', 'child': 'en-US-AnaNeural'}
+    else:
+        voice_map = {'male': 'am-ET-AmehaNeural', 'female': 'am-ET-MekdesNeural', 'old': 'am-ET-MekdesNeural', 'child': 'am-ET-MekdesNeural'}
     selected_voice = voice_map.get(voice_type, 'en-US-GuyNeural')
-    
     status_msg = await query.message.reply_text("🗣️ Generating voice...")
     try:
         communicate = edge_tts.Communicate(text, selected_voice)
         audio_path = "output.mp3"
         await communicate.save(audio_path)
-        
         with open(audio_path, "rb") as audio:
             await query.message.reply_audio(audio=audio, title=f"Voice ({voice_type})", reply_markup=tool_done_kb())
-        
         os.unlink(audio_path)
         await status_msg.edit_text("✅ Voice generated!")
-        
-        # Clean up user data
-        context.user_data.pop('tts_text', None)
-        context.user_data.pop('tts_lang', None)
+        context.user_data.pop('tts_text', None); context.user_data.pop('tts_lang', None)
     except Exception as e:
         await status_msg.edit_text(f"❌ TTS failed: {e}")
 
@@ -806,29 +744,58 @@ async def handle_voice_to_text(update, context, language):
         await status_msg.edit_text(f"❌ Transcription failed: {e}")
         context.user_data['state'] = None
 
-# --- VIDEO DOWNLOADER ---
+# --- UPDATED VIDEO DOWNLOADER (REAL DOWNLOAD) ---
 async def handle_video_download(update, context):
     if context.user_data.get('state') != 'awaiting_video_link': return
     url = update.message.text
     if not url.startswith("http"):
         await update.message.reply_text("❌ Please send a valid video URL.")
         return
-    status_msg = await update.message.reply_text("⏳ Processing video URL...")
-    ydl_opts = {'quiet': True, 'no_warnings': True, 'noplaylist': True, 'simulate': True, 'skip_download': True, 'format': 'best', 'http_headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}}
-    try:
+    
+    status_msg = await update.message.reply_text("⏳ Downloading video... This may take a while.")
+    
+    # Limit quality to 720p to keep under 50MB Telegram limit
+    ydl_opts = {
+        'format': 'best[height<=720]/best',
+        'outtmpl': os.path.join(tempfile.gettempdir(), '%(title)s.%(ext)s'),
+        'quiet': True, 
+        'no_warnings': True,
+        'noplaylist': True,
+        'ffmpeg_location': imageio_ffmpeg.get_ffmpeg_exe(),
+        'http_headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+    }
+    
+    def download_video():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            direct_url = info.get('url') if info else None
-            if not direct_url: direct_url = info.get('webpage_url') if info else None
-            if not direct_url: direct_url = url
-        await status_msg.edit_text("✅ Video detected! Sending direct link...")
-        await update.message.reply_text(f"🎬 **Direct Video Link:**\n{direct_url}", reply_markup=tool_done_kb())
+            info = ydl.extract_info(url, download=True)
+            filepath = ydl.prepare_filename(info)
+            return filepath
+    
+    try:
+        # Run in a separate thread to prevent freezing the bot
+        filepath = await asyncio.to_thread(download_video)
+        
+        # Check file size (Telegram Bot API limit is 50MB)
+        file_size = os.path.getsize(filepath)
+        if file_size > 50 * 1024 * 1024: 
+            os.unlink(filepath)
+            await status_msg.edit_text("❌ Video is too large to send via Telegram (Over 50MB). Please try a shorter video or lower quality.")
+            return
+        
+        # Send the video file directly to the user
+        with open(filepath, 'rb') as video:
+            await update.message.reply_video(video=video, caption="✅ Downloaded successfully!", reply_markup=tool_done_kb())
+        
+        # Clean up
+        os.unlink(filepath)
+        await status_msg.edit_text("✅ Video download complete!")
         context.user_data['state'] = None
+        
     except Exception as e:
-        await status_msg.edit_text(f"❌ Could not process video.\n**Error:** {str(e)[:150]}")
+        await status_msg.edit_text(f"❌ Download failed: {str(e)[:200]}")
         context.user_data['state'] = None
 
-# --- PDF, WORD, IMAGE, ETC. (Other handlers) ---
+# --- PDF, WORD, IMAGE COLLECT ---
 async def handle_pdf_upload(update, context):
     if context.user_data.get('state') != 'awaiting_pdf': return
     if not update.message.document:
@@ -951,7 +918,7 @@ async def process_image_pdf(update, context):
         else: await update.message.reply_text(error_msg)
         context.user_data['state'] = None; context.user_data['pdf_images'] = []
 
-# --- INBOX, PROFILE, SEARCH, STORIES, ETC. (Keeping existing logic) ---
+# --- OTHER FEATURES (Profile, Search, etc.) ---
 async def fetch_profile(update, context, target):
     try:
         entity = await telethon_client.get_entity(target)
