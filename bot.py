@@ -746,62 +746,61 @@ async def handle_voice_to_text(update, context, language):
         await status_msg.edit_text(f"❌ Transcription failed: {e}")
         context.user_data['state'] = None
 
-# --- UPDATED VIDEO DOWNLOADER (WITH QUALITY SELECTION) ---
+# --- VIDEO DOWNLOADER (DYNAMIC IMPERSONATE FIX) ---
+def get_ydl_opts(quality='best', audio=False):
+    opts = {
+        'format': f'best[height<={quality}]/best' if not audio else 'bestaudio/best',
+        'outtmpl': os.path.join(tempfile.gettempdir(), '%(title)s.%(ext)s'),
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'ffmpeg_location': imageio_ffmpeg.get_ffmpeg_exe(),
+        'http_headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+    }
+    # Try to enable Chrome impersonation ONLY if curl_cffi is installed
+    try:
+        import curl_cffi
+        opts['impersonate'] = 'chrome'
+    except ImportError:
+        pass
+    return opts
+
 async def handle_video_download(update, context):
     if context.user_data.get('state') != 'awaiting_video_link': return
     url = update.message.text
     if not url.startswith("http"):
         await update.message.reply_text("❌ Please send a valid video URL.")
         return
-    
+
     status_msg = await update.message.reply_text("⏳ Extracting video info...")
-    
-    # Simulate extraction to get formats
-    ydl_opts = {
-        'quiet': True, 
-        'no_warnings': True,
-        'simulate': True,
-        'skip_download': True,
-        'noplaylist': True,
-        'impersonate': 'chrome',
-        'ffmpeg_location': imageio_ffmpeg.get_ffmpeg_exe()
-    }
-    
+
+    def extract_info():
+        with yt_dlp.YoutubeDL(get_ydl_opts(quality='best')) as ydl:
+            return ydl.extract_info(url, download=False)
+
     try:
-        def extract_info():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(url, download=False)
-        
         info = await asyncio.to_thread(extract_info)
-        
         if not info:
             await status_msg.edit_text("❌ Could not extract video info.")
             return
 
-        # Store URL in user context for the callback (avoids URL length limits)
         context.user_data['video_url'] = url
         title = info.get('title', 'Video')
-        
-        # Get available heights
+
         heights = set()
         if 'formats' in info:
             for f in info['formats']:
                 if f.get('height'):
                     heights.add(f['height'])
-        # Add common resolutions if they are available
+
         all_heights = [1080, 720, 480, 360, 240, 144]
         buttons = []
-        
         for h in all_heights:
             if h in heights:
                 buttons.append(InlineKeyboardButton(f"{h}p", callback_data=f"video_{h}"))
-        
-        # Audio button
         buttons.append(InlineKeyboardButton("🎵 Audio Only", callback_data="video_audio"))
-        
-        # Create keyboard rows of 3
+
         keyboard = [buttons[i:i+3] for i in range(0, len(buttons), 3)]
-        
         await status_msg.edit_text(
             f"🎬 **{title[:50]}**\n\nSelect Download Quality:",
             reply_markup=InlineKeyboardMarkup(keyboard)
@@ -815,78 +814,49 @@ async def handle_video_download(update, context):
 async def handle_video_quality_selection(update, context, data):
     query = update.callback_query
     await query.answer()
-    
-    quality = data.split("_")[1]  # Get height or 'audio'
+
+    quality = data.split("_")[1]
     url = context.user_data.get('video_url')
-    
+
     if not url:
         await query.message.reply_text("❌ Session expired. Please send the link again.")
         return
-    
+
     status_msg = await query.message.reply_text(f"⏳ Downloading ({quality})... This may take a while.")
-    
-    if quality == 'audio':
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'outtmpl': os.path.join(tempfile.gettempdir(), '%(title)s.%(ext)s'),
-            'quiet': True, 
-            'no_warnings': True,
-            'noplaylist': True,
-            'impersonate': 'chrome',
-            'ffmpeg_location': imageio_ffmpeg.get_ffmpeg_exe(),
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }],
-            'http_headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-        }
-    else:
-        ydl_opts = {
-            'format': f'best[height<={quality}]/best',
-            'outtmpl': os.path.join(tempfile.gettempdir(), '%(title)s.%(ext)s'),
-            'quiet': True, 
-            'no_warnings': True,
-            'noplaylist': True,
-            'impersonate': 'chrome',
-            'ffmpeg_location': imageio_ffmpeg.get_ffmpeg_exe(),
-            'http_headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-        }
-    
+
+    is_audio = (quality == 'audio')
+    options = get_ydl_opts(quality=quality, audio=is_audio)
+
     def download_video():
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=True)
             filepath = ydl.prepare_filename(info)
-            # Check if ffmpeg output changed the extension (for audio)
             if os.path.exists(filepath):
                 return filepath
             elif os.path.exists(filepath.rsplit('.', 1)[0] + '.mp3'):
                 return filepath.rsplit('.', 1)[0] + '.mp3'
             else:
                 return filepath
-    
+
     try:
         filepath = await asyncio.to_thread(download_video)
-        
-        # Check file size (Telegram Bot API limit is 50MB)
+
         file_size = os.path.getsize(filepath)
-        if file_size > 50 * 1024 * 1024: 
+        if file_size > 50 * 1024 * 1024:
             os.unlink(filepath)
             await status_msg.edit_text("❌ Video is too large to send via Telegram (Over 50MB). Please try a lower quality.")
             return
-        
-        # Send video or audio
+
         with open(filepath, 'rb') as media:
-            if quality == 'audio':
+            if is_audio:
                 await query.message.reply_audio(audio=media, caption="✅ Audio Extracted!", reply_markup=tool_done_kb())
             else:
                 await query.message.reply_video(video=media, caption=f"✅ Downloaded ({quality}p)!", reply_markup=tool_done_kb())
-        
-        # Clean up
+
         os.unlink(filepath)
         await status_msg.edit_text("✅ Download complete!")
         context.user_data.pop('video_url', None)
-        
+
     except Exception as e:
         await status_msg.edit_text(f"❌ Download failed: {str(e)[:200]}")
         context.user_data.pop('video_url', None)
