@@ -9,6 +9,7 @@ import tempfile
 import subprocess
 import urllib.request
 import urllib.parse
+import shutil
 import html
 from io import BytesIO
 from flask import Flask
@@ -31,6 +32,16 @@ import speech_recognition as sr
 import imageio_ffmpeg
 from groq import Groq
 import edge_tts
+
+# Render compatibility: rapidocr-onnxruntime 1.4.4 requires Python < 3.13.
+if sys.version_info >= (3, 13):
+    raise RuntimeError(
+        f"Unsupported Python {sys.version.split()[0]}. "
+        "Use Python 3.12 on Render (see .python-version)."
+    )
+
+BUILD_ID = "render-fix-2026-09-02-v6"
+print(f"Starting bot build: {BUILD_ID} | Python: {sys.version.split()[0]}")
 
 try:
     from telethon.tl.functions.stories import GetPeerStoriesRequest, GetStoriesByIDRequest
@@ -856,30 +867,30 @@ async def handle_voice_to_text(update, context, language):
         context.user_data['state'] = None
 
 # --- ROBUST MULTI-SOURCE VIDEO DOWNLOADER ---
-# Build: yt-fix-2026-09-02-v4
+# Build: yt-fix-2026-09-02-v5
 #
-# YouTube strategy:
-#   1) yt-dlp with current YouTube clients/EJS
-#   2) optional WebPoClient provider if installed and Chrome/Chromium exists
-#   3) optional Cobalt API fallback
+# YouTube strategy (no Piped and no Cobalt):
+#   1) web_embedded (good for public embeddable videos; no PO token required)
+#   2) android_vr (format 18 fallback for public videos)
+#   3) web_safari (HLS fallback where available)
+#   4) optional authenticated cookies / proxy / PO-token through environment vars
 #
-# IMPORTANT: There is intentionally NO Piped fallback in this build.
+# This deliberately does NOT use fake/unstable third-party downloader services.
 
 VIDEO_MAX_UPLOAD = 50 * 1024 * 1024
 VIDEO_QUALITIES = [1080, 720, 480, 360, 240]
 TIKWM_API = "https://www.tikwm.com/api/"
+BUILD_ID = "yt-fix-2026-09-02-v5"
 
-# Current 2026 YouTube extraction is increasingly dependent on PO Tokens.
-# The WebPoClient plugin can mint tokens in a real Chromium session.
-# It is only used when the plugin/browser are actually available.
-YOUTUBE_CLIENTS = ["mweb", "default", "android_vr", "web_embedded", "ios", "web_safari"]
+# The first two are deliberately the simplest current YouTube clients.
+# android_vr's legacy H.264/AAC format 18 is useful as a no-token fallback.
+YOUTUBE_INFO_CLIENTS = ["web_embedded", "android_vr", "web_safari"]
+YOUTUBE_DOWNLOAD_CLIENTS = ["web_embedded", "android_vr", "web_safari"]
 
-COBALT_API_URL = os.environ.get("COBALT_API_URL", "https://api.cobalt.tools/api/json").rstrip("/")
-COBALT_API_KEY = os.environ.get("COBALT_API_KEY", "").strip()
 YTDLP_COOKIES_FILE = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
 YOUTUBE_PROXY = os.environ.get("YOUTUBE_PROXY", "").strip()
-YOUTUBE_BROWSER_PATH = os.environ.get("YOUTUBE_BROWSER_PATH", "").strip()
-BUILD_ID = "yt-fix-2026-09-02-v4"
+YOUTUBE_PO_TOKEN = os.environ.get("YOUTUBE_PO_TOKEN", "").strip()
+YOUTUBE_PO_CONTEXT = os.environ.get("YOUTUBE_PO_CONTEXT", "").strip()
 
 
 def video_platform(url: str) -> str:
@@ -898,6 +909,8 @@ def video_platform(url: str) -> str:
 
 def normalize_public_url(url: str) -> str:
     url = (url or "").strip()
+    # Resolve common short URLs, but do not fail just because a remote redirect
+    # server rejects the request. yt-dlp can often resolve the original URL.
     req = urllib.request.Request(
         url,
         headers={
@@ -910,48 +923,10 @@ def normalize_public_url(url: str) -> str:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as response:
+        with urllib.request.urlopen(req, timeout=12) as response:
             return response.geturl() or url
     except Exception:
         return url
-
-
-def youtube_video_id(url: str):
-    p = urllib.parse.urlparse(url)
-    host = p.netloc.lower().split(":", 1)[0]
-    if host == "youtu.be":
-        parts = [x for x in p.path.split("/") if x]
-        return parts[0] if parts else None
-    if "youtube.com" in host:
-        q = urllib.parse.parse_qs(p.query)
-        if q.get("v"):
-            return q["v"][0]
-        parts = [x for x in p.path.split("/") if x]
-        if len(parts) >= 2 and parts[0] in {"shorts", "embed", "live"}:
-            return parts[1]
-    return None
-
-
-def find_browser_executable():
-    if YOUTUBE_BROWSER_PATH and os.path.isfile(YOUTUBE_BROWSER_PATH):
-        return YOUTUBE_BROWSER_PATH
-    candidates = [
-        "google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"
-    ]
-    for name in candidates:
-        path = shutil.which(name)
-        if path:
-            return path
-    return None
-
-
-def wpc_available():
-    """Return True when the optional WebPoClient plugin is installed."""
-    try:
-        import nodriver  # noqa: F401
-        return find_browser_executable() is not None
-    except Exception:
-        return False
 
 
 def ytdlp_base_options(*, youtube_client=None):
@@ -960,9 +935,9 @@ def ytdlp_base_options(*, youtube_client=None):
         "no_warnings": False,
         "noplaylist": True,
         "socket_timeout": 30,
-        "retries": 4,
-        "fragment_retries": 4,
-        "file_access_retries": 4,
+        "retries": 5,
+        "fragment_retries": 5,
+        "file_access_retries": 5,
         "concurrent_fragment_downloads": 2,
         "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
         "http_headers": {
@@ -972,6 +947,7 @@ def ytdlp_base_options(*, youtube_client=None):
             ),
             "Accept-Language": "en-US,en;q=0.8",
         },
+        # Modern yt-dlp can fetch EJS challenge code from GitHub.
         "remote_components": {"ejs:github"},
     }
 
@@ -981,40 +957,45 @@ def ytdlp_base_options(*, youtube_client=None):
     if YOUTUBE_PROXY:
         options["proxy"] = YOUTUBE_PROXY
 
+    extractor_args = {}
     if youtube_client:
-        options["extractor_args"] = {"youtube": {"player_client": [youtube_client]}}
+        extractor_args["youtube"] = {"player_client": [youtube_client]}
+        # A manually supplied PO token is only used when the operator provides
+        # a matching context. Never invent or rotate tokens in code.
+        if YOUTUBE_PO_TOKEN and YOUTUBE_PO_CONTEXT:
+            extractor_args["youtube"]["po_token"] = [f"{YOUTUBE_PO_CONTEXT}+{YOUTUBE_PO_TOKEN}"]
+    if extractor_args:
+        options["extractor_args"] = extractor_args
 
-    # Optional manually supplied PO token. Keep it exact and video-independent
-    # only when the owner already has a valid token for the chosen context.
-    po_token = os.environ.get("YOUTUBE_PO_TOKEN", "").strip()
-    if po_token and youtube_client:
-        context = os.environ.get("YOUTUBE_PO_CONTEXT", "mweb.gvs").strip()
-        options.setdefault("extractor_args", {"youtube": {}})
-        options["extractor_args"]["youtube"]["po_token"] = [f"{context}+{po_token}"]
-
-    # Give WebPoClient a browser path if it exists. The provider plugin reads
-    # this extractor argument when it launches Chromium.
-    browser = find_browser_executable()
-    if browser and youtube_client in {"mweb", "web", "web_safari", "web_embedded", "tv", "tv_embedded"}:
-        options.setdefault("extractor_args", {"youtube": {}})
-        options["extractor_args"]["youtubepot-wpc"] = {"browser_path": browser}
-
-    # If a browser provider is not installed, don't force the wpc extractor.
-    # It is an optional plugin and yt-dlp will otherwise fall back normally.
     return options
 
 
-def build_ytdlp_format(height=None, audio=False, platform="unknown"):
+def build_ytdlp_format(height=None, audio=False, platform="unknown", youtube_client=None):
     if audio:
         return "bestaudio/best"
-    if platform == "youtube" and height:
-        # Prefer MP4/H.264 where available, then fall back to any compatible
-        # stream at or below the requested height.
-        return (
-            f"bestvideo[height<={height}][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
-            f"bestvideo[height<={height}]+bestaudio/"
-            f"best[height<={height}]/best"
-        )
+
+    if platform == "youtube":
+        # For android_vr specifically, format 18 is intentionally preferred as
+        # the simple no-token fallback. It is H.264 + AAC and already merged.
+        if youtube_client == "android_vr":
+            if height is None or height <= 360:
+                return "18/best[height<=360]/best"
+            # Try a requested quality if a PO token makes richer formats usable,
+            # but retain format 18 as the final fallback.
+            return (
+                f"bestvideo[height<={height}][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
+                f"best[height<={height}][ext=mp4]/18/best[height<=360]/best"
+            )
+
+        # H.264/M4A first for broad device compatibility.
+        if height:
+            return (
+                f"bestvideo[height<={height}][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
+                f"best[height<={height}][ext=mp4]/best[height<={height}]/best"
+            )
+        return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+
     if height:
         return f"best[height<={height}]/best"
     return "bestvideo+bestaudio/best"
@@ -1032,10 +1013,19 @@ def _find_media_file(output_dir: str, preferred=None):
     return max(files, key=os.path.getmtime) if files else None
 
 
+def _clean_dir(output_dir):
+    for name in os.listdir(output_dir):
+        path = os.path.join(output_dir, name)
+        if os.path.isfile(path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
 def ytdlp_extract_info(url: str, youtube_client=None):
     opts = ytdlp_base_options(youtube_client=youtube_client)
     opts["skip_download"] = True
-    opts["noplaylist"] = True
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 
@@ -1044,12 +1034,13 @@ def ytdlp_download(url, output_dir, *, height=None, audio=False, title_hint="vid
     platform = video_platform(url)
     opts = ytdlp_base_options(youtube_client=youtube_client)
     opts.update({
-        "format": build_ytdlp_format(height, audio, platform),
+        "format": build_ytdlp_format(height, audio, platform, youtube_client),
         "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
         "merge_output_format": "mp4",
         "overwrites": True,
         "keepvideo": False,
     })
+
     if audio:
         opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
@@ -1079,92 +1070,93 @@ def _quality_list_from_info(info):
     return result
 
 
+def _has_audio(info):
+    return any(f.get("acodec") not in (None, "none") for f in (info.get("formats") or []))
+
+
 def youtube_direct_extract(url: str):
     errors = []
-    clients = YOUTUBE_CLIENTS[:]
-    # If WebPoClient is truly available, mweb is the strongest current path.
-    # Otherwise we don't pretend it is available; direct yt-dlp still tries it
-    # but its provider simply won't be present.
-    for client in clients:
+    for client in YOUTUBE_INFO_CLIENTS:
         try:
             info = ytdlp_extract_info(url, client)
-            heights = _quality_list_from_info(info)
-            if heights or any(f.get("acodec") not in (None, "none") for f in info.get("formats", [])):
+            qualities = _quality_list_from_info(info)
+            if qualities or _has_audio(info):
+                # Avoid advertising a quality that is not actually present.
                 return info, client
             errors.append(f"{client}: no usable media formats")
         except Exception as exc:
-            message = str(exc).replace("\n", " ")
-            errors.append(f"{client}: {message[:360]}")
-    raise RuntimeError("YouTube direct extraction failed: " + " | ".join(errors))
+            errors.append(f"{client}: {str(exc).replace(chr(10), ' ')[:320]}")
+
+    # Final attempt using yt-dlp's own current client selection.
+    try:
+        info = ytdlp_extract_info(url, None)
+        qualities = _quality_list_from_info(info)
+        if qualities or _has_audio(info):
+            return info, None
+        errors.append("default: no usable media formats")
+    except Exception as exc:
+        errors.append(f"default: {str(exc).replace(chr(10), ' ')[:320]}")
+
+    raise RuntimeError("YouTube extraction failed: " + " | ".join(errors))
 
 
 def youtube_direct_download(url, output_dir, *, height=None, audio=False, title_hint="YouTube video", preferred_client=None):
     clients = []
     if preferred_client:
         clients.append(preferred_client)
-    clients.extend([c for c in YOUTUBE_CLIENTS if c not in clients])
+    clients.extend([c for c in YOUTUBE_DOWNLOAD_CLIENTS if c not in clients])
+    clients.append(None)  # yt-dlp's own default client selection
+
     errors = []
     for client in clients:
         try:
-            return ytdlp_download(url, output_dir, height=height, audio=audio, title_hint=title_hint, youtube_client=client)
+            return ytdlp_download(
+                url,
+                output_dir,
+                height=height,
+                audio=audio,
+                title_hint=title_hint,
+                youtube_client=client,
+            )
         except Exception as exc:
-            errors.append(f"{client}: {str(exc).replace(chr(10), ' ')[:360]}")
-            for name in list(os.listdir(output_dir)):
-                path = os.path.join(output_dir, name)
-                if os.path.isfile(path):
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        pass
-    raise RuntimeError("YouTube direct download failed: " + " | ".join(errors))
+            errors.append(f"{client or 'default'}: {str(exc).replace(chr(10), ' ')[:340]}")
+            _clean_dir(output_dir)
+
+    raise RuntimeError("YouTube download failed: " + " | ".join(errors))
 
 
-def http_json(url, payload=None, headers=None, timeout=60):
-    hdrs = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json,text/plain,*/*",
-    }
-    if headers:
-        hdrs.update(headers)
-    if payload is None:
-        req = urllib.request.Request(url, headers=hdrs)
-    else:
-        hdrs["Content-Type"] = "application/json"
-        hdrs["Accept"] = "application/json"
-        data = __import__("json").dumps(payload).encode("utf-8")
-        req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        raw = response.read()
-        return __import__("json").loads(raw.decode("utf-8", errors="replace"))
+def tikwm_get_data(url: str):
+    query = urllib.parse.urlencode({"url": url})
+    endpoint = TIKWM_API + "?" + query
+    request = urllib.request.Request(
+        endpoint,
+        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,*/*"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        data = __import__("json").load(response)
+    if int(data.get("code", -1)) != 0 or not data.get("data"):
+        raise RuntimeError(data.get("msg") or "TikTok fallback service returned no data")
+    return data["data"]
 
 
-def cobalt_request(url, *, quality="1080", audio=False):
-    # Cobalt current API shape. API URL can be overridden by the owner.
-    payload = {
-        "url": url,
-        "vCodec": "h264",
-        "vQuality": "max" if quality == "max" else str(quality),
-        "aFormat": "mp3",
-        "isAudioOnly": bool(audio),
-        "filenamePattern": "pretty",
-        "disableMetadata": False,
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-    if COBALT_API_KEY:
-        headers["Authorization"] = f"Api-Key {COBALT_API_KEY}"
+def tikwm_download(url, output_dir, *, quality="hd", audio=False, data=None):
+    data = data or tikwm_get_data(url)
+    title = data.get("title") or data.get("desc") or "TikTok video"
+    if audio:
+        media_url = data.get("music")
+        if not media_url:
+            raise RuntimeError("TikTok audio URL was not returned")
+        path = os.path.join(output_dir, "audio.mp3")
+        download_url_to_file(media_url, path)
+        return {"path": path, "title": title, "source": "tikwm"}
 
-    try:
-        result = http_json(COBALT_API_URL, payload, headers=headers, timeout=90)
-    except Exception as exc:
-        raise RuntimeError(f"Cobalt API request failed: {str(exc)[:500]}") from exc
-
-    if result.get("status") == "error":
-        err = result.get("error") or {}
-        raise RuntimeError(err.get("code") or result.get("text") or "Cobalt returned an error")
-    return result
+    media_url = data.get("hdplay") if quality == "hd" else None
+    media_url = media_url or data.get("play") or data.get("wmplay")
+    if not media_url:
+        raise RuntimeError("TikTok video URL was not returned")
+    path = os.path.join(output_dir, "video.mp4")
+    download_url_to_file(media_url, path)
+    return {"path": path, "title": title, "source": "tikwm"}
 
 
 def download_url_to_file(url, path, headers=None):
@@ -1180,112 +1172,26 @@ def download_url_to_file(url, path, headers=None):
             out.write(chunk)
 
 
-def cobalt_download(url, output_dir, *, quality=1080, audio=False, title_hint="YouTube video"):
-    result = cobalt_request(url, quality=str(quality), audio=audio)
-    status = result.get("status")
-    download_url = result.get("url")
-    filename = result.get("filename") or ("audio.mp3" if audio else "video.mp4")
-
-    if status == "picker":
-        picker = result.get("picker") or []
-        candidates = [x for x in picker if x.get("url")]
-        if not candidates:
-            raise RuntimeError("Cobalt returned no downloadable picker item")
-        # Prefer video matching the requested quality when supplied.
-        if not audio:
-            requested = int(quality) if str(quality).isdigit() else 99999
-            candidates.sort(key=lambda x: abs(int(x.get("height") or requested) - requested))
-        download_url = candidates[0]["url"]
-
-    if not download_url:
-        raise RuntimeError(f"Cobalt returned no download URL (status={status!r})")
-
-    ext = ".mp3" if audio else ".mp4"
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", filename or title_hint)[:100]
-    if not os.path.splitext(safe)[1]:
-        safe += ext
-    path = os.path.join(output_dir, safe)
-    download_url_to_file(download_url, path)
-    if not os.path.isfile(path) or os.path.getsize(path) == 0:
-        raise RuntimeError("Cobalt returned an empty file")
-    return {"path": path, "title": title_hint, "source": "cobalt"}
-
-
-def tikwm_get_data(url: str):
-    query = urllib.parse.urlencode({"url": url})
-    endpoint = TIKWM_API + "?" + query
-    request = urllib.request.Request(endpoint, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,*/*"})
-    with urllib.request.urlopen(request, timeout=30) as response:
-        data = __import__("json").load(response)
-    if int(data.get("code", -1)) != 0 or not data.get("data"):
-        raise RuntimeError(data.get("msg") or "TikTok fallback service returned no data")
-    return data["data"]
-
-
-def tikwm_download(url, output_dir, *, quality="hd", audio=False, data=None):
-    data = data or tikwm_get_data(url)
-    title = data.get("title") or data.get("desc") or "TikTok video"
-    if audio:
-        media_url = data.get("music")
-        if not media_url:
-            raise RuntimeError("TikTok fallback has no audio URL")
-        raw = os.path.join(output_dir, "tiktok_audio.bin")
-        out = os.path.join(output_dir, "tiktok_audio.mp3")
-        download_url_to_file(media_url, raw)
-        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-        result = subprocess.run([ffmpeg, "-y", "-i", raw, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", out], capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError((result.stderr or "TikTok audio conversion failed")[-1200:])
-        try:
-            os.unlink(raw)
-        except OSError:
-            pass
-        return {"path": out, "title": title}
-    media_url = data.get("hdplay") if quality == "hd" else data.get("play")
-    media_url = media_url or data.get("play") or data.get("wmplay")
-    if not media_url:
-        raise RuntimeError("TikTok fallback returned no video URL")
-    out = os.path.join(output_dir, "tiktok.mp4")
-    download_url_to_file(media_url, out)
-    return {"path": out, "title": title}
-
-
 def extract_download_options(url: str):
-    platform = video_platform(url)
+    normalized = normalize_public_url(url)
+    platform = video_platform(normalized)
     if platform == "unknown":
         raise RuntimeError("Unsupported URL. Use YouTube, TikTok, Instagram, or Facebook.")
 
-    normalized = normalize_public_url(url) if platform == "tiktok" else url.strip()
-
     if platform == "youtube":
-        direct_error = None
-        try:
-            info, client = youtube_direct_extract(normalized)
-            qualities = _quality_list_from_info(info)
-            return {
-                "source": "ytdlp",
-                "platform": "youtube",
-                "url": normalized,
-                "title": info.get("title") or "YouTube video",
-                "qualities": qualities or [360],
-                "audio": True,
-                "youtube_client": client,
-                "build": BUILD_ID,
-            }
-        except Exception as exc:
-            direct_error = str(exc)
-
-        # Don't use Piped. Use the current Cobalt endpoint only as a real API fallback.
+        info, client = youtube_direct_extract(normalized)
+        qualities = _quality_list_from_info(info)
+        # A public no-token YouTube fallback may only expose 360p (format 18).
+        if not qualities and _has_audio(info):
+            qualities = [360]
         return {
-            "source": "cobalt",
-            "platform": "youtube",
+            "source": "ytdlp",
+            "platform": platform,
             "url": normalized,
-            "title": "YouTube video",
-            "qualities": VIDEO_QUALITIES[:],
+            "title": info.get("title") or "YouTube video",
+            "qualities": qualities or [360],
             "audio": True,
-            "youtube_client": None,
-            "direct_error": direct_error,
-            "build": BUILD_ID,
+            "youtube_client": client,
         }
 
     try:
@@ -1332,7 +1238,7 @@ def format_bytes(value):
 def video_quality_keyboard(job):
     buttons = []
     for q in job.get("qualities", []):
-        label = f"🎥 {q}p" if isinstance(q, int) else f"🎥 {q.upper()}"
+        label = f"🎥 {q}p" if isinstance(q, int) else f"🎥 {str(q).upper()}"
         buttons.append(InlineKeyboardButton(label, callback_data=f"vd_q_{q}"))
     rows = [buttons[i:i+3] for i in range(0, len(buttons), 3)] if buttons else []
     if job.get("audio"):
@@ -1352,22 +1258,21 @@ async def handle_video_download(update, context):
     status_msg = await update.message.reply_text("🔎 Checking the video and available qualities…")
     try:
         job = await asyncio.to_thread(extract_download_options, raw_url)
-        job["chat_id"] = update.effective_chat.id
         context.user_data["video_job"] = job
         context.user_data["state"] = None
-        note = ""
-        if job.get("source") == "cobalt":
-            note = "\n\n⚙️ Direct YouTube extraction was unavailable on this server, so the Cobalt API fallback is ready."
         await status_msg.edit_text(
             f"🎬 <b>{html.escape(job['platform'].title())} Downloader</b>\n\n"
             f"<b>{html.escape((job.get('title') or 'Video')[:160])}</b>\n\n"
-            f"Choose the quality:{note}",
+            f"Choose the quality:",
             reply_markup=video_quality_keyboard(job),
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
         context.user_data["state"] = None
-        await status_msg.edit_text("❌ Could not prepare download.\n\n" + html.escape(str(e)[:3500]), parse_mode=ParseMode.HTML)
+        await status_msg.edit_text(
+            "❌ Could not prepare download.\n\n" + html.escape(str(e)[:3500]),
+            parse_mode=ParseMode.HTML,
+        )
 
 
 async def handle_video_callback(update, context, data):
@@ -1391,41 +1296,31 @@ async def handle_video_callback(update, context, data):
     output_dir = tempfile.mkdtemp(prefix="tg_video_")
     status_msg = await query.message.reply_text("⏳ Downloading…")
 
-    def clean_dir():
-        for name in list(os.listdir(output_dir)):
-            path = os.path.join(output_dir, name)
-            if os.path.isfile(path):
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
-
     try:
         await query.edit_message_reply_markup(reply_markup=None)
         audio = selected == "audio"
-        quality = None if audio else selected
+        requested_quality = None if audio else int(selected)
 
         def do_download():
             platform = job["platform"]
             source = job["source"]
-            if source == "cobalt":
-                q = 1080 if audio else int(quality)
-                return cobalt_download(job["url"], output_dir, quality=q, audio=audio, title_hint=job.get("title", "YouTube video"))
             if platform == "youtube":
                 return youtube_direct_download(
-                    job["url"], output_dir,
-                    height=None if audio else int(quality),
+                    job["url"],
+                    output_dir,
+                    height=requested_quality,
                     audio=audio,
                     title_hint=job.get("title", "YouTube video"),
                     preferred_client=job.get("youtube_client"),
                 )
             if source == "tikwm":
-                q = quality if quality in {"hd", "sd"} else "sd"
+                q = selected if selected in {"hd", "sd"} else "sd"
                 return tikwm_download(job["url"], output_dir, quality=q, audio=audio, data=job.get("tikwm"))
             return ytdlp_download(
-                job["url"], output_dir,
+                job["url"],
+                output_dir,
                 audio=audio,
-                height=None if audio else int(quality),
+                height=requested_quality,
                 title_hint=job.get("title", "video"),
             )
 
@@ -1433,21 +1328,29 @@ async def handle_video_callback(update, context, data):
         filepath = result["path"]
         file_size = os.path.getsize(filepath)
 
+        # If the requested file is too large, step down through qualities that
+        # actually exist in the extraction result.
         if file_size > VIDEO_MAX_UPLOAD and not audio:
-            candidates = [q for q in job.get("qualities", VIDEO_QUALITIES) if isinstance(q, int) and q < int(quality)]
+            candidates = [
+                q for q in job.get("qualities", [])
+                if isinstance(q, int) and q < int(requested_quality)
+            ]
             for q in candidates:
-                clean_dir()
+                _clean_dir(output_dir)
                 try:
-                    if job["source"] == "cobalt":
-                        candidate = await asyncio.to_thread(cobalt_download, job["url"], output_dir, quality=q, audio=False, title_hint=job.get("title", "YouTube video"))
-                    elif job["platform"] == "youtube":
-                        candidate = await asyncio.to_thread(youtube_direct_download, job["url"], output_dir, height=q, audio=False, title_hint=job.get("title", "YouTube video"), preferred_client=job.get("youtube_client"))
-                    else:
-                        candidate = await asyncio.to_thread(ytdlp_download, job["url"], output_dir, height=q, audio=False, title_hint=job.get("title", "video"))
+                    candidate = await asyncio.to_thread(
+                        youtube_direct_download if job["platform"] == "youtube" else ytdlp_download,
+                        job["url"],
+                        output_dir,
+                        height=q,
+                        audio=False,
+                        title_hint=job.get("title", "video"),
+                        **({"preferred_client": job.get("youtube_client")} if job["platform"] == "youtube" else {}),
+                    )
                     cpath = candidate["path"]
                     csize = os.path.getsize(cpath)
                     if csize <= VIDEO_MAX_UPLOAD:
-                        result, filepath, file_size, quality = candidate, cpath, csize, q
+                        result, filepath, file_size, requested_quality = candidate, cpath, csize, q
                         break
                 except Exception:
                     continue
@@ -1475,15 +1378,13 @@ async def handle_video_callback(update, context, data):
                 )
         await status_msg.edit_text("✅ Download completed successfully!")
     except Exception as e:
-        await status_msg.edit_text("❌ Download failed.\n\n" + html.escape(str(e)[:3500]), parse_mode=ParseMode.HTML)
+        await status_msg.edit_text(
+            "❌ Download failed.\n\n" + html.escape(str(e)[:3500]),
+            parse_mode=ParseMode.HTML,
+        )
     finally:
         context.user_data.pop("video_job", None)
-        try:
-            import shutil
-            shutil.rmtree(output_dir, ignore_errors=True)
-        except Exception:
-            pass
-
+        shutil.rmtree(output_dir, ignore_errors=True)
 
 # --- PDF, WORD, IMAGE COLLECT ---
 async def handle_pdf_upload(update, context):
