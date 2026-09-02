@@ -3,6 +3,7 @@ import asyncio
 import os
 import sys
 import time
+import base64
 import threading
 import sqlite3
 import tempfile
@@ -19,7 +20,7 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
 from telethon import TelegramClient, events, functions, types
 from telethon.sessions import StringSession
-from telethon.errors import (FloodWaitError, ChannelPrivateError, UsernameNotOccupiedError, MessageIdInvalidError)
+from telethon.errors import (FloodWaitError, ChannelPrivateError, UsernameNotOccupiedError, MessageIdInvalidError, RPCError)
 import pymupdf
 import img2pdf
 from pdf2docx import Converter
@@ -313,6 +314,129 @@ async def restart_command(update, context):
         pass
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
+# --- UPDATED GLOBAL SEARCH LOGIC (FAST, DYNAMIC FILTERS, NOT JOINED CHATS) ---
+async def fetch_search(update, context, query):
+    status_msg = await update.message.reply_text("🔎 Searching Telegram globally... (This is fast!)")
+    try:
+        # Use Telegram's Global Search API. Searches EVERYTHING public, not just joined chats.
+        result = await telethon_client(functions.messages.SearchGlobalRequest(
+            q=query,
+            filter=types.InputMessagesFilterEmpty(),
+            min_date=0,
+            max_date=0,
+            offset_rate=0,
+            offset_peer=types.InputPeerEmpty(),
+            offset_id=0,
+            limit=100
+        ))
+
+        # Parse results
+        all_results = []
+        for msg in result.messages:
+            peer_id = msg.chat_id
+            msg_id = msg.id
+            
+            # Resolve peer (User, Channel, Group)
+            try:
+                entity = await telethon_client.get_entity(peer_id)
+                if hasattr(entity, 'username') and entity.username:
+                    link = f"https://t.me/{entity.username}/{msg_id}"
+                else:
+                    link = f"https://t.me/c/{peer_id}/{msg_id}"
+            except:
+                link = f"https://t.me/c/{peer_id}/{msg_id}"
+            
+            # Determine media type
+            if msg.photo: media_type = "photo"
+            elif msg.video: media_type = "video"
+            elif msg.document: media_type = "doc"
+            elif msg.audio or msg.voice: media_type = "audio"
+            else: media_type = "text"
+            
+            content = msg.message[:100] if msg.message else f"[{media_type.upper()}]"
+            
+            all_results.append({
+                "link": link,
+                "content": content,
+                "type": media_type,
+                "date": msg.date
+            })
+
+        if not all_results:
+            await status_msg.edit_text("❌ No global results found.")
+            return
+
+        # Store in memory for dynamic filtering
+        context.user_data['search_data'] = all_results
+        context.user_data['search_query'] = query
+        context.user_data['search_filter'] = 'all'
+        context.user_data['search_page'] = 1
+
+        await status_msg.delete()
+        await display_search_page(update, context, 1, 'all')
+
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Search failed (check log): {str(e)[:150]}")
+
+async def display_search_page(update, context, page, filter_type):
+    query = update.callback_query
+    if query:
+        await query.answer()
+
+    all_results = context.user_data.get('search_data', [])
+    search_query = context.user_data.get('search_query', '')
+    
+    # Filter results based on type
+    if filter_type == 'all':
+        filtered = all_results
+    else:
+        filtered = [r for r in all_results if r['type'] == filter_type]
+    
+    total_results = len(filtered)
+    per_page = 10
+    total_pages = max(1, (total_results + per_page - 1) // per_page)
+    page = max(1, min(page, total_pages))
+    
+    start = (page - 1) * per_page
+    end = start + per_page
+    page_items = filtered[start:end]
+
+    # Build text
+    text = f"<blockquote><b>Global Search Results</b>\n{search_query}\n\n"
+    for item in page_items:
+        text += f"🔗 <a href='{item['link']}'>{item['content']}</a>\n\n"
+    text += f"Page {page}/{total_pages} • {total_results} results\nSort by relevance</blockquote>"
+
+    # Dynamic Filter Buttons
+    kb = []
+    filter_buttons = [
+        ("all", "All"), ("photo", "📷"), ("video", "🎬"), 
+        ("doc", "📄"), ("audio", "🎵"), ("text", "💬")
+    ]
+    
+    row = []
+    for f_type, label in filter_buttons:
+        row.append(InlineKeyboardButton(label, callback_data=f"filt_{f_type}"))
+    kb.append(row)
+
+    # Pagination
+    nav_row = []
+    if page > 1:
+        nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"search_page_{page-1}"))
+    if page < total_pages:
+        nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"search_page_{page+1}"))
+    if nav_row:
+        kb.append(nav_row)
+
+    kb.append([InlineKeyboardButton("🔄 New Search", callback_data="search"), InlineKeyboardButton("⬅️ Back", callback_data="more")])
+
+    if query:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+
+# --- END UPDATED SEARCH LOGIC ---
+
 async def menu_callback(update, context):
     query = update.callback_query
     await query.answer()
@@ -322,9 +446,21 @@ async def menu_callback(update, context):
         return
 
     data = query.data
-    if data.startswith("vd_"):
-        await handle_video_callback(update, context, data)
+    # Handle filter buttons
+    if data.startswith("filt_"):
+        filter_type = data.split("_")[1]
+        context.user_data['search_filter'] = filter_type
+        context.user_data['search_page'] = 1
+        await display_search_page(update, context, 1, filter_type)
         return
+
+    # Handle search pagination
+    if data.startswith("search_page_"):
+        page = int(data.split("_")[2])
+        filter_type = context.user_data.get('search_filter', 'all')
+        await display_search_page(update, context, page, filter_type)
+        return
+
     if data == "main_menu":
         keyboard = [[InlineKeyboardButton("📥 Inbox", callback_data="inbox"), InlineKeyboardButton("👤 Profile", callback_data="profile")], [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")], [InlineKeyboardButton("➕ More Commands", callback_data="more")]]
         await query.message.reply_text("🤖 TELEGRAM ASSISTANT", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -352,11 +488,7 @@ async def menu_callback(update, context):
     elif data == "text_to_pdf":
         context.user_data["state"] = "awaiting_text_pdf"
         context.user_data["text_pdf_parts"] = []
-        await query.message.reply_text(
-            "📝 <b>TEXT TO PDF</b>\n\nSend your first text. You can send multiple messages. After each message, use <b>Enter Next</b> or <b>Done</b>.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done", callback_data="text_pdf_done")]])
-        )
+        await query.message.reply_text("📝 <b>TEXT TO PDF</b>\n\nSend your first text. You can send multiple messages. After each message, use <b>Enter Next</b> or <b>Done</b>.", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done", callback_data="text_pdf_done")]]))
     elif data == "text_pdf_done":
         await process_text_pdf(update, context)
     elif data == "text_pdf_next":
@@ -414,7 +546,7 @@ async def menu_callback(update, context):
         await query.message.reply_text("🔗 Fetch Telegram\n\nSend me a link (e.g., t.me/channel/123 or t.me/channel/123-130):")
         context.user_data['state'] = 'fetch_link'
     elif data == "search":
-        await query.message.reply_text("🔎 SEARCH\n\nEnter any keyword to search across your chats:\nExample: Logic mid")
+        await query.message.reply_text("🔎 SEARCH\n\nEnter any keyword to search across ALL of Telegram (including chats you haven't joined):\nExample: Logic mid")
         context.user_data['state'] = 'search_query'
     elif data == "pdf_fetch":
         await query.message.reply_text("📄 PDF FETCH\n\nPlease upload the PDF file directly to this chat.")
@@ -767,30 +899,19 @@ async def handle_voice_to_text(update, context, language):
         context.user_data['state'] = None
 
 # --- 10-WAY YOUTUBE / VIDEO DOWNLOADER ---
-# YouTube changes its playback/anti-bot system frequently. Instead of relying on
-# dead Piped instances, this downloader uses a ranked set of current yt-dlp
-# extraction strategies. The first successful strategy is used and remembered
-# for the selected download job.
 VIDEO_MAX_UPLOAD = 50 * 1024 * 1024
 VIDEO_QUALITIES = [1080, 720, 480, 360, 240]
 TIKWM_API = "https://www.tikwm.com/api/"
-
-# Optional PO-token provider. Recommended for current YouTube GVS protection.
-# If you run bgutil-ytdlp-pot-provider as a sidecar/service, set:
-#   YTDL_POT_PROVIDER_URL=http://127.0.0.1:4416
 YTDL_POT_PROVIDER_URL = os.environ.get("YTDL_POT_PROVIDER_URL", "").strip()
-
 
 def video_platform(url: str) -> str:
     host = urllib.parse.urlparse(url).netloc.lower().split(":", 1)[0]
-    if host.startswith("www."):
-        host = host[4:]
+    if host.startswith("www."): host = host[4:]
     if "youtube.com" in host or host == "youtu.be": return "youtube"
     if "tiktok.com" in host: return "tiktok"
     if "instagram.com" in host: return "instagram"
     if "facebook.com" in host or host == "fb.watch": return "facebook"
     return "unknown"
-
 
 def normalize_public_url(url: str) -> str:
     url = (url or "").strip()
@@ -805,7 +926,6 @@ def normalize_public_url(url: str) -> str:
     except Exception:
         return url
 
-
 def youtube_video_id(url: str):
     parsed = urllib.parse.urlparse(url)
     host = parsed.netloc.lower().split(":", 1)[0]
@@ -819,9 +939,7 @@ def youtube_video_id(url: str):
         if len(parts) >= 2 and parts[0] in {"shorts", "embed", "live"}: return parts[1]
     return None
 
-
 def _prepare_youtube_cookiefile():
-    """Turn Render env cookie content into a secure temporary Netscape cookie file."""
     content = os.environ.get("COOKIES_CONTENT", "").strip()
     if not content:
         b64 = os.environ.get("YTDLP_COOKIES_B64", "").strip()
@@ -848,7 +966,6 @@ def _prepare_youtube_cookiefile():
 
 _YOUTUBE_COOKIE_FILE = None
 
-
 def _js_runtime_options():
     opts = {}
     node = shutil.which("node")
@@ -856,7 +973,6 @@ def _js_runtime_options():
     if node: opts["node"] = node
     if deno: opts["deno"] = deno
     return opts
-
 
 def _youtube_extractor_args(client=None, use_pot=False):
     args = {}
@@ -866,24 +982,12 @@ def _youtube_extractor_args(client=None, use_pot=False):
         args["youtubepot-bgutilhttp"] = {"base_url": [YTDL_POT_PROVIDER_URL]}
     return args
 
-
 def ytdlp_base_options(extractor_args=None):
     options = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "socket_timeout": 30,
-        "retries": 8,
-        "fragment_retries": 8,
-        "file_access_retries": 5,
-        "concurrent_fragment_downloads": 2,
-        "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
-        "force_ipv4": True,
-        "remote_components": {"ejs:github"},
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.8",
-        },
+        "quiet": True, "no_warnings": True, "noplaylist": True, "socket_timeout": 30,
+        "retries": 8, "fragment_retries": 8, "file_access_retries": 5, "concurrent_fragment_downloads": 2,
+        "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(), "force_ipv4": True, "remote_components": {"ejs:github"},
+        "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36", "Accept-Language": "en-US,en;q=0.8"},
     }
     cookies = _prepare_youtube_cookiefile()
     if cookies: options["cookiefile"] = cookies
@@ -892,34 +996,22 @@ def ytdlp_base_options(extractor_args=None):
     if extractor_args: options["extractor_args"] = extractor_args
     return options
 
-
-# Ten current strategies, ordered strongest/newest first. They are deliberately
-# independent attempts: a failure in one does not poison the next one.
 YOUTUBE_STRATEGIES = [
-    ("bgutil-mweb", {"client": "mweb", "pot": True}),
-    ("bgutil-web", {"client": "web", "pot": True}),
-    ("bgutil-web-safari", {"client": "web_safari", "pot": True}),
-    ("web-embedded", {"client": "web_embedded", "pot": False}),
-    ("android-vr", {"client": "android_vr", "pot": False}),
-    ("tv", {"client": "tv", "pot": False}),
-    ("tv-simply", {"client": "tv_simply", "pot": False}),
-    ("mweb-direct", {"client": "mweb", "pot": False}),
-    ("web-music", {"client": "web_music", "pot": False}),
-    ("yt-dlp-auto", {"client": None, "pot": False}),
+    ("bgutil-mweb", {"client": "mweb", "pot": True}), ("bgutil-web", {"client": "web", "pot": True}),
+    ("bgutil-web-safari", {"client": "web_safari", "pot": True}), ("web-embedded", {"client": "web_embedded", "pot": False}),
+    ("android-vr", {"client": "android_vr", "pot": False}), ("tv", {"client": "tv", "pot": False}),
+    ("tv-simply", {"client": "tv_simply", "pot": False}), ("mweb-direct", {"client": "mweb", "pot": False}),
+    ("web-music", {"client": "web_music", "pot": False}), ("yt-dlp-auto", {"client": None, "pot": False}),
 ]
-
 
 def _extract_with_strategy(url, strategy_name, config):
     args = _youtube_extractor_args(config.get("client"), config.get("pot"))
     opts = ytdlp_base_options(args)
-    # Do not allow an unsuccessful client to silently switch during the same
-    # attempt; the whole point is to test a clean independent strategy.
     if config.get("client"):
         opts["extractor_args"]["youtube"]["player_client"] = [config["client"]]
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
     return info
-
 
 def extract_youtube_info_10way(url: str):
     errors = []
@@ -936,13 +1028,11 @@ def extract_youtube_info_10way(url: str):
             errors.append(f"{number}. {name}: {msg}")
     raise RuntimeError("All 10 YouTube extraction strategies failed:\n" + "\n".join(errors))
 
-
 def extract_ytdlp_info(url: str):
     platform = video_platform(url)
     if platform == "youtube": return extract_youtube_info_10way(url)
     with yt_dlp.YoutubeDL(ytdlp_base_options()) as ydl:
         return ydl.extract_info(url, download=False)
-
 
 def build_ytdlp_format(height=None, audio=False, platform="unknown"):
     if audio: return "bestaudio/best"
@@ -951,12 +1041,10 @@ def build_ytdlp_format(height=None, audio=False, platform="unknown"):
     if height: return f"best[height<={height}]/best"
     return "bestvideo*+bestaudio/best"
 
-
 def ytdlp_download(url: str, output_dir: str, *, height=None, audio=False, title_hint="video", strategy_name=None):
     platform = video_platform(url)
     if platform == "youtube":
-        if not strategy_name:
-            raise RuntimeError("No YouTube strategy selected")
+        if not strategy_name: raise RuntimeError("No YouTube strategy selected")
         cfg = dict(next((cfg for name, cfg in YOUTUBE_STRATEGIES if name == strategy_name), YOUTUBE_STRATEGIES[-1][1]))
         args = _youtube_extractor_args(cfg.get("client"), cfg.get("pot"))
         if cfg.get("client"): args["youtube"]["player_client"] = [cfg["client"]]
@@ -983,7 +1071,6 @@ def ytdlp_download(url: str, output_dir: str, *, height=None, audio=False, title
         if not os.path.isfile(filepath): raise FileNotFoundError(f"Downloaded file was not created: {title_hint}")
         return {"path": filepath, "title": info.get("title") or title_hint, "info": info}
 
-
 def tikwm_get_data(url):
     payload = urllib.parse.urlencode({"url": url, "hd": 1}).encode()
     req = urllib.request.Request(TIKWM_API, data=payload, headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/x-www-form-urlencoded"})
@@ -992,7 +1079,6 @@ def tikwm_get_data(url):
     if data.get("code") != 0 or not data.get("data"): raise RuntimeError(data.get("msg") or "TikWM returned no data")
     return data["data"]
 
-
 def download_url_to_file(url, path):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "*/*"})
     with urllib.request.urlopen(req, timeout=60) as response, open(path, "wb") as out:
@@ -1000,7 +1086,6 @@ def download_url_to_file(url, path):
             chunk = response.read(1024 * 512)
             if not chunk: break
             out.write(chunk)
-
 
 def tikwm_download(url, output_dir, quality="hd", audio=False):
     data = tikwm_get_data(url)
@@ -1014,7 +1099,6 @@ def tikwm_download(url, output_dir, quality="hd", audio=False):
     if not media_url: raise RuntimeError("TikTok returned no video URL")
     out = os.path.join(output_dir, "tiktok.mp4"); download_url_to_file(media_url, out)
     return {"path": out, "title": data.get("title") or data.get("desc") or "TikTok video"}
-
 
 def extract_download_options(url: str):
     platform = video_platform(url)
@@ -1037,7 +1121,6 @@ def extract_download_options(url: str):
             return {"source": "tikwm", "platform": platform, "url": normalized, "title": data.get("title") or data.get("desc") or "TikTok video", "qualities": qualities, "audio": bool(data.get("music")), "tikwm": data}
         raise RuntimeError(f"Extraction failed: {first_error}")
 
-
 def format_bytes(value):
     value = float(value or 0)
     units = ["B", "KB", "MB", "GB"]
@@ -1047,33 +1130,26 @@ def format_bytes(value):
         idx += 1
     return f"{value:.1f} {units[idx]}"
 
-
 def video_quality_keyboard(job):
     buttons = []
     platform = job["platform"]
     if platform == "tiktok" and job["source"] == "tikwm":
-        if "hd" in job["qualities"]:
-            buttons.append(InlineKeyboardButton("🎥 HD", callback_data="vd_q_hd"))
-        if "sd" in job["qualities"]:
-            buttons.append(InlineKeyboardButton("🎥 SD", callback_data="vd_q_sd"))
+        if "hd" in job["qualities"]: buttons.append(InlineKeyboardButton("🎥 HD", callback_data="vd_q_hd"))
+        if "sd" in job["qualities"]: buttons.append(InlineKeyboardButton("🎥 SD", callback_data="vd_q_sd"))
     else:
         for q in job.get("qualities", []):
             buttons.append(InlineKeyboardButton(f"🎥 {q}p", callback_data=f"vd_q_{q}"))
     rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)] if buttons else []
-    if job.get("audio"):
-        rows.append([InlineKeyboardButton("🎵 Audio / MP3", callback_data="vd_q_audio")])
+    if job.get("audio"): rows.append([InlineKeyboardButton("🎵 Audio / MP3", callback_data="vd_q_audio")])
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data="vd_cancel")])
     return InlineKeyboardMarkup(rows)
 
-
 async def handle_video_download(update, context):
-    if context.user_data.get("state") != "awaiting_video_link":
-        return
+    if context.user_data.get("state") != "awaiting_video_link": return
     raw_url = (update.message.text or "").strip()
     if not re.match(r"^https?://", raw_url, re.I):
         await update.message.reply_text("❌ Please send a valid YouTube, TikTok, Instagram, or Facebook URL.")
         return
-
     status_msg = await update.message.reply_text("🔎 Checking the video and available qualities…")
     try:
         job = await asyncio.to_thread(extract_download_options, raw_url)
@@ -1084,11 +1160,8 @@ async def handle_video_download(update, context):
         platform = job["platform"].title()
         safe_title = html.escape(title[:120])
         await status_msg.edit_text(
-            f"🎬 <b>{html.escape(platform)} Downloader</b>\n\n"
-            f"<b>{safe_title}</b>\n\n"
-            "Choose the quality you want:",
-            reply_markup=video_quality_keyboard(job),
-            parse_mode=ParseMode.HTML,
+            f"🎬 <b>{html.escape(platform)} Downloader</b>\n\n<b>{safe_title}</b>\n\nChoose the quality you want:",
+            reply_markup=video_quality_keyboard(job), parse_mode=ParseMode.HTML,
         )
     except Exception as e:
         context.user_data["state"] = None
@@ -1097,7 +1170,6 @@ async def handle_video_download(update, context):
             msg = msg[:3500] + "\n\nTip: if all 10 fail with PO-token or bot-check errors, configure YTDL_POT_PROVIDER_URL to a bgutil provider and keep COOKIES_CONTENT fresh."
         await status_msg.edit_text(f"❌ Could not prepare download.\n\n{msg[:900]}")
 
-
 async def handle_video_callback(update, context, data):
     query = update.callback_query
     await query.answer()
@@ -1105,12 +1177,10 @@ async def handle_video_callback(update, context, data):
         context.user_data.pop("video_job", None)
         await query.edit_message_text("❌ Video download cancelled.")
         return
-
     job = context.user_data.get("video_job")
     if not job:
         await query.edit_message_text("❌ Download session expired. Please send the video link again.")
         return
-
     selected = data.removeprefix("vd_q_")
     output_dir = tempfile.mkdtemp(prefix="tg_video_")
     status_msg = await query.message.reply_text("⏳ Preparing your download…")
@@ -1118,30 +1188,20 @@ async def handle_video_callback(update, context, data):
     try:
         await query.edit_message_reply_markup(reply_markup=None)
         if selected == "audio":
-            quality = None
-            audio = True
+            quality = None; audio = True
         elif job["source"] == "tikwm":
-            quality = selected if selected in {"hd", "sd"} else "sd"
-            audio = False
+            quality = selected if selected in {"hd", "sd"} else "sd"; audio = False
         else:
-            quality = int(selected)
-            audio = False
-
+            quality = int(selected); audio = False
         def do_download():
-            if job["source"] == "ytdlp":
-                return ytdlp_download(job["url"], output_dir, height=quality, audio=audio, title_hint=job.get("title", "video"), strategy_name=job.get("strategy"))
-            if job["source"] == "tikwm":
-                return tikwm_download(job["url"], output_dir, quality=quality, audio=audio)
+            if job["source"] == "ytdlp": return ytdlp_download(job["url"], output_dir, height=quality, audio=audio, title_hint=job.get("title", "video"), strategy_name=job.get("strategy"))
+            if job["source"] == "tikwm": return tikwm_download(job["url"], output_dir, quality=quality, audio=audio)
             raise RuntimeError("Unknown download source")
-
         result = await asyncio.to_thread(do_download)
         filepath = result["path"]
-        if not os.path.isfile(filepath):
-            raise FileNotFoundError("Downloaded file was not created")
-
+        if not os.path.isfile(filepath): raise FileNotFoundError("Downloaded file was not created")
         file_size = os.path.getsize(filepath)
         if file_size > VIDEO_MAX_UPLOAD:
-            # Automatic quality fallback for videos: retry one step lower.
             if not audio and job.get("platform") == "youtube":
                 lower = [q for q in VIDEO_QUALITIES if q < (quality or 999)]
                 if lower:
@@ -1150,71 +1210,48 @@ async def handle_video_callback(update, context, data):
                         try:
                             for name in os.listdir(output_dir):
                                 path = os.path.join(output_dir, name)
-                                if os.path.isfile(path):
-                                    os.unlink(path)
+                                if os.path.isfile(path): os.unlink(path)
                             result = await asyncio.to_thread(do_download_for_quality, job, output_dir, q)
                             filepath = result["path"]
                             if os.path.getsize(filepath) <= VIDEO_MAX_UPLOAD:
-                                quality = q
-                                file_size = os.path.getsize(filepath)
-                                break
-                        except Exception:
-                            continue
-                
+                                quality = q; file_size = os.path.getsize(filepath); break
+                        except Exception: continue
             if file_size > VIDEO_MAX_UPLOAD:
-                raise RuntimeError(
-                    f"The selected file is {format_bytes(file_size)}, above Telegram's current 50 MB bot upload limit."
-                )
-
+                raise RuntimeError(f"The selected file is {format_bytes(file_size)}, above Telegram's current 50 MB bot upload limit.")
         caption = f"✅ {job.get('title', 'Video')[:900]}"
         with open(filepath, "rb") as media:
-            if audio:
-                await query.message.reply_audio(audio=media, filename=os.path.basename(filepath), caption=caption, reply_markup=tool_done_kb())
-            else:
-                await query.message.reply_video(video=media, caption=caption, supports_streaming=True, reply_markup=tool_done_kb())
+            if audio: await query.message.reply_audio(audio=media, filename=os.path.basename(filepath), caption=caption, reply_markup=tool_done_kb())
+            else: await query.message.reply_video(video=media, caption=caption, supports_streaming=True, reply_markup=tool_done_kb())
         await status_msg.edit_text("✅ Download completed successfully!")
     except Exception as e:
         await status_msg.edit_text(f"❌ Download failed.\n\n{str(e)[:1000]}")
     finally:
         context.user_data.pop("video_job", None)
         try:
-            import shutil
-            shutil.rmtree(output_dir, ignore_errors=True)
-        except Exception:
-            pass
-
+            import shutil; shutil.rmtree(output_dir, ignore_errors=True)
+        except Exception: pass
 
 def do_download_for_quality(job, output_dir, quality):
-    if job["source"] == "ytdlp":
-        return ytdlp_download(job["url"], output_dir, height=quality, audio=False, title_hint=job.get("title", "video"))
-    if job["source"] == "tikwm":
-        return tikwm_download(job["url"], output_dir, quality="hd" if quality >= 720 else "sd", audio=False)
+    if job["source"] == "ytdlp": return ytdlp_download(job["url"], output_dir, height=quality, audio=False, title_hint=job.get("title", "video"))
+    if job["source"] == "tikwm": return tikwm_download(job["url"], output_dir, quality="hd" if quality >= 720 else "sd", audio=False)
     raise RuntimeError("Unknown download source")
 
 # --- TEXT TO PDF ---
-
 def _register_pdf_font():
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/opentype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-    ]
+    candidates = ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/opentype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/freefont/FreeSans.ttf"]
     for path in candidates:
         if os.path.isfile(path):
             try:
                 if "PDFUnicodeFont" not in pdfmetrics.getRegisteredFontNames():
                     pdfmetrics.registerFont(TTFont("PDFUnicodeFont", path))
                 return "PDFUnicodeFont"
-            except Exception:
-                pass
+            except Exception: pass
     return "Helvetica"
-
 
 def build_text_pdf(parts):
     font = _register_pdf_font()
     out = BytesIO()
-    doc = SimpleDocTemplate(out, pagesize=letter, rightMargin=45, leftMargin=45, topMargin=45, bottomMargin=45,
-                            title="Text PDF", author="Telegram Assistant")
+    doc = SimpleDocTemplate(out, pagesize=letter, rightMargin=45, leftMargin=45, topMargin=45, bottomMargin=45, title="Text PDF", author="Telegram Assistant")
     styles = getSampleStyleSheet()
     body = ParagraphStyle("PDFBody", parent=styles["BodyText"], fontName=font, fontSize=11, leading=16, spaceAfter=12)
     title_style = ParagraphStyle("PDFTitle", parent=styles["Title"], fontName=font, fontSize=18, leading=23, spaceAfter=20)
@@ -1227,7 +1264,6 @@ def build_text_pdf(parts):
     out.seek(0)
     return out
 
-
 async def handle_text_pdf_message(update, context):
     if context.user_data.get("state") != "awaiting_text_pdf": return
     text = (update.message.text or "").strip()
@@ -1238,16 +1274,11 @@ async def handle_text_pdf_message(update, context):
     parts = context.user_data.setdefault("text_pdf_parts", [])
     parts.append(text)
     n = len(parts)
-    await update.message.reply_text(
-        f"✅ Text part {n} added.\n\nSend another text, or press Done when finished.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Enter Next", callback_data="text_pdf_next"), InlineKeyboardButton("✅ Done", callback_data="text_pdf_done")]])
-    )
-
+    await update.message.reply_text(f"✅ Text part {n} added.\n\nSend another text, or press Done when finished.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Enter Next", callback_data="text_pdf_next"), InlineKeyboardButton("✅ Done", callback_data="text_pdf_done")]]))
 
 async def process_text_pdf(update, context):
     query = update.callback_query
-    if query:
-        await query.answer()
+    if query: await query.answer()
     parts = context.user_data.get("text_pdf_parts", [])
     if not parts:
         msg = "❌ No text received yet."
@@ -1266,7 +1297,6 @@ async def process_text_pdf(update, context):
     finally:
         context.user_data.pop("text_pdf_parts", None)
         context.user_data["state"] = None
-
 
 # --- PDF, WORD, IMAGE COLLECT ---
 async def handle_pdf_upload(update, context):
@@ -1446,63 +1476,6 @@ async def handle_posts_pagination(update, context, page):
     if end < total_posts: kb.append([InlineKeyboardButton("Next ➡️", callback_data=f"posts_{page+1}")])
     kb.append([InlineKeyboardButton("⬅️ Back to Profile", callback_data="profile")])
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
-
-async def fetch_search(update, context, query):
-    status_msg = await update.message.reply_text(f"🔎 Searching accessible chats and public Telegram chats for: {query}")
-    try:
-        dialogs = await telethon_client.get_dialogs(limit=200)
-        peers = []
-        seen = set()
-        for dialog in dialogs:
-            entity = getattr(dialog, "entity", None)
-            if not entity: continue
-            key = (getattr(entity, "id", None), getattr(entity, "access_hash", None))
-            if key[0] not in seen:
-                seen.add(key[0]); peers.append(entity)
-        all_results = []
-        sem = asyncio.Semaphore(8)
-        async def worker(entity):
-            async with sem:
-                try:
-                    messages = await telethon_client.get_messages(entity, search=query, limit=3)
-                    return [{"entity": entity, "message": m, "link": f"https://t.me/{getattr(entity, 'username', entity.id)}/{m.id}", "content": (m.message or "[Media]")[:80]} for m in messages]
-                except Exception:
-                    return []
-        batches = await asyncio.gather(*(worker(e) for e in peers))
-        for batch in batches:
-            all_results.extend(batch)
-        if not all_results:
-            await status_msg.edit_text(f"❌ No results found for '{query}'.")
-            return
-        context.user_data["search_results"] = all_results
-        context.user_data["search_page"] = 1
-        await status_msg.delete()
-        await display_search_page(update, context, 1)
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Search failed: {e}")
-
-async def display_search_page(update, context, page):
-    query = update.callback_query
-    if query: await query.answer()
-    results = context.user_data.get("search_results", [])
-    query_text = " "
-    per_page = 10
-    total_pages = max(1, (len(results) + per_page - 1) // per_page)
-    page = max(1, min(page, total_pages))
-    start = (page - 1) * per_page
-    page_items = results[start:start + per_page]
-    text = f"<blockquote><b>Telegram Search</b>\n{query_text}\n\n"
-    for item in page_items:
-        text += f"🔗 <a href='{item['link']}'>{item['content']}</a>\n\n"
-    text += f"Page {page}/{total_pages}\nSort by relevance and activity</blockquote>"
-    kb = []
-    nav_row = []
-    if page > 1: nav_row.append(InlineKeyboardButton("⬅️ Previous", callback_data="search_prev"))
-    if page < total_pages: nav_row.append(InlineKeyboardButton("Next ➡️", callback_data="search_next"))
-    if nav_row: kb.append(nav_row)
-    kb.append([InlineKeyboardButton("🔄 New Search", callback_data="search"), InlineKeyboardButton("⬅️ Back", callback_data="more")])
-    if query: await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-    else: await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
 
 async def fetch_words(update, context, target):
     try:
