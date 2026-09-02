@@ -4,7 +4,9 @@ flask>=3
 pymupdf>=1.26
 pdf2docx>=0.5
 img2pdf>=0.6
-yt-dlp[default,curl-cffi]
+yt-dlp[default,curl-cffi]>=2026.08.0
+yt-dlp-getpot-wpc>=1.0
+bgutil-ytdlp-pot-provider>=1.3.2
 Pillow>=11
 SpeechRecognition>=3.14
 imageio-ffmpeg>=0.6
