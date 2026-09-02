@@ -11,6 +11,8 @@ import urllib.request
 import urllib.parse
 import shutil
 import html
+import base64
+import json
 from io import BytesIO
 from flask import Flask
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageChops
@@ -27,11 +29,13 @@ from pptx import Presentation
 from pptx.util import Inches
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 import yt_dlp
 import speech_recognition as sr
 import imageio_ffmpeg
 from groq import Groq
-import edge_tts
+from gtts import gTTS
 
 try:
     from telethon.tl.functions.stories import GetPeerStoriesRequest, GetStoriesByIDRequest
@@ -53,6 +57,9 @@ STRING_SESSION = os.environ.get('STRING_SESSION', '')
 BOT_PASSWORD = os.environ.get("BOT_PASSWORD", "ptss25")
 RENDER_URL = os.environ.get('RENDER_URL', 'https://samibot-s1h6.onrender.com')
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
+YOUTUBE_COOKIES_FILE = os.environ.get('YOUTUBE_COOKIES_FILE', '').strip()
+YOUTUBE_COOKIES_B64 = os.environ.get('YOUTUBE_COOKIES_B64', '').strip()
+YOUTUBE_COOKIES_RAW = os.environ.get('YOUTUBE_COOKIES', '').strip()
 
 ADMIN_IDS = []
 admin_ids_str = os.environ.get('ADMIN_IDS', '')
@@ -309,7 +316,7 @@ async def restart_command(update, context):
         pass
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
-async def menu_callback(update, context):
+async def _menu_callback_impl(update, context):
     query = update.callback_query
     data = query.data or ""
     # These handlers answer their own callback queries because they may perform
@@ -341,7 +348,7 @@ async def menu_callback(update, context):
         kb.append([InlineKeyboardButton("⬅️ Back", callback_data="main_menu")])
         await query.message.reply_text("➕ MORE COMMANDS", reply_markup=InlineKeyboardMarkup(kb))
     elif data == "converter":
-        kb = [[InlineKeyboardButton("📄 PDF to Word", callback_data="pdf_to_word"), InlineKeyboardButton("🖼️ Image to Text", callback_data="image_to_text")], [InlineKeyboardButton("🖼️ Image to PDF", callback_data="image_to_pdf"), InlineKeyboardButton("🖼️ Edit Photo", callback_data="image_edit")], [InlineKeyboardButton("🗣️ Text to Voice (ENG)", callback_data="tts_en"), InlineKeyboardButton("🗣️ Text to Voice (AM)", callback_data="tts_am")], [InlineKeyboardButton("📷 Image Format", callback_data="img_fmt_menu"), InlineKeyboardButton("📚 Document Format", callback_data="doc_fmt_menu")], [InlineKeyboardButton("🎙️ Voice to Text (ENG)", callback_data="voice_en"), InlineKeyboardButton("🎙️ Voice to Text (AM)", callback_data="voice_am")], [InlineKeyboardButton("⬅️ Back", callback_data="more")]]
+        kb = [[InlineKeyboardButton("📄 PDF to Word", callback_data="pdf_to_word"), InlineKeyboardButton("🖼️ Image to Text", callback_data="image_to_text")], [InlineKeyboardButton("📄 Text to PDF", callback_data="text_to_pdf")], [InlineKeyboardButton("🖼️ Image to PDF", callback_data="image_to_pdf"), InlineKeyboardButton("🖼️ Edit Photo", callback_data="image_edit")], [InlineKeyboardButton("🗣️ Text to Voice (ENG)", callback_data="tts_en"), InlineKeyboardButton("🗣️ Text to Voice (AM)", callback_data="tts_am")], [InlineKeyboardButton("📷 Image Format", callback_data="img_fmt_menu"), InlineKeyboardButton("📚 Document Format", callback_data="doc_fmt_menu")], [InlineKeyboardButton("🎙️ Voice to Text (ENG)", callback_data="voice_en"), InlineKeyboardButton("🎙️ Voice to Text (AM)", callback_data="voice_am")], [InlineKeyboardButton("⬅️ Back", callback_data="more")]]
         await query.message.reply_text("🔄 MEDIA CONVERTER & AI TOOLS\n\nChoose an option:", reply_markup=InlineKeyboardMarkup(kb))
     elif data == "img_fmt_menu":
         kb = [[InlineKeyboardButton("PNG to JPG", callback_data="img_png_jpg"), InlineKeyboardButton("JPG to PNG", callback_data="img_jpg_png")], [InlineKeyboardButton("Image to GIF", callback_data="img_gif"), InlineKeyboardButton("⬅️ Back", callback_data="converter")]]
@@ -354,6 +361,20 @@ async def menu_callback(update, context):
         context.user_data['state'] = 'awaiting_edit_photo'
     elif data.startswith("edit_"):
         await handle_photo_edit_selection(update, context, data)
+    elif data == "text_to_pdf":
+        context.user_data[PDF_DRAFT_KEY] = []
+        context.user_data['state'] = 'awaiting_text_pdf'
+        await query.message.reply_text(
+            "📄 TEXT TO PDF\n\nSend a text message. After every message I will ask you to enter another or finish.",
+            reply_markup=text_pdf_keyboard(),
+        )
+    elif data == "pdftext_next":
+        context.user_data['state'] = 'awaiting_text_pdf'
+        await query.message.reply_text("➕ Send the next text message.")
+    elif data == "pdftext_done":
+        await finish_text_to_pdf(update, context)
+    elif data == "pdftext_cancel":
+        await cancel_text_to_pdf(update, context)
     elif data == "pdf_to_word":
         await query.message.reply_text("📄 PDF to Word\n\nPlease upload the PDF file.")
         context.user_data['state'] = 'awaiting_pdf_to_word'
@@ -442,6 +463,20 @@ async def menu_callback(update, context):
         elif data == "story_prev":
             context.user_data["story_index"] = context.user_data.get("story_index", 0) - 1
             await display_story(update, context)
+
+async def menu_callback(update, context):
+    try:
+        await _menu_callback_impl(update, context)
+    except Exception as exc:
+        print(f"Menu callback error: {exc}")
+        try:
+            q = update.callback_query
+            if q:
+                await q.answer()
+                await q.message.reply_text("⚠️ This button could not complete, but the bot is still running. Please try again.")
+        except Exception:
+            pass
+
 
 # --- PHOTO EDITING ---
 _REMBG_SESSION = None
@@ -689,31 +724,157 @@ async def handle_tts(update, context, lang):
 
 async def handle_tts_voice_selection(update, context, data):
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        pass
     parts = data.split("_")
-    lang = parts[2]
-    voice_type = parts[3]
-    text = context.user_data.get('tts_text')
+    lang = parts[2] if len(parts) > 2 else "en"
+    voice_type = parts[3] if len(parts) > 3 else "female"
+    text = (context.user_data.get('tts_text') or '').strip()
     if not text:
         await query.message.reply_text("❌ No text found. Please send the text again.")
         return
-    if lang == 'en':
-        voice_map = {'male': 'en-US-GuyNeural', 'female': 'en-US-JennyNeural', 'old': 'en-US-SteffanNeural', 'child': 'en-US-AnaNeural'}
-    else:
-        voice_map = {'male': 'am-ET-AmehaNeural', 'female': 'am-ET-MekdesNeural', 'old': 'am-ET-MekdesNeural', 'child': 'am-ET-MekdesNeural'}
-    selected_voice = voice_map.get(voice_type, 'en-US-GuyNeural')
-    status_msg = await query.message.reply_text("🗣️ Generating voice...")
+
+    # edge-tts currently returns intermittent 403 websocket errors on some
+    # datacenter IPs. Use Google's free gTTS HTTP endpoint instead.
+    lang_code = 'am' if lang == 'am' else 'en'
+    status_msg = await query.message.reply_text("🗣️ Generating voice…")
+    tmp_path = None
     try:
-        communicate = edge_tts.Communicate(text, selected_voice)
-        audio_path = "output.mp3"
-        await communicate.save(audio_path)
-        with open(audio_path, "rb") as audio:
-            await query.message.reply_audio(audio=audio, title=f"Voice ({voice_type})", reply_markup=tool_done_kb())
-        os.unlink(audio_path)
-        await status_msg.edit_text("✅ Voice generated!")
-        context.user_data.pop('tts_text', None); context.user_data.pop('tts_lang', None)
+        fd, tmp_path = tempfile.mkstemp(prefix='tts_', suffix='.mp3')
+        os.close(fd)
+
+        def generate():
+            tts = gTTS(text=text, lang=lang_code, slow=False)
+            tts.save(tmp_path)
+
+        await asyncio.to_thread(generate)
+        with open(tmp_path, 'rb') as audio:
+            await query.message.reply_audio(
+                audio=audio,
+                filename=f"voice_{lang_code}.mp3",
+                title=f"Voice ({voice_type})",
+                caption=f"✅ Text converted to speech ({'Amharic' if lang_code == 'am' else 'English'}).",
+                reply_markup=tool_done_kb(),
+            )
+        await status_msg.edit_text("✅ Voice generated successfully!")
+        context.user_data.pop('tts_text', None)
+        context.user_data.pop('tts_lang', None)
     except Exception as e:
-        await status_msg.edit_text(f"❌ TTS failed: {e}")
+        await status_msg.edit_text(
+            "❌ TTS failed. Google TTS could not be reached.\n\n" + html.escape(str(e)[:1200]),
+            parse_mode=ParseMode.HTML,
+        )
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+# --- TEXT TO PDF ---
+PDF_DRAFT_KEY = 'text_pdf_items'
+
+def text_pdf_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Enter Next Text", callback_data="pdftext_next"),
+         InlineKeyboardButton("✅ Done", callback_data="pdftext_done")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="pdftext_cancel")],
+    ])
+
+
+async def start_text_to_pdf(update, context):
+    context.user_data[PDF_DRAFT_KEY] = []
+    context.user_data['state'] = 'awaiting_text_pdf'
+    await update.message.reply_text(
+        "📄 TEXT TO PDF\n\n"
+        "Send your first text. After each text I will ask whether to enter another one or finish.\n\n"
+        "You can send the texts as separate messages; they will all be collected for the same PDF.",
+    )
+
+
+async def handle_text_pdf_input(update, context):
+    if context.user_data.get('state') != 'awaiting_text_pdf':
+        return
+    text = (update.message.text or '').strip()
+    if not text:
+        await update.message.reply_text("❌ Please send some text.")
+        return
+    items = context.user_data.setdefault(PDF_DRAFT_KEY, [])
+    # Preserve each Telegram message as its own paragraph. This naturally
+    # supports two or more messages arriving quickly from the same chat.
+    items.append(text)
+    count = len(items)
+    await update.message.reply_text(
+        f"✅ Text {count} added.\n\n"
+        "Choose **Enter Next Text** to add another message, or **Done** to create the PDF.",
+        reply_markup=text_pdf_keyboard(),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def finish_text_to_pdf(update, context):
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    items = context.user_data.get(PDF_DRAFT_KEY, [])
+    if not items:
+        await query.edit_message_text("❌ No text has been added yet.")
+        return
+    status = await query.message.reply_text("⏳ Creating PDF…")
+    path = None
+    try:
+        fd, path = tempfile.mkstemp(prefix='text_pdf_', suffix='.pdf')
+        os.close(fd)
+        styles = getSampleStyleSheet()
+        body = ParagraphStyle(
+            'BodyClean', parent=styles['BodyText'], fontName='Helvetica',
+            fontSize=11, leading=16, spaceAfter=12
+        )
+        doc = SimpleDocTemplate(
+            path, pagesize=letter, rightMargin=54, leftMargin=54,
+            topMargin=54, bottomMargin=54, title='Text to PDF'
+        )
+        story = []
+        for idx, item in enumerate(items, 1):
+            escaped = html.escape(item).replace('\n', '<br/>')
+            story.append(Paragraph(escaped, body))
+            if idx < len(items):
+                story.append(Spacer(1, 4))
+        doc.build(story)
+        with open(path, 'rb') as f:
+            await query.message.reply_document(
+                document=f, filename='text_document.pdf',
+                caption=f"✅ PDF created from {len(items)} text message(s).",
+                reply_markup=tool_done_kb(),
+            )
+        await status.edit_text("✅ Text to PDF complete!")
+        context.user_data.pop(PDF_DRAFT_KEY, None)
+        context.user_data['state'] = None
+    except Exception as e:
+        await status.edit_text("❌ Text to PDF failed.\n\n" + html.escape(str(e)[:1200]), parse_mode=ParseMode.HTML)
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+async def cancel_text_to_pdf(update, context):
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    context.user_data.pop(PDF_DRAFT_KEY, None)
+    context.user_data['state'] = None
+    await query.edit_message_text("❌ Text to PDF cancelled.")
+
 
 # --- IMAGE FORMAT CONVERSION ---
 async def handle_image_convert(update, context, fmt):
@@ -856,25 +1017,15 @@ async def handle_voice_to_text(update, context, language):
         await status_msg.edit_text(f"❌ Transcription failed: {e}")
         context.user_data['state'] = None
 
-# --- VIDEO DOWNLOADER (YOUTUBE VIA MANAGED DOWNLOAD API) ---
-# Build: render-python314-2026-09-02-v8
-#
-# YouTube is handled by a managed download service instead of asking the
-# Render datacenter IP to directly defeat YouTube's bot checks.  The API
-# creates a download job, we poll it, then stream the final file to Telegram.
-# TikTok / Instagram / Facebook continue to use the local yt-dlp/TikWM paths.
-
+# --- VIDEO DOWNLOADER ---
+# Build: free-youtube-cookie-2026-09-02-v10
+# YouTube: direct yt-dlp only. No paid API, no Piped, no Cobalt.
+# For server-side YouTube bot checks, use a legitimate exported YouTube cookie
+# file via YOUTUBE_COOKIES_FILE or YOUTUBE_COOKIES_B64.
 VIDEO_MAX_UPLOAD = 50 * 1024 * 1024
 VIDEO_QUALITIES = [1080, 720, 480, 360, 240]
 TIKWM_API = "https://www.tikwm.com/api/"
-BUILD_ID = "render-python314-2026-09-02-v8"
-
-# Managed YouTube Download API (Video Download API / SaveNow API)
-YOUTUBE_API_BASE = os.environ.get("YOUTUBE_API_BASE", "https://p.savenow.to").strip().rstrip("/")
-YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "").strip()
-YOUTUBE_API_TIMEOUT = 45
-YOUTUBE_POLL_SECONDS = 3
-YOUTUBE_MAX_POLL_SECONDS = 15 * 60
+BUILD_ID = "free-youtube-cookie-2026-09-02-v10"
 
 
 def video_platform(url: str) -> str:
@@ -892,8 +1043,33 @@ def video_platform(url: str) -> str:
 
 
 def normalize_public_url(url: str) -> str:
-    url = (url or "").strip()
-    return url
+    return (url or "").strip()
+
+
+def _youtube_cookie_file():
+    # File path has highest priority. Raw/base64 environment values are useful
+    # on Render where committing cookies to GitHub would be unsafe.
+    if YOUTUBE_COOKIES_FILE and os.path.isfile(YOUTUBE_COOKIES_FILE):
+        return YOUTUBE_COOKIES_FILE
+    if YOUTUBE_COOKIES_B64 or YOUTUBE_COOKIES_RAW:
+        cache_dir = os.path.join(tempfile.gettempdir(), 'youtube_auth')
+        os.makedirs(cache_dir, exist_ok=True)
+        path = os.path.join(cache_dir, 'cookies.txt')
+        try:
+            if YOUTUBE_COOKIES_B64:
+                raw = base64.b64decode(YOUTUBE_COOKIES_B64).decode('utf-8')
+            else:
+                raw = YOUTUBE_COOKIES_RAW
+            # Basic validation: cookie files should be Netscape/Mozilla format.
+            if '# Netscape HTTP Cookie File' not in raw and '# HTTP Cookie File' not in raw:
+                raise ValueError('Cookie data is not in Netscape cookies.txt format')
+            with open(path, 'w', encoding='utf-8', newline='\n') as f:
+                f.write(raw)
+            os.chmod(path, 0o600)
+            return path
+        except Exception as exc:
+            print(f"YouTube cookies could not be prepared: {exc}")
+    return None
 
 
 def ytdlp_base_options(*, youtube_client=None):
@@ -913,13 +1089,18 @@ def ytdlp_base_options(*, youtube_client=None):
         },
         "remote_components": {"ejs:github"},
     }
+    cookie_file = _youtube_cookie_file()
+    if cookie_file:
+        options['cookiefile'] = cookie_file
+    if youtube_client:
+        options['extractor_args'] = {'youtube': {'player_client': [youtube_client]}}
     return options
 
 
 def _find_media_file(output_dir: str, preferred=None):
     if preferred and os.path.isfile(preferred):
         return preferred
-    allowed = {".mp4", ".mkv", ".webm", ".mov", ".m4a", ".mp3", ".aac", ".opus"}
+    allowed = {'.mp4', '.mkv', '.webm', '.mov', '.m4a', '.mp3', '.aac', '.opus'}
     files = []
     for name in os.listdir(output_dir):
         path = os.path.join(output_dir, name)
@@ -932,167 +1113,75 @@ def _clean_dir(output_dir):
     for name in os.listdir(output_dir):
         path = os.path.join(output_dir, name)
         if os.path.isfile(path):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+            try: os.unlink(path)
+            except OSError: pass
 
 
-def ytdlp_download(url, output_dir, *, height=None, audio=False, title_hint="video", youtube_client=None):
-    """Used for TikTok/Instagram/Facebook. YouTube uses the managed API below."""
+def ytdlp_download(url, output_dir, *, height=None, audio=False, title_hint='video', youtube_client=None):
     platform = video_platform(url)
-    opts = ytdlp_base_options(youtube_client=None)
+    opts = ytdlp_base_options(youtube_client=youtube_client if platform == 'youtube' else None)
     if audio:
-        opts["format"] = "bestaudio/best"
-        opts["postprocessors"] = [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
+        opts['format'] = 'bestaudio/best'
+        opts['postprocessors'] = [{
+            'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'
         }]
     else:
-        opts["format"] = f"best[height<={height}]/best" if height else "best/best"
-    opts.update({
-        "outtmpl": os.path.join(output_dir, "%(.id)s.%(ext)s") if False else os.path.join(output_dir, "%(id)s.%(ext)s"),
-        "merge_output_format": "mp4",
-        "overwrites": True,
-    })
+        h = int(height) if height else 720
+        # Prefer H.264/AAC MP4 when available, then fall back to the best
+        # source under the requested height. This avoids WebM-only responses.
+        opts['format'] = (
+            f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/"
+            f"best[height<={h}][ext=mp4]/best[height<={h}]/best"
+        )
+        opts['merge_output_format'] = 'mp4'
+    opts['outtmpl'] = os.path.join(output_dir, '%(id)s.%(ext)s')
+    opts['overwrites'] = True
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         prepared = ydl.prepare_filename(info)
         base, _ = os.path.splitext(prepared)
-        expected = base + ".mp3" if audio else prepared
+        expected = base + '.mp3' if audio else base + '.mp4'
         path = _find_media_file(output_dir, expected)
         if not path:
-            raise FileNotFoundError(f"Downloaded file was not created: {title_hint}")
-        return {"path": path, "title": info.get("title") or title_hint, "info": info}
+            raise FileNotFoundError(f'Downloaded file was not created: {title_hint}')
+        return {'path': path, 'title': info.get('title') or title_hint, 'info': info, 'source': 'ytdlp'}
 
 
-def _json_or_text(response):
-    raw = response.read()
-    text = raw.decode("utf-8", "replace")
-    try:
-        import json
-        return json.loads(text)
-    except Exception:
-        # Some legacy services return query-string/plain text on failure.
-        return {"raw": text}
-
-
-def _api_success(data):
-    value = data.get("success")
-    return value is True or value == 1 or value == "1" or value == "true"
-
-
-def youtube_api_create_job(url: str, selected: str):
-    if not YOUTUBE_API_KEY:
-        raise RuntimeError(
-            "YOUTUBE_API_KEY is not configured. Create a Video Download API key and add it to Render environment variables."
-        )
-
-    params = {
-        "url": url,
-        "apikey": YOUTUBE_API_KEY,
-        "add_info": "1",
-    }
-    if selected == "audio":
-        params.update({"format": "mp3", "audio_quality": "192"})
-    else:
-        params.update({"format": str(selected), "allow_extended_duration": "0", "no_merge": "0"})
-
-    endpoint = f"{YOUTUBE_API_BASE}/ajax/download.php?{urllib.parse.urlencode(params)}"
-    req = urllib.request.Request(
-        endpoint,
-        headers={
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json,text/plain,*/*",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=YOUTUBE_API_TIMEOUT) as response:
-        data = _json_or_text(response)
-
-    if isinstance(data, dict) and _api_success(data):
-        job_id = data.get("id") or data.get("download_id") or data.get("job_id")
-        if not job_id:
-            raise RuntimeError(f"YouTube API accepted the request but returned no job id: {data}")
-        info = data.get("info") or {}
-        return str(job_id), info
-
-    message = ""
-    if isinstance(data, dict):
-        message = data.get("error") or data.get("message") or data.get("text") or data.get("raw") or str(data)
-    else:
-        message = str(data)
-    raise RuntimeError(f"YouTube API rejected the download request: {message[:1200]}")
-
-
-def youtube_api_poll(job_id: str):
-    endpoint = f"{YOUTUBE_API_BASE}/ajax/progress.php?id={urllib.parse.quote(str(job_id))}"
-    started = time.time()
-    last_error = None
-    while time.time() - started < YOUTUBE_MAX_POLL_SECONDS:
-        req = urllib.request.Request(
-            endpoint,
-            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,text/plain,*/*"},
-        )
+def youtube_extract_info(url):
+    # Try free clients in a controlled order. If the server asks for login,
+    # all clients will normally show the same error; then the cookie setup is
+    # the correct next step instead of cycling paid/public proxy services.
+    clients = ['android_vr', 'web_safari', 'web_embedded', 'default']
+    errors = []
+    for client in clients:
         try:
-            with urllib.request.urlopen(req, timeout=YOUTUBE_API_TIMEOUT) as response:
-                data = _json_or_text(response)
+            with yt_dlp.YoutubeDL(ytdlp_base_options(youtube_client=None if client == 'default' else client)) as ydl:
+                return ydl.extract_info(url, download=False), client
         except Exception as exc:
-            last_error = str(exc)
-            time.sleep(YOUTUBE_POLL_SECONDS)
-            continue
+            errors.append(f'{client}: {exc}')
+    raise RuntimeError('YouTube extraction failed. ' + ' | '.join(errors[-4:]))
 
-        if not isinstance(data, dict):
-            time.sleep(YOUTUBE_POLL_SECONDS)
-            continue
 
-        download_url = data.get("download_url") or data.get("url") or data.get("downloadUrl")
+def youtube_direct_download(url, output_dir, *, height=None, audio=False, title_hint='YouTube video'):
+    clients = ['android_vr', 'web_safari', 'web_embedded', 'default']
+    errors = []
+    for client in clients:
         try:
-            progress = int(float(data.get("progress", 0)))
-        except Exception:
-            progress = 0
-
-        if download_url and (progress >= 1000 or data.get("success") in (True, 1, "1", "true")):
-            return download_url, data
-
-        text_value = str(data.get("text", "")).lower()
-        if data.get("success") in (False, 0, "0", "false") and text_value:
-            raise RuntimeError(text_value[:1200])
-        if "failed" in text_value:
-            raise RuntimeError(text_value[:1200])
-
-        time.sleep(YOUTUBE_POLL_SECONDS)
-
-    raise RuntimeError(
-        f"YouTube download API timed out after {YOUTUBE_MAX_POLL_SECONDS // 60} minutes"
-        + (f" ({last_error})" if last_error else "")
+            result = ytdlp_download(
+                url, output_dir, height=height, audio=audio, title_hint=title_hint,
+                youtube_client=None if client == 'default' else client,
+            )
+            result['youtube_client'] = client
+            return result
+        except Exception as exc:
+            errors.append(f'{client}: {exc}')
+            _clean_dir(output_dir)
+    cookie = _youtube_cookie_file()
+    hint = (
+        ' Add YOUTUBE_COOKIES_B64 (Mozilla/Netscape cookies.txt from your own signed-in YouTube browser) to Render.'
+        if not cookie else ''
     )
-
-
-def download_url_to_file(url, path, headers=None):
-    hdrs = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
-    if headers:
-        hdrs.update(headers)
-    req = urllib.request.Request(url, headers=hdrs)
-    with urllib.request.urlopen(req, timeout=180) as response, open(path, "wb") as out:
-        while True:
-            chunk = response.read(1024 * 1024)
-            if not chunk:
-                break
-            out.write(chunk)
-
-
-def youtube_api_download(url: str, output_dir: str, selected: str, title_hint="YouTube video"):
-    job_id, info = youtube_api_create_job(url, selected)
-    download_url, progress_data = youtube_api_poll(job_id)
-    ext = ".mp3" if selected == "audio" else ".mp4"
-    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", str(job_id))
-    path = os.path.join(output_dir, f"youtube_{safe_id}{ext}")
-    download_url_to_file(download_url, path)
-    if not os.path.isfile(path) or os.path.getsize(path) == 0:
-        raise RuntimeError("YouTube API returned an empty file")
-    title = (info.get("title") if isinstance(info, dict) else None) or title_hint
-    return {"path": path, "title": title, "info": info, "source": "managed_api", "progress": progress_data}
+    raise RuntimeError('YouTube download failed. ' + ' | '.join(errors) + hint)
 
 
 def tikwm_get_data(url):
@@ -1144,15 +1233,16 @@ def extract_download_options(url: str):
         raise RuntimeError("Unsupported URL. Use YouTube, TikTok, Instagram, or Facebook.")
 
     if platform == "youtube":
-        # Managed API does the actual YouTube retrieval. We present the supported
-        # quality buttons directly and validate availability when the user picks.
+        info, client = youtube_extract_info(normalized)
+        qualities = _quality_list_from_info(info)
         return {
-            "source": "managed_api",
+            "source": "ytdlp",
             "platform": platform,
             "url": normalized,
-            "title": "YouTube video",
-            "qualities": [1080, 720, 480, 360, 240],
-            "audio": True,
+            "title": info.get("title") or "YouTube video",
+            "qualities": qualities or [360],
+            "audio": _has_audio(info) or True,
+            "youtube_client": client,
         }
 
     try:
@@ -1266,11 +1356,9 @@ async def handle_video_callback(update, context, data):
         def do_download():
             platform = job["platform"]
             source = job["source"]
-            if platform == "youtube" and source == "managed_api":
-                return youtube_api_download(
-                    job["url"],
-                    output_dir,
-                    "audio" if audio else str(requested_quality),
+            if platform == "youtube":
+                return youtube_direct_download(
+                    job["url"], output_dir, height=requested_quality, audio=audio,
                     title_hint=job.get("title", "YouTube video"),
                 )
             if source == "tikwm":
@@ -1293,13 +1381,21 @@ async def handle_video_callback(update, context, data):
             for q in lower:
                 _clean_dir(output_dir)
                 try:
-                    candidate = await asyncio.to_thread(
-                        youtube_api_download if job["platform"] == "youtube" and job["source"] == "managed_api" else ytdlp_download,
-                        job["url"],
-                        output_dir,
-                        str(q) if job["platform"] == "youtube" and job["source"] == "managed_api" else q,
-                        **({"title_hint": job.get("title", "video")} if job["platform"] == "youtube" and job["source"] == "managed_api" else {"audio": False, "height": q, "title_hint": job.get("title", "video")}),
-                    )
+                    if job["platform"] == "youtube":
+                        candidate = await asyncio.to_thread(
+                            youtube_direct_download, job["url"], output_dir,
+                            height=q, audio=False, title_hint=job.get("title", "video")
+                        )
+                    elif job["source"] == "tikwm":
+                        candidate = await asyncio.to_thread(
+                            tikwm_download, job["url"], output_dir, quality=selected,
+                            audio=False, data=job.get("tikwm")
+                        )
+                    else:
+                        candidate = await asyncio.to_thread(
+                            ytdlp_download, job["url"], output_dir, audio=False,
+                            height=q, title_hint=job.get("title", "video")
+                        )
                     cpath = candidate["path"]
                     csize = os.path.getsize(cpath)
                     if csize <= VIDEO_MAX_UPLOAD:
@@ -1748,10 +1844,11 @@ async def inbox_listener(event):
             print(f"Inbox Error: {e}")
 
 # --- MAIN HANDLER ---
-async def handle_link(update, context):
+async def _handle_link_impl(update, context):
     user_id = update.effective_user.id
     text = update.message.text if update.message.text else ""
     self_ping()
+    if context.user_data.get('state') == 'awaiting_text_pdf': await handle_text_pdf_input(update, context); return
     if context.user_data.get('state') == 'awaiting_image_to_pdf': await handle_image_collect(update, context); return
     if context.user_data.get('state') == 'awaiting_pdf': await handle_pdf_upload(update, context); return
     if context.user_data.get('state') == 'awaiting_pdf_to_word': await handle_pdf_to_word(update, context); return
@@ -1845,6 +1942,18 @@ async def handle_link(update, context):
             await handle_telethon_error(update, e)
     else:
         await update.message.reply_text("👋 Use the menu buttons, or send a Telegram link.")
+
+async def handle_link(update, context):
+    try:
+        await _handle_link_impl(update, context)
+    except Exception as exc:
+        print(f"Message handler error: {exc}")
+        try:
+            if update.message:
+                await update.message.reply_text("⚠️ This request failed, but the bot is still running. Please try again.")
+        except Exception:
+            pass
+
 
 # --- MAIN EXECUTION ---
 async def main():
