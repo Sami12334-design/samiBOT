@@ -10,6 +10,7 @@ import subprocess
 import urllib.request
 import urllib.parse
 import html
+import shutil
 from io import BytesIO
 from flask import Flask
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageChops
@@ -26,6 +27,10 @@ from pptx import Presentation
 from pptx.util import Inches
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 import yt_dlp
 import speech_recognition as sr
 import imageio_ffmpeg
@@ -331,7 +336,7 @@ async def menu_callback(update, context):
         kb.append([InlineKeyboardButton("⬅️ Back", callback_data="main_menu")])
         await query.message.reply_text("➕ MORE COMMANDS", reply_markup=InlineKeyboardMarkup(kb))
     elif data == "converter":
-        kb = [[InlineKeyboardButton("📄 PDF to Word", callback_data="pdf_to_word"), InlineKeyboardButton("🖼️ Image to Text", callback_data="image_to_text")], [InlineKeyboardButton("🖼️ Image to PDF", callback_data="image_to_pdf"), InlineKeyboardButton("🖼️ Edit Photo", callback_data="image_edit")], [InlineKeyboardButton("🗣️ Text to Voice (ENG)", callback_data="tts_en"), InlineKeyboardButton("🗣️ Text to Voice (AM)", callback_data="tts_am")], [InlineKeyboardButton("📷 Image Format", callback_data="img_fmt_menu"), InlineKeyboardButton("📚 Document Format", callback_data="doc_fmt_menu")], [InlineKeyboardButton("🎙️ Voice to Text (ENG)", callback_data="voice_en"), InlineKeyboardButton("🎙️ Voice to Text (AM)", callback_data="voice_am")], [InlineKeyboardButton("⬅️ Back", callback_data="more")]]
+        kb = [[InlineKeyboardButton("📝 Text to PDF", callback_data="text_to_pdf"), InlineKeyboardButton("📄 PDF to Word", callback_data="pdf_to_word"), InlineKeyboardButton("🖼️ Image to Text", callback_data="image_to_text")], [InlineKeyboardButton("🖼️ Image to PDF", callback_data="image_to_pdf"), InlineKeyboardButton("🖼️ Edit Photo", callback_data="image_edit")], [InlineKeyboardButton("🗣️ Text to Voice (ENG)", callback_data="tts_en"), InlineKeyboardButton("🗣️ Text to Voice (AM)", callback_data="tts_am")], [InlineKeyboardButton("📷 Image Format", callback_data="img_fmt_menu"), InlineKeyboardButton("📚 Document Format", callback_data="doc_fmt_menu")], [InlineKeyboardButton("🎙️ Voice to Text (ENG)", callback_data="voice_en"), InlineKeyboardButton("🎙️ Voice to Text (AM)", callback_data="voice_am")], [InlineKeyboardButton("⬅️ Back", callback_data="more")]]
         await query.message.reply_text("🔄 MEDIA CONVERTER & AI TOOLS\n\nChoose an option:", reply_markup=InlineKeyboardMarkup(kb))
     elif data == "img_fmt_menu":
         kb = [[InlineKeyboardButton("PNG to JPG", callback_data="img_png_jpg"), InlineKeyboardButton("JPG to PNG", callback_data="img_jpg_png")], [InlineKeyboardButton("Image to GIF", callback_data="img_gif"), InlineKeyboardButton("⬅️ Back", callback_data="converter")]]
@@ -344,6 +349,18 @@ async def menu_callback(update, context):
         context.user_data['state'] = 'awaiting_edit_photo'
     elif data.startswith("edit_"):
         await handle_photo_edit_selection(update, context, data)
+    elif data == "text_to_pdf":
+        context.user_data["state"] = "awaiting_text_pdf"
+        context.user_data["text_pdf_parts"] = []
+        await query.message.reply_text(
+            "📝 <b>TEXT TO PDF</b>\n\nSend your first text. You can send multiple messages. After each message, use <b>Enter Next</b> or <b>Done</b>.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done", callback_data="text_pdf_done")]])
+        )
+    elif data == "text_pdf_done":
+        await process_text_pdf(update, context)
+    elif data == "text_pdf_next":
+        await query.answer("Send the next text message.")
     elif data == "pdf_to_word":
         await query.message.reply_text("📄 PDF to Word\n\nPlease upload the PDF file.")
         context.user_data['state'] = 'awaiting_pdf_to_word'
@@ -749,58 +766,42 @@ async def handle_voice_to_text(update, context, language):
         await status_msg.edit_text(f"❌ Transcription failed: {e}")
         context.user_data['state'] = None
 
-# --- POWERFUL MULTI-SOURCE VIDEO DOWNLOADER ---
-# Supported input: YouTube, TikTok, Instagram, Facebook.
-# The bot first uses yt-dlp. For YouTube/TikTok failures, it can use public
-# fallback services that return stream URLs. No CAPTCHA or anti-bot bypass code
-# is used. Optional authenticated cookies can be provided by the owner through
-# YTDLP_COOKIES_FILE if the service requires login.
-
+# --- 10-WAY YOUTUBE / VIDEO DOWNLOADER ---
+# YouTube changes its playback/anti-bot system frequently. Instead of relying on
+# dead Piped instances, this downloader uses a ranked set of current yt-dlp
+# extraction strategies. The first successful strategy is used and remembered
+# for the selected download job.
 VIDEO_MAX_UPLOAD = 50 * 1024 * 1024
 VIDEO_QUALITIES = [1080, 720, 480, 360, 240]
-PIPED_APIS = [
-    "https://pipedapi.kavin.rocks",
-    "https://pipedapi.leptons.xyz",
-    "https://pipedapi.nosebs.ru",
-    "https://piped-api.privacy.com.de",
-    "https://pipedapi.adminforge.de",
-]
 TIKWM_API = "https://www.tikwm.com/api/"
+
+# Optional PO-token provider. Recommended for current YouTube GVS protection.
+# If you run bgutil-ytdlp-pot-provider as a sidecar/service, set:
+#   YTDL_POT_PROVIDER_URL=http://127.0.0.1:4416
+YTDL_POT_PROVIDER_URL = os.environ.get("YTDL_POT_PROVIDER_URL", "").strip()
 
 
 def video_platform(url: str) -> str:
     host = urllib.parse.urlparse(url).netloc.lower().split(":", 1)[0]
     if host.startswith("www."):
         host = host[4:]
-    if "youtube.com" in host or host == "youtu.be":
-        return "youtube"
-    if "tiktok.com" in host:
-        return "tiktok"
-    if "instagram.com" in host:
-        return "instagram"
-    if "facebook.com" in host or host == "fb.watch":
-        return "facebook"
+    if "youtube.com" in host or host == "youtu.be": return "youtube"
+    if "tiktok.com" in host: return "tiktok"
+    if "instagram.com" in host: return "instagram"
+    if "facebook.com" in host or host == "fb.watch": return "facebook"
     return "unknown"
 
 
 def normalize_public_url(url: str) -> str:
-    """Follow ordinary HTTP redirects (especially short TikTok links)."""
     url = (url or "").strip()
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/147.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.8",
-        },
-        method="GET",
-    )
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/147.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.8",
+    })
     try:
         with urllib.request.urlopen(req, timeout=15) as response:
-            final_url = response.geturl()
-            return final_url or url
+            return response.geturl() or url
     except Exception:
         return url
 
@@ -809,71 +810,159 @@ def youtube_video_id(url: str):
     parsed = urllib.parse.urlparse(url)
     host = parsed.netloc.lower().split(":", 1)[0]
     if host == "youtu.be":
-        value = parsed.path.strip("/").split("/")
-        return value[0] if value and value[0] else None
+        parts = parsed.path.strip("/").split("/")
+        return parts[0] if parts and parts[0] else None
     if "youtube.com" in host:
         qs = urllib.parse.parse_qs(parsed.query)
-        if qs.get("v"):
-            return qs["v"][0]
+        if qs.get("v"): return qs["v"][0]
         parts = [p for p in parsed.path.split("/") if p]
-        if len(parts) >= 2 and parts[0] in {"shorts", "embed", "live"}:
-            return parts[1]
+        if len(parts) >= 2 and parts[0] in {"shorts", "embed", "live"}: return parts[1]
     return None
 
 
-def ytdlp_base_options():
+def _prepare_youtube_cookiefile():
+    """Turn Render env cookie content into a secure temporary Netscape cookie file."""
+    content = os.environ.get("COOKIES_CONTENT", "").strip()
+    if not content:
+        b64 = os.environ.get("YTDLP_COOKIES_B64", "").strip()
+        if b64:
+            try: content = base64.b64decode(b64).decode("utf-8", "replace").strip()
+            except Exception: content = ""
+    if not content:
+        path = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
+        return path if path and os.path.isfile(path) else None
+    first = next((line.strip() for line in content.splitlines() if line.strip()), "")
+    if not (first.startswith("# HTTP Cookie File") or first.startswith("# Netscape HTTP Cookie File")):
+        return None
+    global _YOUTUBE_COOKIE_FILE
+    if _YOUTUBE_COOKIE_FILE and os.path.isfile(_YOUTUBE_COOKIE_FILE): return _YOUTUBE_COOKIE_FILE
+    try:
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".txt", encoding="utf-8") as f:
+            f.write(content); path = f.name
+        try: os.chmod(path, 0o600)
+        except Exception: pass
+        _YOUTUBE_COOKIE_FILE = path
+        return path
+    except Exception:
+        return None
+
+_YOUTUBE_COOKIE_FILE = None
+
+
+def _js_runtime_options():
+    opts = {}
+    node = shutil.which("node")
+    deno = shutil.which("deno")
+    if node: opts["node"] = node
+    if deno: opts["deno"] = deno
+    return opts
+
+
+def _youtube_extractor_args(client=None, use_pot=False):
+    args = {}
+    if client:
+        args["youtube"] = {"player_client": [client, "default"] if client != "default" else ["default"]}
+    if use_pot and YTDL_POT_PROVIDER_URL:
+        args["youtubepot-bgutilhttp"] = {"base_url": [YTDL_POT_PROVIDER_URL]}
+    return args
+
+
+def ytdlp_base_options(extractor_args=None):
     options = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "socket_timeout": 25,
-        "retries": 3,
-        "fragment_retries": 3,
-        "file_access_retries": 3,
-        "concurrent_fragment_downloads": 4,
+        "socket_timeout": 30,
+        "retries": 8,
+        "fragment_retries": 8,
+        "file_access_retries": 5,
+        "concurrent_fragment_downloads": 2,
         "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
+        "force_ipv4": True,
+        "remote_components": {"ejs:github"},
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/147.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.8",
         },
-        # Current yt-dlp supports remote EJS components. They help keep
-        # YouTube extraction working when challenge scripts change.
-        "remote_components": {"ejs:github"},
     }
-    cookies = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
-    if cookies and os.path.isfile(cookies):
-        options["cookiefile"] = cookies
-    # Do NOT set `impersonate='chrome'` blindly. That was the source of the
-    # user's "Impersonate target chrome is not available" error.
+    cookies = _prepare_youtube_cookiefile()
+    if cookies: options["cookiefile"] = cookies
+    js = _js_runtime_options()
+    if js: options["js_runtimes"] = js
+    if extractor_args: options["extractor_args"] = extractor_args
     return options
 
 
-def extract_ytdlp_info(url: str):
-    opts = ytdlp_base_options()
-    # Let current yt-dlp select its working YouTube player client. If one
-    # client is blocked, yt-dlp can try another supported client.
+# Ten current strategies, ordered strongest/newest first. They are deliberately
+# independent attempts: a failure in one does not poison the next one.
+YOUTUBE_STRATEGIES = [
+    ("bgutil-mweb", {"client": "mweb", "pot": True}),
+    ("bgutil-web", {"client": "web", "pot": True}),
+    ("bgutil-web-safari", {"client": "web_safari", "pot": True}),
+    ("web-embedded", {"client": "web_embedded", "pot": False}),
+    ("android-vr", {"client": "android_vr", "pot": False}),
+    ("tv", {"client": "tv", "pot": False}),
+    ("tv-simply", {"client": "tv_simply", "pot": False}),
+    ("mweb-direct", {"client": "mweb", "pot": False}),
+    ("web-music", {"client": "web_music", "pot": False}),
+    ("yt-dlp-auto", {"client": None, "pot": False}),
+]
+
+
+def _extract_with_strategy(url, strategy_name, config):
+    args = _youtube_extractor_args(config.get("client"), config.get("pot"))
+    opts = ytdlp_base_options(args)
+    # Do not allow an unsuccessful client to silently switch during the same
+    # attempt; the whole point is to test a clean independent strategy.
+    if config.get("client"):
+        opts["extractor_args"]["youtube"]["player_client"] = [config["client"]]
     with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    return info
+
+
+def extract_youtube_info_10way(url: str):
+    errors = []
+    for number, (name, config) in enumerate(YOUTUBE_STRATEGIES, 1):
+        try:
+            info = _extract_with_strategy(url, name, config)
+            if info and (info.get("formats") or info.get("url")):
+                info["_download_strategy"] = name
+                info["_strategy_number"] = number
+                return info
+            errors.append(f"{number}. {name}: no usable formats")
+        except Exception as exc:
+            msg = str(exc).replace("\n", " ")[:260]
+            errors.append(f"{number}. {name}: {msg}")
+    raise RuntimeError("All 10 YouTube extraction strategies failed:\n" + "\n".join(errors))
+
+
+def extract_ytdlp_info(url: str):
+    platform = video_platform(url)
+    if platform == "youtube": return extract_youtube_info_10way(url)
+    with yt_dlp.YoutubeDL(ytdlp_base_options()) as ydl:
         return ydl.extract_info(url, download=False)
 
 
 def build_ytdlp_format(height=None, audio=False, platform="unknown"):
-    if audio:
-        return "bestaudio/best"
-    if height:
-        if platform == "youtube":
-            return (
-                f"bestvideo[height<={height}]+bestaudio/"
-                f"best[height<={height}]/best"
-            )
-        return f"best[height<={height}]/best"
-    return "bestvideo+bestaudio/best"
+    if audio: return "bestaudio/best"
+    if height and platform == "youtube":
+        return f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height}][ext=mp4]/best[height<={height}]/best"
+    if height: return f"best[height<={height}]/best"
+    return "bestvideo*+bestaudio/best"
 
 
-def ytdlp_download(url: str, output_dir: str, *, height=None, audio=False, title_hint="video"):
+def ytdlp_download(url: str, output_dir: str, *, height=None, audio=False, title_hint="video", strategy_name=None):
     platform = video_platform(url)
-    opts = ytdlp_base_options()
+    if platform == "youtube":
+        if not strategy_name:
+            raise RuntimeError("No YouTube strategy selected")
+        cfg = dict(next((cfg for name, cfg in YOUTUBE_STRATEGIES if name == strategy_name), YOUTUBE_STRATEGIES[-1][1]))
+        args = _youtube_extractor_args(cfg.get("client"), cfg.get("pot"))
+        if cfg.get("client"): args["youtube"]["player_client"] = [cfg["client"]]
+        opts = ytdlp_base_options(args)
+    else:
+        opts = ytdlp_base_options()
     opts.update({
         "format": build_ytdlp_format(height, audio, platform),
         "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
@@ -881,243 +970,70 @@ def ytdlp_download(url: str, output_dir: str, *, height=None, audio=False, title
         "overwrites": True,
     })
     if audio:
-        opts["postprocessors"] = [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }]
+        opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filepath = ydl.prepare_filename(info)
         if audio:
-            base, _ = os.path.splitext(filepath)
-            mp3_path = base + ".mp3"
-            if os.path.exists(mp3_path):
-                filepath = mp3_path
-        else:
-            # yt-dlp can change extension after merge/postprocessing.
-            if not os.path.exists(filepath):
-                stem = os.path.splitext(filepath)[0]
-                for ext in (".mp4", ".mkv", ".webm", ".mov"):
-                    if os.path.exists(stem + ext):
-                        filepath = stem + ext
-                        break
-        if not os.path.isfile(filepath):
-            raise FileNotFoundError(f"Downloaded file was not created: {title_hint}")
+            filepath = os.path.splitext(filepath)[0] + ".mp3"
+        if not os.path.exists(filepath):
+            stem = os.path.splitext(filepath)[0]
+            for ext in (".mp4", ".mkv", ".webm", ".mov", ".mp3"):
+                if os.path.exists(stem + ext): filepath = stem + ext; break
+        if not os.path.isfile(filepath): raise FileNotFoundError(f"Downloaded file was not created: {title_hint}")
         return {"path": filepath, "title": info.get("title") or title_hint, "info": info}
 
 
-def piped_get_json(url: str):
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json,text/plain,*/*",
-        },
-    )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        return __import__("json").load(response)
-
-
-def piped_metadata(video_id: str):
-    errors = []
-    for api in PIPED_APIS:
-        try:
-            data = piped_get_json(f"{api}/streams/{urllib.parse.quote(video_id)}")
-            if data.get("videoStreams") or data.get("audioStreams"):
-                return data
-            errors.append(f"{api}: no streams")
-        except Exception as exc:
-            errors.append(f"{api}: {exc}")
-    raise RuntimeError("All YouTube fallback services failed: " + " | ".join(errors[:3]))
-
-
-def choose_piped_video_stream(streams, target_height):
-    valid = [s for s in streams if s.get("url") and s.get("height")]
-    if not valid:
-        return None
-    progressive = [s for s in valid if not s.get("videoOnly")]
-    if progressive:
-        valid = progressive
-    below = [s for s in valid if int(s.get("height", 0)) <= target_height]
-    pool = below or valid
-    pool.sort(key=lambda s: (abs(int(s.get("height", 0)) - target_height), -int(s.get("height", 0))))
-    return pool[0]
-
-
-def choose_piped_audio_stream(streams):
-    valid = [s for s in streams if s.get("url")]
-    if not valid:
-        return None
-    valid.sort(key=lambda s: float(s.get("bitrate") or 0), reverse=True)
-    return valid[0]
-
-
-def download_url_to_file(url: str, path: str, headers=None):
-    request = urllib.request.Request(
-        url,
-        headers=headers or {
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "*/*",
-        },
-    )
-    with urllib.request.urlopen(request, timeout=30) as response, open(path, "wb") as dst:
-        while True:
-            chunk = response.read(1024 * 1024)
-            if not chunk:
-                break
-            dst.write(chunk)
-
-
-def ffmpeg_merge(video_path: str, audio_path: str, out_path: str):
-    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    cmd = [
-        ffmpeg, "-y",
-        "-i", video_path,
-        "-i", audio_path,
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-movflags", "+faststart",
-        out_path,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError((result.stderr or result.stdout or "FFmpeg merge failed")[-1500:])
-    return out_path
-
-
-def download_from_piped(meta, output_dir: str, *, height=None, audio=False):
-    title = meta.get("title") or "YouTube video"
-    if audio:
-        stream = choose_piped_audio_stream(meta.get("audioStreams") or [])
-        if not stream:
-            raise RuntimeError("YouTube fallback has no audio stream")
-        raw = os.path.join(output_dir, "audio.m4a")
-        mp3 = os.path.join(output_dir, "audio.mp3")
-        download_url_to_file(stream["url"], raw)
-        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-        result = subprocess.run([
-            ffmpeg, "-y", "-i", raw,
-            "-vn", "-c:a", "libmp3lame", "-b:a", "192k", mp3,
-        ], capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError((result.stderr or "Audio conversion failed")[-1200:])
-        return {"path": mp3, "title": title}
-
-    target = height or 720
-    stream = choose_piped_video_stream(meta.get("videoStreams") or [], target)
-    if not stream:
-        raise RuntimeError("YouTube fallback has no video stream")
-    video_raw = os.path.join(output_dir, "video.bin")
-    download_url_to_file(stream["url"], video_raw)
-    mime = (stream.get("mimeType") or "").lower()
-    has_audio = not bool(stream.get("videoOnly")) or mime.startswith("video/mp4") and not stream.get("videoOnly")
-    if has_audio:
-        final = os.path.join(output_dir, "video.mp4")
-        if mime == "video/mp4":
-            os.replace(video_raw, final)
-        else:
-            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-            result = subprocess.run([
-                ffmpeg, "-y", "-i", video_raw, "-c:v", "copy", "-c:a", "aac", "-movflags", "+faststart", final,
-            ], capture_output=True, text=True)
-            if result.returncode != 0:
-                raise RuntimeError((result.stderr or "Video conversion failed")[-1200:])
-            os.unlink(video_raw)
-        return {"path": final, "title": title}
-
-    audio_stream = choose_piped_audio_stream(meta.get("audioStreams") or [])
-    if not audio_stream:
-        raise RuntimeError("YouTube fallback video is video-only and no audio stream was found")
-    audio_raw = os.path.join(output_dir, "audio.bin")
-    final = os.path.join(output_dir, "video.mp4")
-    download_url_to_file(audio_stream["url"], audio_raw)
-    ffmpeg_merge(video_raw, audio_raw, final)
-    os.unlink(video_raw)
-    os.unlink(audio_raw)
-    return {"path": final, "title": title}
-
-
-def tikwm_get_data(url: str):
-    query = urllib.parse.urlencode({"url": url})
-    endpoint = TIKWM_API + "?" + query
-    request = urllib.request.Request(endpoint, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,*/*"})
-    with urllib.request.urlopen(request, timeout=25) as response:
+def tikwm_get_data(url):
+    payload = urllib.parse.urlencode({"url": url, "hd": 1}).encode()
+    req = urllib.request.Request(TIKWM_API, data=payload, headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=30) as response:
         data = __import__("json").load(response)
-    if int(data.get("code", -1)) != 0 or not data.get("data"):
-        raise RuntimeError(data.get("msg") or "TikTok fallback service returned no data")
+    if data.get("code") != 0 or not data.get("data"): raise RuntimeError(data.get("msg") or "TikWM returned no data")
     return data["data"]
 
 
-def tikwm_download(url: str, output_dir: str, *, quality="hd", audio=False):
+def download_url_to_file(url, path):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "*/*"})
+    with urllib.request.urlopen(req, timeout=60) as response, open(path, "wb") as out:
+        while True:
+            chunk = response.read(1024 * 512)
+            if not chunk: break
+            out.write(chunk)
+
+
+def tikwm_download(url, output_dir, quality="hd", audio=False):
     data = tikwm_get_data(url)
-    title = data.get("title") or data.get("desc") or "TikTok video"
     if audio:
         media_url = data.get("music")
-        if not media_url:
-            raise RuntimeError("TikTok fallback has no audio URL")
-        out = os.path.join(output_dir, "tiktok_audio.mp3")
-        raw = os.path.join(output_dir, "tiktok_audio.bin")
-        download_url_to_file(media_url, raw)
-        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-        result = subprocess.run([ffmpeg, "-y", "-i", raw, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", out], capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError((result.stderr or "TikTok audio conversion failed")[-1200:])
-        os.unlink(raw)
-        return {"path": out, "title": title}
+        if not media_url: raise RuntimeError("TikTok returned no audio URL")
+        out = os.path.join(output_dir, "tiktok.mp3"); download_url_to_file(media_url, out)
+        return {"path": out, "title": data.get("title") or data.get("desc") or "TikTok audio"}
     media_url = data.get("hdplay") if quality == "hd" else data.get("play")
     media_url = media_url or data.get("play") or data.get("wmplay")
-    if not media_url:
-        raise RuntimeError("TikTok fallback returned no video URL")
-    out = os.path.join(output_dir, "tiktok.mp4")
-    download_url_to_file(media_url, out)
-    return {"path": out, "title": title}
+    if not media_url: raise RuntimeError("TikTok returned no video URL")
+    out = os.path.join(output_dir, "tiktok.mp4"); download_url_to_file(media_url, out)
+    return {"path": out, "title": data.get("title") or data.get("desc") or "TikTok video"}
 
 
 def extract_download_options(url: str):
     platform = video_platform(url)
     normalized = normalize_public_url(url) if platform == "tiktok" else url
-    # Direct yt-dlp path first.
+    if platform == "youtube":
+        info = extract_youtube_info_10way(normalized)
+        heights = sorted({int(f["height"]) for f in info.get("formats") or [] if f.get("vcodec") != "none" and f.get("height")}, reverse=True)
+        qualities = [q for q in VIDEO_QUALITIES if any(h >= q for h in heights)] or ([max(heights)] if heights else [720])
+        return {"source": "ytdlp", "platform": platform, "url": normalized, "title": info.get("title") or "YouTube video", "qualities": qualities, "audio": True, "strategy": info.get("_download_strategy")}
     try:
         info = extract_ytdlp_info(normalized)
-        title = info.get("title") or "Video"
-        if platform == "youtube":
-            available = set()
-            for f in info.get("formats") or []:
-                if f.get("vcodec") != "none" and f.get("height"):
-                    available.add(int(f["height"]))
-            qualities = [q for q in VIDEO_QUALITIES if any(h >= q for h in available)]
-            if not qualities and available:
-                qualities = [max(available)]
-            return {"source": "ytdlp", "platform": platform, "url": normalized, "title": title, "qualities": qualities or [720], "audio": True}
-        # For other sites, expose the qualities yt-dlp actually knows about.
         heights = sorted({int(f["height"]) for f in info.get("formats") or [] if f.get("vcodec") != "none" and f.get("height")}, reverse=True)
-        qualities = [q for q in VIDEO_QUALITIES if any(h >= q for h in heights)]
-        return {"source": "ytdlp", "platform": platform, "url": normalized, "title": title, "qualities": qualities or [720], "audio": True}
+        qualities = [q for q in VIDEO_QUALITIES if any(h >= q for h in heights)] or ([max(heights)] if heights else [720])
+        return {"source": "ytdlp", "platform": platform, "url": normalized, "title": info.get("title") or "Video", "qualities": qualities, "audio": True, "strategy": None}
     except Exception as first_error:
-        if platform == "youtube":
-            vid = youtube_video_id(normalized)
-            if not vid:
-                raise RuntimeError(f"YouTube extraction failed: {first_error}")
-            piped = piped_metadata(vid)
-            heights = sorted({int(s.get("height")) for s in piped.get("videoStreams") or [] if s.get("height")}, reverse=True)
-            qualities = [q for q in VIDEO_QUALITIES if any(h >= q for h in heights)]
-            if not qualities and heights:
-                qualities = [max(heights)]
-            return {"source": "piped", "platform": platform, "url": normalized, "title": piped.get("title") or "YouTube video", "qualities": qualities or [720], "audio": bool(piped.get("audioStreams")), "piped": piped}
         if platform == "tiktok":
             data = tikwm_get_data(normalized)
-            qualities = []
-            if data.get("hdplay"):
-                qualities.append("hd")
-            if data.get("play"):
-                qualities.append("sd")
-            if not qualities and data.get("wmplay"):
-                qualities.append("sd")
-            if not qualities:
-                raise RuntimeError(f"TikTok extraction failed: {first_error}")
+            qualities = [x for x in (["hd"] if data.get("hdplay") else []) + (["sd"] if data.get("play") else [])]
+            if not qualities: raise RuntimeError(f"TikTok extraction failed: {first_error}")
             return {"source": "tikwm", "platform": platform, "url": normalized, "title": data.get("title") or data.get("desc") or "TikTok video", "qualities": qualities, "audio": bool(data.get("music")), "tikwm": data}
         raise RuntimeError(f"Extraction failed: {first_error}")
 
@@ -1177,13 +1093,8 @@ async def handle_video_download(update, context):
     except Exception as e:
         context.user_data["state"] = None
         msg = str(e)
-        if "Sign in to confirm" in msg or "LOGIN_REQUIRED" in msg:
-            msg = (
-                "YouTube is currently requiring authentication from this server. "
-                "The bot already tried its normal extractor and the public fallback. "
-                "For videos that remain protected, the supported option is to provide "
-                "a fresh cookies file through YTDLP_COOKIES_FILE."
-            )
+        if "All 10 YouTube extraction strategies failed" in msg:
+            msg = msg[:3500] + "\n\nTip: if all 10 fail with PO-token or bot-check errors, configure YTDL_POT_PROVIDER_URL to a bgutil provider and keep COOKIES_CONTENT fresh."
         await status_msg.edit_text(f"❌ Could not prepare download.\n\n{msg[:900]}")
 
 
@@ -1218,9 +1129,7 @@ async def handle_video_callback(update, context, data):
 
         def do_download():
             if job["source"] == "ytdlp":
-                return ytdlp_download(job["url"], output_dir, height=quality, audio=audio, title_hint=job.get("title", "video"))
-            if job["source"] == "piped":
-                return download_from_piped(job["piped"], output_dir, height=quality, audio=audio)
+                return ytdlp_download(job["url"], output_dir, height=quality, audio=audio, title_hint=job.get("title", "video"), strategy_name=job.get("strategy"))
             if job["source"] == "tikwm":
                 return tikwm_download(job["url"], output_dir, quality=quality, audio=audio)
             raise RuntimeError("Unknown download source")
@@ -1278,11 +1187,86 @@ async def handle_video_callback(update, context, data):
 def do_download_for_quality(job, output_dir, quality):
     if job["source"] == "ytdlp":
         return ytdlp_download(job["url"], output_dir, height=quality, audio=False, title_hint=job.get("title", "video"))
-    if job["source"] == "piped":
-        return download_from_piped(job["piped"], output_dir, height=quality, audio=False)
     if job["source"] == "tikwm":
         return tikwm_download(job["url"], output_dir, quality="hd" if quality >= 720 else "sd", audio=False)
     raise RuntimeError("Unknown download source")
+
+# --- TEXT TO PDF ---
+
+def _register_pdf_font():
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/opentype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            try:
+                if "PDFUnicodeFont" not in pdfmetrics.getRegisteredFontNames():
+                    pdfmetrics.registerFont(TTFont("PDFUnicodeFont", path))
+                return "PDFUnicodeFont"
+            except Exception:
+                pass
+    return "Helvetica"
+
+
+def build_text_pdf(parts):
+    font = _register_pdf_font()
+    out = BytesIO()
+    doc = SimpleDocTemplate(out, pagesize=letter, rightMargin=45, leftMargin=45, topMargin=45, bottomMargin=45,
+                            title="Text PDF", author="Telegram Assistant")
+    styles = getSampleStyleSheet()
+    body = ParagraphStyle("PDFBody", parent=styles["BodyText"], fontName=font, fontSize=11, leading=16, spaceAfter=12)
+    title_style = ParagraphStyle("PDFTitle", parent=styles["Title"], fontName=font, fontSize=18, leading=23, spaceAfter=20)
+    story = [Paragraph("Text Document", title_style)]
+    for i, part in enumerate(parts, 1):
+        safe = html.escape(part).replace("\n", "<br/>")
+        story.append(Paragraph(safe, body))
+        if i < len(parts): story.append(Spacer(1, 5))
+    doc.build(story)
+    out.seek(0)
+    return out
+
+
+async def handle_text_pdf_message(update, context):
+    if context.user_data.get("state") != "awaiting_text_pdf": return
+    text = (update.message.text or "").strip()
+    if not text: return
+    if text.lower() in {"done", "finish", "/done"}:
+        await process_text_pdf(update, context)
+        return
+    parts = context.user_data.setdefault("text_pdf_parts", [])
+    parts.append(text)
+    n = len(parts)
+    await update.message.reply_text(
+        f"✅ Text part {n} added.\n\nSend another text, or press Done when finished.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Enter Next", callback_data="text_pdf_next"), InlineKeyboardButton("✅ Done", callback_data="text_pdf_done")]])
+    )
+
+
+async def process_text_pdf(update, context):
+    query = update.callback_query
+    if query:
+        await query.answer()
+    parts = context.user_data.get("text_pdf_parts", [])
+    if not parts:
+        msg = "❌ No text received yet."
+        if query: await query.message.reply_text(msg)
+        else: await update.message.reply_text(msg)
+        return
+    try:
+        status = await (query.message.reply_text("⏳ Creating your PDF…") if query else update.message.reply_text("⏳ Creating your PDF…"))
+        pdf = await asyncio.to_thread(build_text_pdf, parts)
+        chat_id = query.message.chat_id if query else update.effective_chat.id
+        await context.bot.send_document(chat_id=chat_id, document=pdf, filename="text_document.pdf", caption=f"✅ PDF created from {len(parts)} text part(s).", reply_markup=tool_done_kb())
+        await status.edit_text("✅ Text to PDF completed!")
+    except Exception as e:
+        if query: await query.message.reply_text(f"❌ Text to PDF failed: {e}")
+        else: await update.message.reply_text(f"❌ Text to PDF failed: {e}")
+    finally:
+        context.user_data.pop("text_pdf_parts", None)
+        context.user_data["state"] = None
+
 
 # --- PDF, WORD, IMAGE COLLECT ---
 async def handle_pdf_upload(update, context):
@@ -1631,6 +1615,7 @@ async def handle_link(update, context):
     user_id = update.effective_user.id
     text = update.message.text if update.message.text else ""
     self_ping()
+    if context.user_data.get('state') == 'awaiting_text_pdf': await handle_text_pdf_message(update, context); return
     if context.user_data.get('state') == 'awaiting_image_to_pdf': await handle_image_collect(update, context); return
     if context.user_data.get('state') == 'awaiting_pdf': await handle_pdf_upload(update, context); return
     if context.user_data.get('state') == 'awaiting_pdf_to_word': await handle_pdf_to_word(update, context); return
@@ -1749,7 +1734,8 @@ async def main():
     bot_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_link))
     print("Bot running with upgraded multi-source video downloader...")
     await bot_app.initialize(); await bot_app.start(); await bot_app.updater.start_polling()
-    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
+    port = int(os.environ.get('PORT', '10000'))
+    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=port, use_reloader=False), daemon=True).start()
     await asyncio.Event().wait()
 
 if __name__ == '__main__':
