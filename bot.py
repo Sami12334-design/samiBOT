@@ -310,7 +310,16 @@ async def restart_command(update, context):
 
 async def menu_callback(update, context):
     query = update.callback_query
-    await query.answer()
+    data = query.data or ""
+    # These handlers answer their own callback queries because they may perform
+    # longer-running work or update the message immediately.
+    if not (data.startswith("vd_") or data.startswith("edit_") or
+            data.startswith("tts_voice_") or data.startswith("posts_") or
+            data.startswith("story_")):
+        try:
+            await query.answer()
+        except Exception:
+            pass
     user_id = update.effective_user.id
     if not is_authenticated(user_id):
         await query.edit_message_text("🔐 Password required.")
@@ -434,97 +443,194 @@ async def menu_callback(update, context):
             await display_story(update, context)
 
 # --- PHOTO EDITING ---
+_REMBG_SESSION = None
+_REMBG_LOCK = threading.Lock()
+
+
+def _get_rembg_session():
+    global _REMBG_SESSION
+    if _REMBG_SESSION is not None:
+        return _REMBG_SESSION
+    with _REMBG_LOCK:
+        if _REMBG_SESSION is None:
+            from rembg import new_session
+            # u2netp is much lighter than u2net and is friendlier to small
+            # Render/container instances. If unavailable, fall back to default.
+            try:
+                _REMBG_SESSION = new_session("u2netp")
+            except Exception:
+                _REMBG_SESSION = new_session()
+    return _REMBG_SESSION
+
+
+def _remove_background_sync(img):
+    from rembg import remove
+    rgba = img.convert("RGBA").copy()
+    rgba.load()
+    session = _get_rembg_session()
+    try:
+        return remove(rgba, session=session)
+    except Exception:
+        # A second attempt without the cached session protects against stale
+        # model/session objects after a worker restart or model load failure.
+        return remove(rgba)
+
+
+def _sketch_sync(img):
+    # Reliable pencil-sketch effect using Pillow only (no network/model needed).
+    rgb = img.convert("RGB")
+    gray = ImageOps.grayscale(rgb)
+    inverted = ImageOps.invert(gray)
+    blurred = inverted.filter(ImageFilter.GaussianBlur(radius=9))
+    sketch = ImageChops.dodge(gray, blurred, scale=2.2)
+    sketch = ImageEnhance.Contrast(sketch).enhance(1.35)
+    sketch = ImageEnhance.Sharpness(sketch).enhance(1.4)
+    return sketch.convert("RGB")
+
+
 async def handle_photo_edit_selection(update, context, data):
     query = update.callback_query
-    await query.answer()
-    if not context.user_data.get('edit_image'):
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if not context.user_data.get("edit_image"):
         await query.message.reply_text("❌ No image found. Please send a photo first.")
         return
-    img = context.user_data['edit_image']
+
+    img = context.user_data["edit_image"].copy()
+
     if data == "edit_remove_bg":
-        async def run_bg_removal():
-            def do_work():
-                from rembg import remove, new_session
-                session = new_session("u2netp")
-                return remove(img, session=session)
-            return await asyncio.to_thread(do_work)
+        status = await query.message.reply_text("⏳ Removing background… This may take a little while on the first use.")
         try:
-            out_img = await run_bg_removal()
+            out_img = await asyncio.to_thread(_remove_background_sync, img)
             out_bytes = BytesIO()
-            out_img.save(out_bytes, format='PNG')
+            out_img.save(out_bytes, format="PNG")
             out_bytes.seek(0)
-            await query.message.reply_document(document=out_bytes, filename="no_bg.png", caption="✅ Background removed!", reply_markup=tool_done_kb())
+            await query.message.reply_document(
+                document=out_bytes,
+                filename="background_removed.png",
+                caption="✅ Background removed successfully!",
+                reply_markup=tool_done_kb(),
+            )
+            await status.edit_text("✅ Background removal complete!")
         except Exception as e:
-            await query.message.reply_text(f"❌ Background removal failed: {e}")
+            await status.edit_text("❌ Background removal failed.\n\n" + html.escape(str(e)[:1500]), parse_mode=ParseMode.HTML)
         return
+
     if data == "edit_change_bg":
-        await query.message.reply_text("🖼️ **CHANGE BACKGROUND**\n\nStep 1/2: Please upload the **background image** you want to use.")
-        context.user_data['state'] = 'awaiting_bg_upload'
+        await query.message.reply_text("🖼️ CHANGE BACKGROUND\n\nStep 1/2: Upload the background image.")
+        context.user_data["state"] = "awaiting_bg_upload"
         return
-    max_side = 4096
-    if img.width >= img.height:
-        new_width = max_side
-        new_height = int(img.height * (max_side / img.width))
-    else:
-        new_height = max_side
-        new_width = int(img.width * (max_side / img.height))
-    img = img.resize((new_width, new_height), Image.LANCZOS)
-    filter_name = "Original"
-    if data == "edit_orig": filter_name = "Original"
-    elif data == "edit_hd":
-        img = ImageEnhance.Sharpness(img).enhance(2.0)
-        img = ImageEnhance.Contrast(img).enhance(1.2)
-        img = ImageEnhance.Color(img).enhance(1.1)
-        filter_name = "HD Enhanced"
-    elif data == "edit_bw":
-        img = ImageOps.grayscale(img); filter_name = "Black & White"
-    elif data == "edit_sepia":
-        sepia_matrix = (0.393, 0.769, 0.189, 0, 0.349, 0.686, 0.168, 0, 0.272, 0.534, 0.131, 0)
-        img = img.convert("RGB", sepia_matrix); filter_name = "Vintage Sepia"
-    elif data == "edit_vivid":
-        img = ImageEnhance.Color(img).enhance(1.5); img = ImageEnhance.Contrast(img).enhance(1.2); filter_name = "Vivid"
-    elif data == "edit_sharp":
-        img = img.filter(ImageFilter.SHARPEN); filter_name = "Sharpen"
-    elif data == "edit_bright":
-        img = ImageEnhance.Brightness(img).enhance(1.3); filter_name = "Brighten"
-    elif data == "edit_dark":
-        img = ImageEnhance.Brightness(img).enhance(0.7); filter_name = "Darken"
-    elif data == "edit_blur":
-        img = img.filter(ImageFilter.GaussianBlur(radius=2)); filter_name = "Soft Blur"
-    elif data == "edit_pixel":
-        small = img.resize((64, 64), Image.BILINEAR); img = small.resize((new_width, new_height), Image.NEAREST); filter_name = "Pixel Art"
-    elif data == "edit_invert":
-        img = ImageOps.invert(img.convert('RGB')); filter_name = "Invert"
-    elif data == "edit_sketch":
-        gray = img.convert('L'); invert = ImageOps.invert(gray); blur = invert.filter(ImageFilter.GaussianBlur(radius=5)); img = ImageChops.dodge(gray, blur); filter_name = "Sketch"
-    elif data == "edit_emboss":
-        img = img.filter(ImageFilter.EMBOSS); filter_name = "Emboss"
-    elif data == "edit_poster":
-        img = ImageOps.posterize(img.convert('RGB'), bits=3); filter_name = "Posterize"
-    elif data == "edit_solar":
-        img = ImageOps.solarize(img.convert('RGB'), threshold=128); filter_name = "Solarize"
-    out_bytes = BytesIO()
-    img.save(out_bytes, format='JPEG', quality=95)
-    out_bytes.seek(0)
-    await query.message.reply_photo(photo=out_bytes, caption=f"✅ Applied: **{filter_name}**", reply_markup=tool_done_kb())
+
+    status = await query.message.reply_text("⏳ Applying edit…")
+    try:
+        # Work at a reasonable size so Render does not explode memory on huge photos.
+        max_side = 2048
+        img.thumbnail((max_side, max_side), Image.LANCZOS)
+        filter_name = "Original"
+
+        if data == "edit_orig":
+            result = img.convert("RGB")
+            filter_name = "Original"
+        elif data == "edit_hd":
+            result = ImageEnhance.Sharpness(img.convert("RGB")).enhance(2.2)
+            result = ImageEnhance.Contrast(result).enhance(1.15)
+            result = ImageEnhance.Color(result).enhance(1.08)
+            filter_name = "HD Enhanced"
+        elif data == "edit_bw":
+            result = ImageOps.grayscale(img).convert("RGB")
+            filter_name = "Black & White"
+        elif data == "edit_sepia":
+            rgb = img.convert("RGB")
+            sepia_matrix = (0.393, 0.769, 0.189, 0, 0.349, 0.686, 0.168, 0, 0.272, 0.534, 0.131, 0)
+            result = rgb.convert("RGB", sepia_matrix)
+            filter_name = "Vintage Sepia"
+        elif data == "edit_vivid":
+            result = ImageEnhance.Color(img.convert("RGB")).enhance(1.5)
+            result = ImageEnhance.Contrast(result).enhance(1.18)
+            filter_name = "Vivid"
+        elif data == "edit_sharp":
+            result = img.convert("RGB").filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
+            filter_name = "Sharpen"
+        elif data == "edit_bright":
+            result = ImageEnhance.Brightness(img.convert("RGB")).enhance(1.3)
+            filter_name = "Brighten"
+        elif data == "edit_dark":
+            result = ImageEnhance.Brightness(img.convert("RGB")).enhance(0.7)
+            filter_name = "Darken"
+        elif data == "edit_blur":
+            result = img.convert("RGB").filter(ImageFilter.GaussianBlur(radius=2.2))
+            filter_name = "Soft Blur"
+        elif data == "edit_pixel":
+            rgb = img.convert("RGB")
+            small_w = max(8, rgb.width // 24)
+            small_h = max(8, rgb.height // 24)
+            tiny = rgb.resize((small_w, small_h), Image.Resampling.BILINEAR)
+            result = tiny.resize(rgb.size, Image.Resampling.NEAREST)
+            filter_name = "Pixel Art"
+        elif data == "edit_invert":
+            result = ImageOps.invert(img.convert("RGB"))
+            filter_name = "Invert"
+        elif data == "edit_sketch":
+            result = await asyncio.to_thread(_sketch_sync, img)
+            filter_name = "Pencil Sketch"
+        elif data == "edit_emboss":
+            result = img.convert("RGB").filter(ImageFilter.EMBOSS)
+            filter_name = "Emboss"
+        elif data == "edit_poster":
+            result = ImageOps.posterize(img.convert("RGB"), bits=4)
+            filter_name = "Posterize"
+        elif data == "edit_solar":
+            result = ImageOps.solarize(img.convert("RGB"), threshold=128)
+            filter_name = "Solarize"
+        else:
+            await status.edit_text("❌ Unknown editing operation.")
+            return
+
+        out_bytes = BytesIO()
+        result.save(out_bytes, format="JPEG", quality=95, optimize=True)
+        out_bytes.seek(0)
+        await query.message.reply_photo(
+            photo=out_bytes,
+            caption=f"✅ Applied: {filter_name}",
+            reply_markup=tool_done_kb(),
+        )
+        await status.edit_text(f"✅ {filter_name} complete!")
+    except Exception as e:
+        await status.edit_text("❌ Edit failed.\n\n" + html.escape(str(e)[:1500]), parse_mode=ParseMode.HTML)
+
 
 async def handle_edit_photo(update, context):
-    if context.user_data.get('state') != 'awaiting_edit_photo': return
+    if context.user_data.get("state") != "awaiting_edit_photo":
+        return
     if not update.message.photo:
         await update.message.reply_text("❌ Please upload an image.")
         return
-    status_msg = await update.message.reply_text("⏳ Processing image...")
+    status_msg = await update.message.reply_text("⏳ Loading image…")
     try:
-        photo = update.message.photo[-1]; file = await context.bot.get_file(photo.file_id)
-        img_bytes = BytesIO(); await file.download_to_memory(img_bytes); img_bytes.seek(0)
-        img = Image.open(img_bytes)
-        context.user_data['edit_image'] = img
-        kb = [[InlineKeyboardButton("🖼️ Original", callback_data="edit_orig"), InlineKeyboardButton("✨ HD 100x", callback_data="edit_hd"), InlineKeyboardButton("🎨 Vivid", callback_data="edit_vivid")], [InlineKeyboardButton("⬛ B&W", callback_data="edit_bw"), InlineKeyboardButton("🟤 Sepia", callback_data="edit_sepia"), InlineKeyboardButton("🔪 Sharpen", callback_data="edit_sharp")], [InlineKeyboardButton("☀️ Brighten", callback_data="edit_bright"), InlineKeyboardButton("🌙 Darken", callback_data="edit_dark"), InlineKeyboardButton("🌫️ Blur", callback_data="edit_blur")], [InlineKeyboardButton("🟥 Pixel", callback_data="edit_pixel"), InlineKeyboardButton("🔄 Invert", callback_data="edit_invert"), InlineKeyboardButton("✏️ Sketch", callback_data="edit_sketch")], [InlineKeyboardButton("🧊 Emboss", callback_data="edit_emboss"), InlineKeyboardButton("🎞️ Poster", callback_data="edit_poster"), InlineKeyboardButton("🔥 Solarize", callback_data="edit_solar")], [InlineKeyboardButton("🖼️ Remove BG", callback_data="edit_remove_bg"), InlineKeyboardButton("🖼️ Change BG", callback_data="edit_change_bg")]]
-        await status_msg.edit_text("✅ Image loaded!\n\nChoose an editing feature below:", reply_markup=InlineKeyboardMarkup(kb))
-        context.user_data['state'] = None
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        img_bytes = BytesIO()
+        await file.download_to_memory(img_bytes)
+        img_bytes.seek(0)
+        img = Image.open(img_bytes).convert("RGBA")
+        img.load()
+        context.user_data["edit_image"] = img.copy()
+        kb = [
+            [InlineKeyboardButton("🖼️ Original", callback_data="edit_orig"), InlineKeyboardButton("✨ HD", callback_data="edit_hd"), InlineKeyboardButton("🎨 Vivid", callback_data="edit_vivid")],
+            [InlineKeyboardButton("⬛ B&W", callback_data="edit_bw"), InlineKeyboardButton("🟤 Sepia", callback_data="edit_sepia"), InlineKeyboardButton("🔪 Sharpen", callback_data="edit_sharp")],
+            [InlineKeyboardButton("☀️ Brighten", callback_data="edit_bright"), InlineKeyboardButton("🌙 Darken", callback_data="edit_dark"), InlineKeyboardButton("🌫️ Blur", callback_data="edit_blur")],
+            [InlineKeyboardButton("🟥 Pixel", callback_data="edit_pixel"), InlineKeyboardButton("🔄 Invert", callback_data="edit_invert"), InlineKeyboardButton("✏️ Sketch", callback_data="edit_sketch")],
+            [InlineKeyboardButton("🧊 Emboss", callback_data="edit_emboss"), InlineKeyboardButton("🎞️ Poster", callback_data="edit_poster"), InlineKeyboardButton("🔥 Solarize", callback_data="edit_solar")],
+            [InlineKeyboardButton("🖼️ Remove BG", callback_data="edit_remove_bg"), InlineKeyboardButton("🖼️ Change BG", callback_data="edit_change_bg")],
+        ]
+        await status_msg.edit_text("✅ Image loaded!\n\nChoose an editing feature:", reply_markup=InlineKeyboardMarkup(kb))
+        context.user_data["state"] = None
     except Exception as e:
-        await status_msg.edit_text(f"❌ Processing failed: {e}")
-        context.user_data['state'] = None
+        await status_msg.edit_text("❌ Processing failed.\n\n" + html.escape(str(e)[:1500]), parse_mode=ParseMode.HTML)
+        context.user_data["state"] = None
+
 
 async def handle_bg_upload(update, context):
     if context.user_data.get('state') != 'awaiting_bg_upload': return
@@ -749,136 +855,200 @@ async def handle_voice_to_text(update, context, language):
         await status_msg.edit_text(f"❌ Transcription failed: {e}")
         context.user_data['state'] = None
 
-# --- POWERFUL MULTI-SOURCE VIDEO DOWNLOADER ---
-# Supported input: YouTube, TikTok, Instagram, Facebook.
-# The bot first uses yt-dlp. For YouTube/TikTok failures, it can use public
-# fallback services that return stream URLs. No CAPTCHA or anti-bot bypass code
-# is used. Optional authenticated cookies can be provided by the owner through
-# YTDLP_COOKIES_FILE if the service requires login.
+# --- ROBUST MULTI-SOURCE VIDEO DOWNLOADER ---
+# Build: yt-fix-2026-09-02-v4
+#
+# YouTube strategy:
+#   1) yt-dlp with current YouTube clients/EJS
+#   2) optional WebPoClient provider if installed and Chrome/Chromium exists
+#   3) optional Cobalt API fallback
+#
+# IMPORTANT: There is intentionally NO Piped fallback in this build.
 
 VIDEO_MAX_UPLOAD = 50 * 1024 * 1024
 VIDEO_QUALITIES = [1080, 720, 480, 360, 240]
-PIPED_APIS = [
-    "https://pipedapi.kavin.rocks",
-    "https://pipedapi.leptons.xyz",
-    "https://pipedapi.nosebs.ru",
-    "https://piped-api.privacy.com.de",
-    "https://pipedapi.adminforge.de",
-]
 TIKWM_API = "https://www.tikwm.com/api/"
+
+# Current 2026 YouTube extraction is increasingly dependent on PO Tokens.
+# The WebPoClient plugin can mint tokens in a real Chromium session.
+# It is only used when the plugin/browser are actually available.
+YOUTUBE_CLIENTS = ["mweb", "default", "android_vr", "web_embedded", "ios", "web_safari"]
+
+COBALT_API_URL = os.environ.get("COBALT_API_URL", "https://api.cobalt.tools/api/json").rstrip("/")
+COBALT_API_KEY = os.environ.get("COBALT_API_KEY", "").strip()
+YTDLP_COOKIES_FILE = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
+YOUTUBE_PROXY = os.environ.get("YOUTUBE_PROXY", "").strip()
+YOUTUBE_BROWSER_PATH = os.environ.get("YOUTUBE_BROWSER_PATH", "").strip()
+BUILD_ID = "yt-fix-2026-09-02-v4"
 
 
 def video_platform(url: str) -> str:
     host = urllib.parse.urlparse(url).netloc.lower().split(":", 1)[0]
-    if host.startswith("www."):
-        host = host[4:]
-    if "youtube.com" in host or host == "youtu.be":
+    host = host[4:] if host.startswith("www.") else host
+    if host in {"youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"} or host.endswith(".youtube.com"):
         return "youtube"
     if "tiktok.com" in host:
         return "tiktok"
     if "instagram.com" in host:
         return "instagram"
-    if "facebook.com" in host or host == "fb.watch":
+    if host == "fb.watch" or "facebook.com" in host:
         return "facebook"
     return "unknown"
 
 
 def normalize_public_url(url: str) -> str:
-    """Follow ordinary HTTP redirects (especially short TikTok links)."""
     url = (url or "").strip()
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/147.0.0.0 Safari/537.36",
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+            ),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.8",
         },
-        method="GET",
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as response:
-            final_url = response.geturl()
-            return final_url or url
+            return response.geturl() or url
     except Exception:
         return url
 
 
 def youtube_video_id(url: str):
-    parsed = urllib.parse.urlparse(url)
-    host = parsed.netloc.lower().split(":", 1)[0]
+    p = urllib.parse.urlparse(url)
+    host = p.netloc.lower().split(":", 1)[0]
     if host == "youtu.be":
-        value = parsed.path.strip("/").split("/")
-        return value[0] if value and value[0] else None
+        parts = [x for x in p.path.split("/") if x]
+        return parts[0] if parts else None
     if "youtube.com" in host:
-        qs = urllib.parse.parse_qs(parsed.query)
-        if qs.get("v"):
-            return qs["v"][0]
-        parts = [p for p in parsed.path.split("/") if p]
+        q = urllib.parse.parse_qs(p.query)
+        if q.get("v"):
+            return q["v"][0]
+        parts = [x for x in p.path.split("/") if x]
         if len(parts) >= 2 and parts[0] in {"shorts", "embed", "live"}:
             return parts[1]
     return None
 
 
-def ytdlp_base_options():
+def find_browser_executable():
+    if YOUTUBE_BROWSER_PATH and os.path.isfile(YOUTUBE_BROWSER_PATH):
+        return YOUTUBE_BROWSER_PATH
+    candidates = [
+        "google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"
+    ]
+    for name in candidates:
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+
+def wpc_available():
+    """Return True when the optional WebPoClient plugin is installed."""
+    try:
+        import nodriver  # noqa: F401
+        return find_browser_executable() is not None
+    except Exception:
+        return False
+
+
+def ytdlp_base_options(*, youtube_client=None):
     options = {
         "quiet": True,
-        "no_warnings": True,
+        "no_warnings": False,
         "noplaylist": True,
-        "socket_timeout": 25,
-        "retries": 3,
-        "fragment_retries": 3,
-        "file_access_retries": 3,
-        "concurrent_fragment_downloads": 4,
+        "socket_timeout": 30,
+        "retries": 4,
+        "fragment_retries": 4,
+        "file_access_retries": 4,
+        "concurrent_fragment_downloads": 2,
         "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/147.0.0.0 Safari/537.36",
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+            ),
             "Accept-Language": "en-US,en;q=0.8",
         },
-        # Current yt-dlp supports remote EJS components. They help keep
-        # YouTube extraction working when challenge scripts change.
         "remote_components": {"ejs:github"},
     }
-    cookies = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
-    if cookies and os.path.isfile(cookies):
-        options["cookiefile"] = cookies
-    # Do NOT set `impersonate='chrome'` blindly. That was the source of the
-    # user's "Impersonate target chrome is not available" error.
+
+    if YTDLP_COOKIES_FILE and os.path.isfile(YTDLP_COOKIES_FILE):
+        options["cookiefile"] = YTDLP_COOKIES_FILE
+
+    if YOUTUBE_PROXY:
+        options["proxy"] = YOUTUBE_PROXY
+
+    if youtube_client:
+        options["extractor_args"] = {"youtube": {"player_client": [youtube_client]}}
+
+    # Optional manually supplied PO token. Keep it exact and video-independent
+    # only when the owner already has a valid token for the chosen context.
+    po_token = os.environ.get("YOUTUBE_PO_TOKEN", "").strip()
+    if po_token and youtube_client:
+        context = os.environ.get("YOUTUBE_PO_CONTEXT", "mweb.gvs").strip()
+        options.setdefault("extractor_args", {"youtube": {}})
+        options["extractor_args"]["youtube"]["po_token"] = [f"{context}+{po_token}"]
+
+    # Give WebPoClient a browser path if it exists. The provider plugin reads
+    # this extractor argument when it launches Chromium.
+    browser = find_browser_executable()
+    if browser and youtube_client in {"mweb", "web", "web_safari", "web_embedded", "tv", "tv_embedded"}:
+        options.setdefault("extractor_args", {"youtube": {}})
+        options["extractor_args"]["youtubepot-wpc"] = {"browser_path": browser}
+
+    # If a browser provider is not installed, don't force the wpc extractor.
+    # It is an optional plugin and yt-dlp will otherwise fall back normally.
     return options
-
-
-def extract_ytdlp_info(url: str):
-    opts = ytdlp_base_options()
-    # Let current yt-dlp select its working YouTube player client. If one
-    # client is blocked, yt-dlp can try another supported client.
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
 
 
 def build_ytdlp_format(height=None, audio=False, platform="unknown"):
     if audio:
         return "bestaudio/best"
+    if platform == "youtube" and height:
+        # Prefer MP4/H.264 where available, then fall back to any compatible
+        # stream at or below the requested height.
+        return (
+            f"bestvideo[height<={height}][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
+            f"bestvideo[height<={height}]+bestaudio/"
+            f"best[height<={height}]/best"
+        )
     if height:
-        if platform == "youtube":
-            return (
-                f"bestvideo[height<={height}]+bestaudio/"
-                f"best[height<={height}]/best"
-            )
         return f"best[height<={height}]/best"
     return "bestvideo+bestaudio/best"
 
 
-def ytdlp_download(url: str, output_dir: str, *, height=None, audio=False, title_hint="video"):
+def _find_media_file(output_dir: str, preferred=None):
+    if preferred and os.path.isfile(preferred):
+        return preferred
+    allowed = {".mp4", ".mkv", ".webm", ".mov", ".m4a", ".mp3", ".aac", ".opus"}
+    files = []
+    for name in os.listdir(output_dir):
+        path = os.path.join(output_dir, name)
+        if os.path.isfile(path) and os.path.splitext(name)[1].lower() in allowed:
+            files.append(path)
+    return max(files, key=os.path.getmtime) if files else None
+
+
+def ytdlp_extract_info(url: str, youtube_client=None):
+    opts = ytdlp_base_options(youtube_client=youtube_client)
+    opts["skip_download"] = True
+    opts["noplaylist"] = True
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+def ytdlp_download(url, output_dir, *, height=None, audio=False, title_hint="video", youtube_client=None):
     platform = video_platform(url)
-    opts = ytdlp_base_options()
+    opts = ytdlp_base_options(youtube_client=youtube_client)
     opts.update({
         "format": build_ytdlp_format(height, audio, platform),
         "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
         "merge_output_format": "mp4",
         "overwrites": True,
+        "keepvideo": False,
     })
     if audio:
         opts["postprocessors"] = [{
@@ -886,186 +1056,190 @@ def ytdlp_download(url: str, output_dir: str, *, height=None, audio=False, title
             "preferredcodec": "mp3",
             "preferredquality": "192",
         }]
+
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        filepath = ydl.prepare_filename(info)
-        if audio:
-            base, _ = os.path.splitext(filepath)
-            mp3_path = base + ".mp3"
-            if os.path.exists(mp3_path):
-                filepath = mp3_path
-        else:
-            # yt-dlp can change extension after merge/postprocessing.
-            if not os.path.exists(filepath):
-                stem = os.path.splitext(filepath)[0]
-                for ext in (".mp4", ".mkv", ".webm", ".mov"):
-                    if os.path.exists(stem + ext):
-                        filepath = stem + ext
-                        break
-        if not os.path.isfile(filepath):
+        prepared = ydl.prepare_filename(info)
+        base, _ = os.path.splitext(prepared)
+        expected = base + ".mp3" if audio else prepared
+        path = _find_media_file(output_dir, expected)
+        if not path:
             raise FileNotFoundError(f"Downloaded file was not created: {title_hint}")
-        return {"path": filepath, "title": info.get("title") or title_hint, "info": info}
+        return {"path": path, "title": info.get("title") or title_hint, "info": info, "client": youtube_client}
 
 
-def piped_get_json(url: str):
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json,text/plain,*/*",
-        },
-    )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        return __import__("json").load(response)
+def _quality_list_from_info(info):
+    heights = sorted({
+        int(f["height"]) for f in (info.get("formats") or [])
+        if f.get("vcodec") not in (None, "none") and f.get("height")
+    }, reverse=True)
+    result = [q for q in VIDEO_QUALITIES if any(h >= q for h in heights)]
+    if not result and heights:
+        result = [max(heights)]
+    return result
 
 
-def piped_metadata(video_id: str):
+def youtube_direct_extract(url: str):
     errors = []
-    for api in PIPED_APIS:
+    clients = YOUTUBE_CLIENTS[:]
+    # If WebPoClient is truly available, mweb is the strongest current path.
+    # Otherwise we don't pretend it is available; direct yt-dlp still tries it
+    # but its provider simply won't be present.
+    for client in clients:
         try:
-            data = piped_get_json(f"{api}/streams/{urllib.parse.quote(video_id)}")
-            if data.get("videoStreams") or data.get("audioStreams"):
-                return data
-            errors.append(f"{api}: no streams")
+            info = ytdlp_extract_info(url, client)
+            heights = _quality_list_from_info(info)
+            if heights or any(f.get("acodec") not in (None, "none") for f in info.get("formats", [])):
+                return info, client
+            errors.append(f"{client}: no usable media formats")
         except Exception as exc:
-            errors.append(f"{api}: {exc}")
-    raise RuntimeError("All YouTube fallback services failed: " + " | ".join(errors[:3]))
+            message = str(exc).replace("\n", " ")
+            errors.append(f"{client}: {message[:360]}")
+    raise RuntimeError("YouTube direct extraction failed: " + " | ".join(errors))
 
 
-def choose_piped_video_stream(streams, target_height):
-    valid = [s for s in streams if s.get("url") and s.get("height")]
-    if not valid:
-        return None
-    progressive = [s for s in valid if not s.get("videoOnly")]
-    if progressive:
-        valid = progressive
-    below = [s for s in valid if int(s.get("height", 0)) <= target_height]
-    pool = below or valid
-    pool.sort(key=lambda s: (abs(int(s.get("height", 0)) - target_height), -int(s.get("height", 0))))
-    return pool[0]
+def youtube_direct_download(url, output_dir, *, height=None, audio=False, title_hint="YouTube video", preferred_client=None):
+    clients = []
+    if preferred_client:
+        clients.append(preferred_client)
+    clients.extend([c for c in YOUTUBE_CLIENTS if c not in clients])
+    errors = []
+    for client in clients:
+        try:
+            return ytdlp_download(url, output_dir, height=height, audio=audio, title_hint=title_hint, youtube_client=client)
+        except Exception as exc:
+            errors.append(f"{client}: {str(exc).replace(chr(10), ' ')[:360]}")
+            for name in list(os.listdir(output_dir)):
+                path = os.path.join(output_dir, name)
+                if os.path.isfile(path):
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+    raise RuntimeError("YouTube direct download failed: " + " | ".join(errors))
 
 
-def choose_piped_audio_stream(streams):
-    valid = [s for s in streams if s.get("url")]
-    if not valid:
-        return None
-    valid.sort(key=lambda s: float(s.get("bitrate") or 0), reverse=True)
-    return valid[0]
+def http_json(url, payload=None, headers=None, timeout=60):
+    hdrs = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json,text/plain,*/*",
+    }
+    if headers:
+        hdrs.update(headers)
+    if payload is None:
+        req = urllib.request.Request(url, headers=hdrs)
+    else:
+        hdrs["Content-Type"] = "application/json"
+        hdrs["Accept"] = "application/json"
+        data = __import__("json").dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        raw = response.read()
+        return __import__("json").loads(raw.decode("utf-8", errors="replace"))
 
 
-def download_url_to_file(url: str, path: str, headers=None):
-    request = urllib.request.Request(
-        url,
-        headers=headers or {
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "*/*",
-        },
-    )
-    with urllib.request.urlopen(request, timeout=30) as response, open(path, "wb") as dst:
+def cobalt_request(url, *, quality="1080", audio=False):
+    # Cobalt current API shape. API URL can be overridden by the owner.
+    payload = {
+        "url": url,
+        "vCodec": "h264",
+        "vQuality": "max" if quality == "max" else str(quality),
+        "aFormat": "mp3",
+        "isAudioOnly": bool(audio),
+        "filenamePattern": "pretty",
+        "disableMetadata": False,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if COBALT_API_KEY:
+        headers["Authorization"] = f"Api-Key {COBALT_API_KEY}"
+
+    try:
+        result = http_json(COBALT_API_URL, payload, headers=headers, timeout=90)
+    except Exception as exc:
+        raise RuntimeError(f"Cobalt API request failed: {str(exc)[:500]}") from exc
+
+    if result.get("status") == "error":
+        err = result.get("error") or {}
+        raise RuntimeError(err.get("code") or result.get("text") or "Cobalt returned an error")
+    return result
+
+
+def download_url_to_file(url, path, headers=None):
+    hdrs = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(url, headers=hdrs)
+    with urllib.request.urlopen(req, timeout=180) as response, open(path, "wb") as out:
         while True:
             chunk = response.read(1024 * 1024)
             if not chunk:
                 break
-            dst.write(chunk)
+            out.write(chunk)
 
 
-def ffmpeg_merge(video_path: str, audio_path: str, out_path: str):
-    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    cmd = [
-        ffmpeg, "-y",
-        "-i", video_path,
-        "-i", audio_path,
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-movflags", "+faststart",
-        out_path,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError((result.stderr or result.stdout or "FFmpeg merge failed")[-1500:])
-    return out_path
+def cobalt_download(url, output_dir, *, quality=1080, audio=False, title_hint="YouTube video"):
+    result = cobalt_request(url, quality=str(quality), audio=audio)
+    status = result.get("status")
+    download_url = result.get("url")
+    filename = result.get("filename") or ("audio.mp3" if audio else "video.mp4")
 
+    if status == "picker":
+        picker = result.get("picker") or []
+        candidates = [x for x in picker if x.get("url")]
+        if not candidates:
+            raise RuntimeError("Cobalt returned no downloadable picker item")
+        # Prefer video matching the requested quality when supplied.
+        if not audio:
+            requested = int(quality) if str(quality).isdigit() else 99999
+            candidates.sort(key=lambda x: abs(int(x.get("height") or requested) - requested))
+        download_url = candidates[0]["url"]
 
-def download_from_piped(meta, output_dir: str, *, height=None, audio=False):
-    title = meta.get("title") or "YouTube video"
-    if audio:
-        stream = choose_piped_audio_stream(meta.get("audioStreams") or [])
-        if not stream:
-            raise RuntimeError("YouTube fallback has no audio stream")
-        raw = os.path.join(output_dir, "audio.m4a")
-        mp3 = os.path.join(output_dir, "audio.mp3")
-        download_url_to_file(stream["url"], raw)
-        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-        result = subprocess.run([
-            ffmpeg, "-y", "-i", raw,
-            "-vn", "-c:a", "libmp3lame", "-b:a", "192k", mp3,
-        ], capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError((result.stderr or "Audio conversion failed")[-1200:])
-        return {"path": mp3, "title": title}
+    if not download_url:
+        raise RuntimeError(f"Cobalt returned no download URL (status={status!r})")
 
-    target = height or 720
-    stream = choose_piped_video_stream(meta.get("videoStreams") or [], target)
-    if not stream:
-        raise RuntimeError("YouTube fallback has no video stream")
-    video_raw = os.path.join(output_dir, "video.bin")
-    download_url_to_file(stream["url"], video_raw)
-    mime = (stream.get("mimeType") or "").lower()
-    has_audio = not bool(stream.get("videoOnly")) or mime.startswith("video/mp4") and not stream.get("videoOnly")
-    if has_audio:
-        final = os.path.join(output_dir, "video.mp4")
-        if mime == "video/mp4":
-            os.replace(video_raw, final)
-        else:
-            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-            result = subprocess.run([
-                ffmpeg, "-y", "-i", video_raw, "-c:v", "copy", "-c:a", "aac", "-movflags", "+faststart", final,
-            ], capture_output=True, text=True)
-            if result.returncode != 0:
-                raise RuntimeError((result.stderr or "Video conversion failed")[-1200:])
-            os.unlink(video_raw)
-        return {"path": final, "title": title}
-
-    audio_stream = choose_piped_audio_stream(meta.get("audioStreams") or [])
-    if not audio_stream:
-        raise RuntimeError("YouTube fallback video is video-only and no audio stream was found")
-    audio_raw = os.path.join(output_dir, "audio.bin")
-    final = os.path.join(output_dir, "video.mp4")
-    download_url_to_file(audio_stream["url"], audio_raw)
-    ffmpeg_merge(video_raw, audio_raw, final)
-    os.unlink(video_raw)
-    os.unlink(audio_raw)
-    return {"path": final, "title": title}
+    ext = ".mp3" if audio else ".mp4"
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", filename or title_hint)[:100]
+    if not os.path.splitext(safe)[1]:
+        safe += ext
+    path = os.path.join(output_dir, safe)
+    download_url_to_file(download_url, path)
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        raise RuntimeError("Cobalt returned an empty file")
+    return {"path": path, "title": title_hint, "source": "cobalt"}
 
 
 def tikwm_get_data(url: str):
     query = urllib.parse.urlencode({"url": url})
     endpoint = TIKWM_API + "?" + query
     request = urllib.request.Request(endpoint, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,*/*"})
-    with urllib.request.urlopen(request, timeout=25) as response:
+    with urllib.request.urlopen(request, timeout=30) as response:
         data = __import__("json").load(response)
     if int(data.get("code", -1)) != 0 or not data.get("data"):
         raise RuntimeError(data.get("msg") or "TikTok fallback service returned no data")
     return data["data"]
 
 
-def tikwm_download(url: str, output_dir: str, *, quality="hd", audio=False):
-    data = tikwm_get_data(url)
+def tikwm_download(url, output_dir, *, quality="hd", audio=False, data=None):
+    data = data or tikwm_get_data(url)
     title = data.get("title") or data.get("desc") or "TikTok video"
     if audio:
         media_url = data.get("music")
         if not media_url:
             raise RuntimeError("TikTok fallback has no audio URL")
-        out = os.path.join(output_dir, "tiktok_audio.mp3")
         raw = os.path.join(output_dir, "tiktok_audio.bin")
+        out = os.path.join(output_dir, "tiktok_audio.mp3")
         download_url_to_file(media_url, raw)
         ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
         result = subprocess.run([ffmpeg, "-y", "-i", raw, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", out], capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError((result.stderr or "TikTok audio conversion failed")[-1200:])
-        os.unlink(raw)
+        try:
+            os.unlink(raw)
+        except OSError:
+            pass
         return {"path": out, "title": title}
     media_url = data.get("hdplay") if quality == "hd" else data.get("play")
     media_url = media_url or data.get("play") or data.get("wmplay")
@@ -1078,72 +1252,89 @@ def tikwm_download(url: str, output_dir: str, *, quality="hd", audio=False):
 
 def extract_download_options(url: str):
     platform = video_platform(url)
-    normalized = normalize_public_url(url) if platform == "tiktok" else url
-    # Direct yt-dlp path first.
+    if platform == "unknown":
+        raise RuntimeError("Unsupported URL. Use YouTube, TikTok, Instagram, or Facebook.")
+
+    normalized = normalize_public_url(url) if platform == "tiktok" else url.strip()
+
+    if platform == "youtube":
+        direct_error = None
+        try:
+            info, client = youtube_direct_extract(normalized)
+            qualities = _quality_list_from_info(info)
+            return {
+                "source": "ytdlp",
+                "platform": "youtube",
+                "url": normalized,
+                "title": info.get("title") or "YouTube video",
+                "qualities": qualities or [360],
+                "audio": True,
+                "youtube_client": client,
+                "build": BUILD_ID,
+            }
+        except Exception as exc:
+            direct_error = str(exc)
+
+        # Don't use Piped. Use the current Cobalt endpoint only as a real API fallback.
+        return {
+            "source": "cobalt",
+            "platform": "youtube",
+            "url": normalized,
+            "title": "YouTube video",
+            "qualities": VIDEO_QUALITIES[:],
+            "audio": True,
+            "youtube_client": None,
+            "direct_error": direct_error,
+            "build": BUILD_ID,
+        }
+
     try:
-        info = extract_ytdlp_info(normalized)
-        title = info.get("title") or "Video"
-        if platform == "youtube":
-            available = set()
-            for f in info.get("formats") or []:
-                if f.get("vcodec") != "none" and f.get("height"):
-                    available.add(int(f["height"]))
-            qualities = [q for q in VIDEO_QUALITIES if any(h >= q for h in available)]
-            if not qualities and available:
-                qualities = [max(available)]
-            return {"source": "ytdlp", "platform": platform, "url": normalized, "title": title, "qualities": qualities or [720], "audio": True}
-        # For other sites, expose the qualities yt-dlp actually knows about.
-        heights = sorted({int(f["height"]) for f in info.get("formats") or [] if f.get("vcodec") != "none" and f.get("height")}, reverse=True)
-        qualities = [q for q in VIDEO_QUALITIES if any(h >= q for h in heights)]
-        return {"source": "ytdlp", "platform": platform, "url": normalized, "title": title, "qualities": qualities or [720], "audio": True}
+        info = ytdlp_extract_info(normalized)
+        qualities = _quality_list_from_info(info)
+        return {
+            "source": "ytdlp",
+            "platform": platform,
+            "url": normalized,
+            "title": info.get("title") or f"{platform.title()} video",
+            "qualities": qualities or [720],
+            "audio": True,
+        }
     except Exception as first_error:
-        if platform == "youtube":
-            vid = youtube_video_id(normalized)
-            if not vid:
-                raise RuntimeError(f"YouTube extraction failed: {first_error}")
-            piped = piped_metadata(vid)
-            heights = sorted({int(s.get("height")) for s in piped.get("videoStreams") or [] if s.get("height")}, reverse=True)
-            qualities = [q for q in VIDEO_QUALITIES if any(h >= q for h in heights)]
-            if not qualities and heights:
-                qualities = [max(heights)]
-            return {"source": "piped", "platform": platform, "url": normalized, "title": piped.get("title") or "YouTube video", "qualities": qualities or [720], "audio": bool(piped.get("audioStreams")), "piped": piped}
         if platform == "tiktok":
             data = tikwm_get_data(normalized)
-            qualities = []
+            choices = []
             if data.get("hdplay"):
-                qualities.append("hd")
-            if data.get("play"):
-                qualities.append("sd")
-            if not qualities and data.get("wmplay"):
-                qualities.append("sd")
-            if not qualities:
+                choices.append("hd")
+            if data.get("play") or data.get("wmplay"):
+                choices.append("sd")
+            if not choices:
                 raise RuntimeError(f"TikTok extraction failed: {first_error}")
-            return {"source": "tikwm", "platform": platform, "url": normalized, "title": data.get("title") or data.get("desc") or "TikTok video", "qualities": qualities, "audio": bool(data.get("music")), "tikwm": data}
+            return {
+                "source": "tikwm",
+                "platform": platform,
+                "url": normalized,
+                "title": data.get("title") or data.get("desc") or "TikTok video",
+                "qualities": choices,
+                "audio": bool(data.get("music")),
+                "tikwm": data,
+            }
         raise RuntimeError(f"Extraction failed: {first_error}")
 
 
 def format_bytes(value):
-    value = float(value or 0)
-    units = ["B", "KB", "MB", "GB"]
-    idx = 0
-    while value >= 1024 and idx < len(units) - 1:
+    value = float(value)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.1f} {unit}"
         value /= 1024
-        idx += 1
-    return f"{value:.1f} {units[idx]}"
 
 
 def video_quality_keyboard(job):
     buttons = []
-    platform = job["platform"]
-    if platform == "tiktok" and job["source"] == "tikwm":
-        if "hd" in job["qualities"]:
-            buttons.append(InlineKeyboardButton("🎥 HD", callback_data="vd_q_hd"))
-        if "sd" in job["qualities"]:
-            buttons.append(InlineKeyboardButton("🎥 SD", callback_data="vd_q_sd"))
-    else:
-        for q in job.get("qualities", []):
-            buttons.append(InlineKeyboardButton(f"🎥 {q}p", callback_data=f"vd_q_{q}"))
-    rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)] if buttons else []
+    for q in job.get("qualities", []):
+        label = f"🎥 {q}p" if isinstance(q, int) else f"🎥 {q.upper()}"
+        buttons.append(InlineKeyboardButton(label, callback_data=f"vd_q_{q}"))
+    rows = [buttons[i:i+3] for i in range(0, len(buttons), 3)] if buttons else []
     if job.get("audio"):
         rows.append([InlineKeyboardButton("🎵 Audio / MP3", callback_data="vd_q_audio")])
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data="vd_cancel")])
@@ -1164,32 +1355,28 @@ async def handle_video_download(update, context):
         job["chat_id"] = update.effective_chat.id
         context.user_data["video_job"] = job
         context.user_data["state"] = None
-        title = job.get("title") or "Video"
-        platform = job["platform"].title()
-        safe_title = html.escape(title[:120])
+        note = ""
+        if job.get("source") == "cobalt":
+            note = "\n\n⚙️ Direct YouTube extraction was unavailable on this server, so the Cobalt API fallback is ready."
         await status_msg.edit_text(
-            f"🎬 <b>{html.escape(platform)} Downloader</b>\n\n"
-            f"<b>{safe_title}</b>\n\n"
-            "Choose the quality you want:",
+            f"🎬 <b>{html.escape(job['platform'].title())} Downloader</b>\n\n"
+            f"<b>{html.escape((job.get('title') or 'Video')[:160])}</b>\n\n"
+            f"Choose the quality:{note}",
             reply_markup=video_quality_keyboard(job),
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
         context.user_data["state"] = None
-        msg = str(e)
-        if "Sign in to confirm" in msg or "LOGIN_REQUIRED" in msg:
-            msg = (
-                "YouTube is currently requiring authentication from this server. "
-                "The bot already tried its normal extractor and the public fallback. "
-                "For videos that remain protected, the supported option is to provide "
-                "a fresh cookies file through YTDLP_COOKIES_FILE."
-            )
-        await status_msg.edit_text(f"❌ Could not prepare download.\n\n{msg[:900]}")
+        await status_msg.edit_text("❌ Could not prepare download.\n\n" + html.escape(str(e)[:3500]), parse_mode=ParseMode.HTML)
 
 
 async def handle_video_callback(update, context, data):
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
     if data == "vd_cancel":
         context.user_data.pop("video_job", None)
         await query.edit_message_text("❌ Video download cancelled.")
@@ -1202,70 +1389,93 @@ async def handle_video_callback(update, context, data):
 
     selected = data.removeprefix("vd_q_")
     output_dir = tempfile.mkdtemp(prefix="tg_video_")
-    status_msg = await query.message.reply_text("⏳ Preparing your download…")
-    filepath = None
+    status_msg = await query.message.reply_text("⏳ Downloading…")
+
+    def clean_dir():
+        for name in list(os.listdir(output_dir)):
+            path = os.path.join(output_dir, name)
+            if os.path.isfile(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
     try:
         await query.edit_message_reply_markup(reply_markup=None)
-        if selected == "audio":
-            quality = None
-            audio = True
-        elif job["source"] == "tikwm":
-            quality = selected if selected in {"hd", "sd"} else "sd"
-            audio = False
-        else:
-            quality = int(selected)
-            audio = False
+        audio = selected == "audio"
+        quality = None if audio else selected
 
         def do_download():
-            if job["source"] == "ytdlp":
-                return ytdlp_download(job["url"], output_dir, height=quality, audio=audio, title_hint=job.get("title", "video"))
-            if job["source"] == "piped":
-                return download_from_piped(job["piped"], output_dir, height=quality, audio=audio)
-            if job["source"] == "tikwm":
-                return tikwm_download(job["url"], output_dir, quality=quality, audio=audio)
-            raise RuntimeError("Unknown download source")
+            platform = job["platform"]
+            source = job["source"]
+            if source == "cobalt":
+                q = 1080 if audio else int(quality)
+                return cobalt_download(job["url"], output_dir, quality=q, audio=audio, title_hint=job.get("title", "YouTube video"))
+            if platform == "youtube":
+                return youtube_direct_download(
+                    job["url"], output_dir,
+                    height=None if audio else int(quality),
+                    audio=audio,
+                    title_hint=job.get("title", "YouTube video"),
+                    preferred_client=job.get("youtube_client"),
+                )
+            if source == "tikwm":
+                q = quality if quality in {"hd", "sd"} else "sd"
+                return tikwm_download(job["url"], output_dir, quality=q, audio=audio, data=job.get("tikwm"))
+            return ytdlp_download(
+                job["url"], output_dir,
+                audio=audio,
+                height=None if audio else int(quality),
+                title_hint=job.get("title", "video"),
+            )
 
         result = await asyncio.to_thread(do_download)
         filepath = result["path"]
-        if not os.path.isfile(filepath):
-            raise FileNotFoundError("Downloaded file was not created")
-
         file_size = os.path.getsize(filepath)
+
+        if file_size > VIDEO_MAX_UPLOAD and not audio:
+            candidates = [q for q in job.get("qualities", VIDEO_QUALITIES) if isinstance(q, int) and q < int(quality)]
+            for q in candidates:
+                clean_dir()
+                try:
+                    if job["source"] == "cobalt":
+                        candidate = await asyncio.to_thread(cobalt_download, job["url"], output_dir, quality=q, audio=False, title_hint=job.get("title", "YouTube video"))
+                    elif job["platform"] == "youtube":
+                        candidate = await asyncio.to_thread(youtube_direct_download, job["url"], output_dir, height=q, audio=False, title_hint=job.get("title", "YouTube video"), preferred_client=job.get("youtube_client"))
+                    else:
+                        candidate = await asyncio.to_thread(ytdlp_download, job["url"], output_dir, height=q, audio=False, title_hint=job.get("title", "video"))
+                    cpath = candidate["path"]
+                    csize = os.path.getsize(cpath)
+                    if csize <= VIDEO_MAX_UPLOAD:
+                        result, filepath, file_size, quality = candidate, cpath, csize, q
+                        break
+                except Exception:
+                    continue
+
         if file_size > VIDEO_MAX_UPLOAD:
-            # Automatic quality fallback for videos: retry one step lower.
-            if not audio and job.get("platform") == "youtube":
-                lower = [q for q in VIDEO_QUALITIES if q < (quality or 999)]
-                if lower:
-                    await status_msg.edit_text("📦 That quality is over Telegram's 50 MB bot upload limit. Trying the next lower quality…")
-                    for q in lower:
-                        try:
-                            for name in os.listdir(output_dir):
-                                path = os.path.join(output_dir, name)
-                                if os.path.isfile(path):
-                                    os.unlink(path)
-                            result = await asyncio.to_thread(do_download_for_quality, job, output_dir, q)
-                            filepath = result["path"]
-                            if os.path.getsize(filepath) <= VIDEO_MAX_UPLOAD:
-                                quality = q
-                                file_size = os.path.getsize(filepath)
-                                break
-                        except Exception:
-                            continue
-                
-            if file_size > VIDEO_MAX_UPLOAD:
-                raise RuntimeError(
-                    f"The selected file is {format_bytes(file_size)}, above Telegram's current 50 MB bot upload limit."
-                )
+            raise RuntimeError(
+                f"Downloaded file is {format_bytes(file_size)} and exceeds Telegram's 50 MB bot upload limit."
+            )
 
         caption = f"✅ {job.get('title', 'Video')[:900]}"
         with open(filepath, "rb") as media:
             if audio:
-                await query.message.reply_audio(audio=media, filename=os.path.basename(filepath), caption=caption, reply_markup=tool_done_kb())
+                await query.message.reply_audio(
+                    audio=media,
+                    filename=os.path.basename(filepath),
+                    caption=caption,
+                    reply_markup=tool_done_kb(),
+                )
             else:
-                await query.message.reply_video(video=media, caption=caption, supports_streaming=True, reply_markup=tool_done_kb())
+                await query.message.reply_video(
+                    video=media,
+                    caption=caption,
+                    supports_streaming=True,
+                    reply_markup=tool_done_kb(),
+                )
         await status_msg.edit_text("✅ Download completed successfully!")
     except Exception as e:
-        await status_msg.edit_text(f"❌ Download failed.\n\n{str(e)[:1000]}")
+        await status_msg.edit_text("❌ Download failed.\n\n" + html.escape(str(e)[:3500]), parse_mode=ParseMode.HTML)
     finally:
         context.user_data.pop("video_job", None)
         try:
@@ -1274,15 +1484,6 @@ async def handle_video_callback(update, context, data):
         except Exception:
             pass
 
-
-def do_download_for_quality(job, output_dir, quality):
-    if job["source"] == "ytdlp":
-        return ytdlp_download(job["url"], output_dir, height=quality, audio=False, title_hint=job.get("title", "video"))
-    if job["source"] == "piped":
-        return download_from_piped(job["piped"], output_dir, height=quality, audio=False)
-    if job["source"] == "tikwm":
-        return tikwm_download(job["url"], output_dir, quality="hd" if quality >= 720 else "sd", audio=False)
-    raise RuntimeError("Unknown download source")
 
 # --- PDF, WORD, IMAGE COLLECT ---
 async def handle_pdf_upload(update, context):
@@ -1727,6 +1928,7 @@ async def handle_link(update, context):
 
 # --- MAIN EXECUTION ---
 async def main():
+    print(f"Starting bot build: {BUILD_ID}")
     init_db()
     def keep_alive():
         while True:
