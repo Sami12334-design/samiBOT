@@ -856,31 +856,25 @@ async def handle_voice_to_text(update, context, language):
         await status_msg.edit_text(f"❌ Transcription failed: {e}")
         context.user_data['state'] = None
 
-# --- ROBUST MULTI-SOURCE VIDEO DOWNLOADER ---
-# Build: yt-fix-2026-09-02-v7
+# --- VIDEO DOWNLOADER (YOUTUBE VIA MANAGED DOWNLOAD API) ---
+# Build: render-python314-2026-09-02-v8
 #
-# YouTube strategy (no Piped and no Cobalt):
-#   1) web_embedded (good for public embeddable videos; no PO token required)
-#   2) android_vr (format 18 fallback for public videos)
-#   3) web_safari (HLS fallback where available)
-#   4) optional authenticated cookies / proxy / PO-token through environment vars
-#
-# This deliberately does NOT use fake/unstable third-party downloader services.
+# YouTube is handled by a managed download service instead of asking the
+# Render datacenter IP to directly defeat YouTube's bot checks.  The API
+# creates a download job, we poll it, then stream the final file to Telegram.
+# TikTok / Instagram / Facebook continue to use the local yt-dlp/TikWM paths.
 
 VIDEO_MAX_UPLOAD = 50 * 1024 * 1024
 VIDEO_QUALITIES = [1080, 720, 480, 360, 240]
 TIKWM_API = "https://www.tikwm.com/api/"
-BUILD_ID = "render-python314-2026-09-02-v7"
+BUILD_ID = "render-python314-2026-09-02-v8"
 
-# The first two are deliberately the simplest current YouTube clients.
-# android_vr's legacy H.264/AAC format 18 is useful as a no-token fallback.
-YOUTUBE_INFO_CLIENTS = ["web_embedded", "android_vr", "web_safari"]
-YOUTUBE_DOWNLOAD_CLIENTS = ["web_embedded", "android_vr", "web_safari"]
-
-YTDLP_COOKIES_FILE = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
-YOUTUBE_PROXY = os.environ.get("YOUTUBE_PROXY", "").strip()
-YOUTUBE_PO_TOKEN = os.environ.get("YOUTUBE_PO_TOKEN", "").strip()
-YOUTUBE_PO_CONTEXT = os.environ.get("YOUTUBE_PO_CONTEXT", "").strip()
+# Managed YouTube Download API (Video Download API / SaveNow API)
+YOUTUBE_API_BASE = os.environ.get("YOUTUBE_API_BASE", "https://p.savenow.to").strip().rstrip("/")
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "").strip()
+YOUTUBE_API_TIMEOUT = 45
+YOUTUBE_POLL_SECONDS = 3
+YOUTUBE_MAX_POLL_SECONDS = 15 * 60
 
 
 def video_platform(url: str) -> str:
@@ -899,24 +893,7 @@ def video_platform(url: str) -> str:
 
 def normalize_public_url(url: str) -> str:
     url = (url or "").strip()
-    # Resolve common short URLs, but do not fail just because a remote redirect
-    # server rejects the request. yt-dlp can often resolve the original URL.
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.8",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=12) as response:
-            return response.geturl() or url
-    except Exception:
-        return url
+    return url
 
 
 def ytdlp_base_options(*, youtube_client=None):
@@ -931,64 +908,12 @@ def ytdlp_base_options(*, youtube_client=None):
         "concurrent_fragment_downloads": 2,
         "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
         "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/139.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.8",
         },
-        # Modern yt-dlp can fetch EJS challenge code from GitHub.
         "remote_components": {"ejs:github"},
     }
-
-    if YTDLP_COOKIES_FILE and os.path.isfile(YTDLP_COOKIES_FILE):
-        options["cookiefile"] = YTDLP_COOKIES_FILE
-
-    if YOUTUBE_PROXY:
-        options["proxy"] = YOUTUBE_PROXY
-
-    extractor_args = {}
-    if youtube_client:
-        extractor_args["youtube"] = {"player_client": [youtube_client]}
-        # A manually supplied PO token is only used when the operator provides
-        # a matching context. Never invent or rotate tokens in code.
-        if YOUTUBE_PO_TOKEN and YOUTUBE_PO_CONTEXT:
-            extractor_args["youtube"]["po_token"] = [f"{YOUTUBE_PO_CONTEXT}+{YOUTUBE_PO_TOKEN}"]
-    if extractor_args:
-        options["extractor_args"] = extractor_args
-
     return options
-
-
-def build_ytdlp_format(height=None, audio=False, platform="unknown", youtube_client=None):
-    if audio:
-        return "bestaudio/best"
-
-    if platform == "youtube":
-        # For android_vr specifically, format 18 is intentionally preferred as
-        # the simple no-token fallback. It is H.264 + AAC and already merged.
-        if youtube_client == "android_vr":
-            if height is None or height <= 360:
-                return "18/best[height<=360]/best"
-            # Try a requested quality if a PO token makes richer formats usable,
-            # but retain format 18 as the final fallback.
-            return (
-                f"bestvideo[height<={height}][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
-                f"best[height<={height}][ext=mp4]/18/best[height<=360]/best"
-            )
-
-        # H.264/M4A first for broad device compatibility.
-        if height:
-            return (
-                f"bestvideo[height<={height}][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
-                f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
-                f"best[height<={height}][ext=mp4]/best[height<={height}]/best"
-            )
-        return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-
-    if height:
-        return f"best[height<={height}]/best"
-    return "bestvideo+bestaudio/best"
 
 
 def _find_media_file(output_dir: str, preferred=None):
@@ -1013,31 +938,24 @@ def _clean_dir(output_dir):
                 pass
 
 
-def ytdlp_extract_info(url: str, youtube_client=None):
-    opts = ytdlp_base_options(youtube_client=youtube_client)
-    opts["skip_download"] = True
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
-
-
 def ytdlp_download(url, output_dir, *, height=None, audio=False, title_hint="video", youtube_client=None):
+    """Used for TikTok/Instagram/Facebook. YouTube uses the managed API below."""
     platform = video_platform(url)
-    opts = ytdlp_base_options(youtube_client=youtube_client)
-    opts.update({
-        "format": build_ytdlp_format(height, audio, platform, youtube_client),
-        "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
-        "merge_output_format": "mp4",
-        "overwrites": True,
-        "keepvideo": False,
-    })
-
+    opts = ytdlp_base_options(youtube_client=None)
     if audio:
+        opts["format"] = "bestaudio/best"
         opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
             "preferredquality": "192",
         }]
-
+    else:
+        opts["format"] = f"best[height<={height}]/best" if height else "best/best"
+    opts.update({
+        "outtmpl": os.path.join(output_dir, "%(.id)s.%(ext)s") if False else os.path.join(output_dir, "%(id)s.%(ext)s"),
+        "merge_output_format": "mp4",
+        "overwrites": True,
+    })
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         prepared = ydl.prepare_filename(info)
@@ -1046,107 +964,109 @@ def ytdlp_download(url, output_dir, *, height=None, audio=False, title_hint="vid
         path = _find_media_file(output_dir, expected)
         if not path:
             raise FileNotFoundError(f"Downloaded file was not created: {title_hint}")
-        return {"path": path, "title": info.get("title") or title_hint, "info": info, "client": youtube_client}
+        return {"path": path, "title": info.get("title") or title_hint, "info": info}
 
 
-def _quality_list_from_info(info):
-    heights = sorted({
-        int(f["height"]) for f in (info.get("formats") or [])
-        if f.get("vcodec") not in (None, "none") and f.get("height")
-    }, reverse=True)
-    result = [q for q in VIDEO_QUALITIES if any(h >= q for h in heights)]
-    if not result and heights:
-        result = [max(heights)]
-    return result
-
-
-def _has_audio(info):
-    return any(f.get("acodec") not in (None, "none") for f in (info.get("formats") or []))
-
-
-def youtube_direct_extract(url: str):
-    errors = []
-    for client in YOUTUBE_INFO_CLIENTS:
-        try:
-            info = ytdlp_extract_info(url, client)
-            qualities = _quality_list_from_info(info)
-            if qualities or _has_audio(info):
-                # Avoid advertising a quality that is not actually present.
-                return info, client
-            errors.append(f"{client}: no usable media formats")
-        except Exception as exc:
-            errors.append(f"{client}: {str(exc).replace(chr(10), ' ')[:320]}")
-
-    # Final attempt using yt-dlp's own current client selection.
+def _json_or_text(response):
+    raw = response.read()
+    text = raw.decode("utf-8", "replace")
     try:
-        info = ytdlp_extract_info(url, None)
-        qualities = _quality_list_from_info(info)
-        if qualities or _has_audio(info):
-            return info, None
-        errors.append("default: no usable media formats")
-    except Exception as exc:
-        errors.append(f"default: {str(exc).replace(chr(10), ' ')[:320]}")
-
-    raise RuntimeError("YouTube extraction failed: " + " | ".join(errors))
+        import json
+        return json.loads(text)
+    except Exception:
+        # Some legacy services return query-string/plain text on failure.
+        return {"raw": text}
 
 
-def youtube_direct_download(url, output_dir, *, height=None, audio=False, title_hint="YouTube video", preferred_client=None):
-    clients = []
-    if preferred_client:
-        clients.append(preferred_client)
-    clients.extend([c for c in YOUTUBE_DOWNLOAD_CLIENTS if c not in clients])
-    clients.append(None)  # yt-dlp's own default client selection
-
-    errors = []
-    for client in clients:
-        try:
-            return ytdlp_download(
-                url,
-                output_dir,
-                height=height,
-                audio=audio,
-                title_hint=title_hint,
-                youtube_client=client,
-            )
-        except Exception as exc:
-            errors.append(f"{client or 'default'}: {str(exc).replace(chr(10), ' ')[:340]}")
-            _clean_dir(output_dir)
-
-    raise RuntimeError("YouTube download failed: " + " | ".join(errors))
+def _api_success(data):
+    value = data.get("success")
+    return value is True or value == 1 or value == "1" or value == "true"
 
 
-def tikwm_get_data(url: str):
-    query = urllib.parse.urlencode({"url": url})
-    endpoint = TIKWM_API + "?" + query
-    request = urllib.request.Request(
+def youtube_api_create_job(url: str, selected: str):
+    if not YOUTUBE_API_KEY:
+        raise RuntimeError(
+            "YOUTUBE_API_KEY is not configured. Create a Video Download API key and add it to Render environment variables."
+        )
+
+    params = {
+        "url": url,
+        "apikey": YOUTUBE_API_KEY,
+        "add_info": "1",
+    }
+    if selected == "audio":
+        params.update({"format": "mp3", "audio_quality": "192"})
+    else:
+        params.update({"format": str(selected), "allow_extended_duration": "0", "no_merge": "0"})
+
+    endpoint = f"{YOUTUBE_API_BASE}/ajax/download.php?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(
         endpoint,
-        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,*/*"},
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json,text/plain,*/*",
+        },
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        data = __import__("json").load(response)
-    if int(data.get("code", -1)) != 0 or not data.get("data"):
-        raise RuntimeError(data.get("msg") or "TikTok fallback service returned no data")
-    return data["data"]
+    with urllib.request.urlopen(req, timeout=YOUTUBE_API_TIMEOUT) as response:
+        data = _json_or_text(response)
+
+    if isinstance(data, dict) and _api_success(data):
+        job_id = data.get("id") or data.get("download_id") or data.get("job_id")
+        if not job_id:
+            raise RuntimeError(f"YouTube API accepted the request but returned no job id: {data}")
+        info = data.get("info") or {}
+        return str(job_id), info
+
+    message = ""
+    if isinstance(data, dict):
+        message = data.get("error") or data.get("message") or data.get("text") or data.get("raw") or str(data)
+    else:
+        message = str(data)
+    raise RuntimeError(f"YouTube API rejected the download request: {message[:1200]}")
 
 
-def tikwm_download(url, output_dir, *, quality="hd", audio=False, data=None):
-    data = data or tikwm_get_data(url)
-    title = data.get("title") or data.get("desc") or "TikTok video"
-    if audio:
-        media_url = data.get("music")
-        if not media_url:
-            raise RuntimeError("TikTok audio URL was not returned")
-        path = os.path.join(output_dir, "audio.mp3")
-        download_url_to_file(media_url, path)
-        return {"path": path, "title": title, "source": "tikwm"}
+def youtube_api_poll(job_id: str):
+    endpoint = f"{YOUTUBE_API_BASE}/ajax/progress.php?id={urllib.parse.quote(str(job_id))}"
+    started = time.time()
+    last_error = None
+    while time.time() - started < YOUTUBE_MAX_POLL_SECONDS:
+        req = urllib.request.Request(
+            endpoint,
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,text/plain,*/*"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=YOUTUBE_API_TIMEOUT) as response:
+                data = _json_or_text(response)
+        except Exception as exc:
+            last_error = str(exc)
+            time.sleep(YOUTUBE_POLL_SECONDS)
+            continue
 
-    media_url = data.get("hdplay") if quality == "hd" else None
-    media_url = media_url or data.get("play") or data.get("wmplay")
-    if not media_url:
-        raise RuntimeError("TikTok video URL was not returned")
-    path = os.path.join(output_dir, "video.mp4")
-    download_url_to_file(media_url, path)
-    return {"path": path, "title": title, "source": "tikwm"}
+        if not isinstance(data, dict):
+            time.sleep(YOUTUBE_POLL_SECONDS)
+            continue
+
+        download_url = data.get("download_url") or data.get("url") or data.get("downloadUrl")
+        try:
+            progress = int(float(data.get("progress", 0)))
+        except Exception:
+            progress = 0
+
+        if download_url and (progress >= 1000 or data.get("success") in (True, 1, "1", "true")):
+            return download_url, data
+
+        text_value = str(data.get("text", "")).lower()
+        if data.get("success") in (False, 0, "0", "false") and text_value:
+            raise RuntimeError(text_value[:1200])
+        if "failed" in text_value:
+            raise RuntimeError(text_value[:1200])
+
+        time.sleep(YOUTUBE_POLL_SECONDS)
+
+    raise RuntimeError(
+        f"YouTube download API timed out after {YOUTUBE_MAX_POLL_SECONDS // 60} minutes"
+        + (f" ({last_error})" if last_error else "")
+    )
 
 
 def download_url_to_file(url, path, headers=None):
@@ -1162,6 +1082,61 @@ def download_url_to_file(url, path, headers=None):
             out.write(chunk)
 
 
+def youtube_api_download(url: str, output_dir: str, selected: str, title_hint="YouTube video"):
+    job_id, info = youtube_api_create_job(url, selected)
+    download_url, progress_data = youtube_api_poll(job_id)
+    ext = ".mp3" if selected == "audio" else ".mp4"
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", str(job_id))
+    path = os.path.join(output_dir, f"youtube_{safe_id}{ext}")
+    download_url_to_file(download_url, path)
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        raise RuntimeError("YouTube API returned an empty file")
+    title = (info.get("title") if isinstance(info, dict) else None) or title_hint
+    return {"path": path, "title": title, "info": info, "source": "managed_api", "progress": progress_data}
+
+
+def tikwm_get_data(url):
+    payload = urllib.parse.urlencode({"url": url, "hd": 1}).encode()
+    req = urllib.request.Request(TIKWM_API, data=payload, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,*/*"})
+    with urllib.request.urlopen(req, timeout=30) as response:
+        import json
+        data = json.load(response)
+    if int(data.get("code", -1)) != 0 or not data.get("data"):
+        raise RuntimeError(data.get("msg") or "TikTok fallback service returned no data")
+    return data["data"]
+
+
+def tikwm_download(url, output_dir, *, quality="hd", audio=False, data=None):
+    data = data or tikwm_get_data(url)
+    title = data.get("title") or data.get("desc") or "TikTok video"
+    if audio:
+        media_url = data.get("music")
+        if not media_url:
+            raise RuntimeError("TikTok audio URL was not returned")
+        path = os.path.join(output_dir, "audio.mp3")
+        download_url_to_file(media_url, path)
+        return {"path": path, "title": title, "source": "tikwm"}
+    media_url = data.get("hdplay") if quality == "hd" else None
+    media_url = media_url or data.get("play") or data.get("wmplay")
+    if not media_url:
+        raise RuntimeError("TikTok video URL was not returned")
+    path = os.path.join(output_dir, "video.mp4")
+    download_url_to_file(media_url, path)
+    return {"path": path, "title": title, "source": "tikwm"}
+
+
+def _quality_list_from_info(info):
+    heights = sorted({
+        int(f["height"]) for f in (info.get("formats") or [])
+        if f.get("vcodec") not in (None, "none") and f.get("height")
+    }, reverse=True)
+    return [q for q in VIDEO_QUALITIES if any(h >= q for h in heights)]
+
+
+def _has_audio(info):
+    return any(f.get("acodec") not in (None, "none") for f in (info.get("formats") or []))
+
+
 def extract_download_options(url: str):
     normalized = normalize_public_url(url)
     platform = video_platform(normalized)
@@ -1169,23 +1144,20 @@ def extract_download_options(url: str):
         raise RuntimeError("Unsupported URL. Use YouTube, TikTok, Instagram, or Facebook.")
 
     if platform == "youtube":
-        info, client = youtube_direct_extract(normalized)
-        qualities = _quality_list_from_info(info)
-        # A public no-token YouTube fallback may only expose 360p (format 18).
-        if not qualities and _has_audio(info):
-            qualities = [360]
+        # Managed API does the actual YouTube retrieval. We present the supported
+        # quality buttons directly and validate availability when the user picks.
         return {
-            "source": "ytdlp",
+            "source": "managed_api",
             "platform": platform,
             "url": normalized,
-            "title": info.get("title") or "YouTube video",
-            "qualities": qualities or [360],
+            "title": "YouTube video",
+            "qualities": [1080, 720, 480, 360, 240],
             "audio": True,
-            "youtube_client": client,
         }
 
     try:
-        info = ytdlp_extract_info(normalized)
+        with yt_dlp.YoutubeDL(ytdlp_base_options()) as ydl:
+            info = ydl.extract_info(normalized, download=False)
         qualities = _quality_list_from_info(info)
         return {
             "source": "ytdlp",
@@ -1245,7 +1217,7 @@ async def handle_video_download(update, context):
         await update.message.reply_text("❌ Please send a valid YouTube, TikTok, Instagram, or Facebook URL.")
         return
 
-    status_msg = await update.message.reply_text("🔎 Checking the video and available qualities…")
+    status_msg = await update.message.reply_text("🔎 Checking the video…")
     try:
         job = await asyncio.to_thread(extract_download_options, raw_url)
         context.user_data["video_job"] = job
@@ -1284,7 +1256,7 @@ async def handle_video_callback(update, context, data):
 
     selected = data.removeprefix("vd_q_")
     output_dir = tempfile.mkdtemp(prefix="tg_video_")
-    status_msg = await query.message.reply_text("⏳ Downloading…")
+    status_msg = await query.message.reply_text("⏳ Starting download…")
 
     try:
         await query.edit_message_reply_markup(reply_markup=None)
@@ -1294,14 +1266,12 @@ async def handle_video_callback(update, context, data):
         def do_download():
             platform = job["platform"]
             source = job["source"]
-            if platform == "youtube":
-                return youtube_direct_download(
+            if platform == "youtube" and source == "managed_api":
+                return youtube_api_download(
                     job["url"],
                     output_dir,
-                    height=requested_quality,
-                    audio=audio,
+                    "audio" if audio else str(requested_quality),
                     title_hint=job.get("title", "YouTube video"),
-                    preferred_client=job.get("youtube_client"),
                 )
             if source == "tikwm":
                 q = selected if selected in {"hd", "sd"} else "sd"
@@ -1318,24 +1288,17 @@ async def handle_video_callback(update, context, data):
         filepath = result["path"]
         file_size = os.path.getsize(filepath)
 
-        # If the requested file is too large, step down through qualities that
-        # actually exist in the extraction result.
-        if file_size > VIDEO_MAX_UPLOAD and not audio:
-            candidates = [
-                q for q in job.get("qualities", [])
-                if isinstance(q, int) and q < int(requested_quality)
-            ]
-            for q in candidates:
+        if file_size > VIDEO_MAX_UPLOAD and not audio and requested_quality:
+            lower = [q for q in VIDEO_QUALITIES if q < requested_quality]
+            for q in lower:
                 _clean_dir(output_dir)
                 try:
                     candidate = await asyncio.to_thread(
-                        youtube_direct_download if job["platform"] == "youtube" else ytdlp_download,
+                        youtube_api_download if job["platform"] == "youtube" and job["source"] == "managed_api" else ytdlp_download,
                         job["url"],
                         output_dir,
-                        height=q,
-                        audio=False,
-                        title_hint=job.get("title", "video"),
-                        **({"preferred_client": job.get("youtube_client")} if job["platform"] == "youtube" else {}),
+                        str(q) if job["platform"] == "youtube" and job["source"] == "managed_api" else q,
+                        **({"title_hint": job.get("title", "video")} if job["platform"] == "youtube" and job["source"] == "managed_api" else {"audio": False, "height": q, "title_hint": job.get("title", "video")}),
                     )
                     cpath = candidate["path"]
                     csize = os.path.getsize(cpath)
@@ -1375,6 +1338,7 @@ async def handle_video_callback(update, context, data):
     finally:
         context.user_data.pop("video_job", None)
         shutil.rmtree(output_dir, ignore_errors=True)
+
 
 # --- PDF, WORD, IMAGE COLLECT ---
 async def handle_pdf_upload(update, context):
