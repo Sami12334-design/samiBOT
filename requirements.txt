@@ -4,7 +4,7 @@ flask
 pymupdf
 pdf2docx
 img2pdf
-yt-dlp
+yt-dlp>=2025.1.1
 Pillow
 SpeechRecognition
 imageio-ffmpeg
@@ -14,3 +14,4 @@ python-pptx
 reportlab
 rembg
 onnxruntime
+curl_cffi
