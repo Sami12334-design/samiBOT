@@ -33,16 +33,6 @@ import imageio_ffmpeg
 from groq import Groq
 import edge_tts
 
-# Render compatibility: rapidocr-onnxruntime 1.4.4 requires Python < 3.13.
-if sys.version_info >= (3, 13):
-    raise RuntimeError(
-        f"Unsupported Python {sys.version.split()[0]}. "
-        "Use Python 3.12 on Render (see .python-version)."
-    )
-
-BUILD_ID = "render-fix-2026-09-02-v6"
-print(f"Starting bot build: {BUILD_ID} | Python: {sys.version.split()[0]}")
-
 try:
     from telethon.tl.functions.stories import GetPeerStoriesRequest, GetStoriesByIDRequest
 except ImportError:
@@ -867,7 +857,7 @@ async def handle_voice_to_text(update, context, language):
         context.user_data['state'] = None
 
 # --- ROBUST MULTI-SOURCE VIDEO DOWNLOADER ---
-# Build: yt-fix-2026-09-02-v5
+# Build: yt-fix-2026-09-02-v7
 #
 # YouTube strategy (no Piped and no Cobalt):
 #   1) web_embedded (good for public embeddable videos; no PO token required)
@@ -880,7 +870,7 @@ async def handle_voice_to_text(update, context, language):
 VIDEO_MAX_UPLOAD = 50 * 1024 * 1024
 VIDEO_QUALITIES = [1080, 720, 480, 360, 240]
 TIKWM_API = "https://www.tikwm.com/api/"
-BUILD_ID = "yt-fix-2026-09-02-v5"
+BUILD_ID = "render-python314-2026-09-02-v7"
 
 # The first two are deliberately the simplest current YouTube clients.
 # android_vr's legacy H.264/AAC format 18 is useful as a no-token fallback.
@@ -1452,25 +1442,90 @@ async def handle_pdf_to_word(update, context):
         await status_msg.edit_text(f"❌ Conversion failed: {e}"); context.user_data['state'] = None
 
 async def handle_image_to_text(update, context):
-    if context.user_data.get('state') != 'awaiting_image_to_text': return
+    """OCR using Groq vision so the bot stays compatible with Render Python 3.14.
+    This removes the incompatible rapidocr-onnxruntime dependency.
+    """
+    if context.user_data.get('state') != 'awaiting_image_to_text':
+        return
     if not update.message.photo:
-        await update.message.reply_text("❌ Please upload an image."); return
-    status_msg = await update.message.reply_text("⏳ Extracting text from image...")
+        await update.message.reply_text("❌ Please upload an image.")
+        return
+
+    status_msg = await update.message.reply_text("⏳ Extracting text from image with AI OCR...")
+    if not GROQ_API_KEY:
+        await status_msg.edit_text(
+            "❌ Image-to-Text is not configured. Set GROQ_API_KEY in Render Environment Variables."
+        )
+        context.user_data['state'] = None
+        return
+
+    tmp_path = None
     try:
-        from rapidocr_onnxruntime import RapidOCR
-        ocr = RapidOCR()
-        photo = update.message.photo[-1]; file = await context.bot.get_file(photo.file_id)
-        img_bytes = BytesIO(); await file.download_to_memory(img_bytes); img_bytes.seek(0)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_img:
-            tmp_img.write(img_bytes.read()); tmp_img_path = tmp_img.name
-        result, elapse = ocr(tmp_img_path); os.unlink(tmp_img_path)
-        if not result:
-            await status_msg.edit_text("❌ No text found in the image."); return
-        extracted_text = "\n".join([line[1] for line in result])
-        await update.message.reply_text(f"📝 **Extracted Text:**\n\n{extracted_text}", reply_markup=tool_done_kb())
-        await status_msg.edit_text("✅ Text extraction complete!"); context.user_data['state'] = None
+        photo = update.message.photo[-1]
+        tg_file = await context.bot.get_file(photo.file_id)
+        img_bytes = BytesIO()
+        await tg_file.download_to_memory(img_bytes)
+        img_bytes.seek(0)
+
+        # Groq accepts base64 data URLs for local images. Keep the payload
+        # comfortably below the documented 20 MB image limit.
+        img = Image.open(img_bytes).convert('RGB')
+        max_side = 2400
+        img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+        encoded = BytesIO()
+        img.save(encoded, format='JPEG', quality=88, optimize=True)
+        import base64
+        data_url = 'data:image/jpeg;base64,' + base64.b64encode(encoded.getvalue()).decode('ascii')
+
+        client = Groq(api_key=GROQ_API_KEY)
+        completion = await asyncio.to_thread(
+            lambda: client.chat.completions.create(
+                model=os.environ.get('GROQ_VISION_MODEL', 'qwen/qwen3.6-27b'),
+                messages=[
+                    {
+                        'role': 'user',
+                        'content': [
+                            {
+                                'type': 'text',
+                                'text': (
+                                    'Transcribe all readable text in this image exactly. '
+                                    'Preserve line breaks as much as possible. Do not summarize. '
+                                    'If there is no readable text, return NO_TEXT.'
+                                ),
+                            },
+                            {
+                                'type': 'image_url',
+                                'image_url': {'url': data_url},
+                            },
+                        ],
+                    }
+                ],
+                temperature=0,
+                max_completion_tokens=4096,
+            )
+        )
+
+        extracted_text = (completion.choices[0].message.content or '').strip()
+        if not extracted_text or extracted_text == 'NO_TEXT':
+            await status_msg.edit_text("❌ No readable text found in the image.")
+        else:
+            # Telegram messages have a finite size, so split long OCR output.
+            await status_msg.edit_text("✅ Text extraction complete!")
+            for i in range(0, len(extracted_text), 3800):
+                await update.message.reply_text(
+                    f"📝 **Extracted Text:**\n\n{extracted_text[i:i+3800]}",
+                    reply_markup=tool_done_kb() if i + 3800 >= len(extracted_text) else None,
+                )
+        context.user_data['state'] = None
     except Exception as e:
-        await status_msg.edit_text(f"❌ OCR failed: {e}"); context.user_data['state'] = None
+        await status_msg.edit_text(f"❌ OCR failed: {str(e)[:1200]}")
+        context.user_data['state'] = None
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 async def handle_image_collect(update, context):
     if context.user_data.get('state') != 'awaiting_image_to_pdf': return
