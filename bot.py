@@ -29,6 +29,8 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 import yt_dlp
 import imageio_ffmpeg
 from groq import Groq
@@ -747,37 +749,378 @@ async def handle_pptx_to_pdf(update, context):
         context.user_data['state'] = None
 
 # --- TEXT TO PDF ---
-PDF_DRAFT_KEY = "text_pdf_items"
-def text_pdf_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("➕ Enter Next Text", callback_data="pdftext_next"), InlineKeyboardButton("✅ Done", callback_data="pdftext_done")],[InlineKeyboardButton("❌ Cancel", callback_data="pdftext_cancel")]])
-async def handle_text_pdf_input(update, context):
-    if context.user_data.get("state") != "awaiting_text_pdf": return
-    text=(update.message.text or "").strip()
-    if not text: await update.message.reply_text("❌ Please send some text."); return
-    items=context.user_data.setdefault(PDF_DRAFT_KEY,[]); items.append(text)
-    await update.message.reply_text(f"✅ Text {len(items)} added.\n\nAdd another text or press Done.",reply_markup=text_pdf_keyboard())
-async def finish_text_to_pdf(update, context):
-    q=update.callback_query; await q.answer(); items=context.user_data.get(PDF_DRAFT_KEY,[])
-    if not items: await q.message.reply_text("❌ No text has been added yet."); return
-    status=await q.message.reply_text("⏳ Creating PDF…"); path=None
-    try:
-        fd,path=tempfile.mkstemp(prefix="text_pdf_",suffix=".pdf"); os.close(fd)
-        styles=getSampleStyleSheet(); body=ParagraphStyle("BotBody",parent=styles["BodyText"],fontName="Helvetica",fontSize=11,leading=16,spaceAfter=12)
-        doc=SimpleDocTemplate(path,pagesize=letter,rightMargin=54,leftMargin=54,topMargin=54,bottomMargin=54,title="Text to PDF")
-        story=[]
-        for item in items: story += [Paragraph(html.escape(item).replace("\n","<br/>"),body),Spacer(1,4)]
-        doc.build(story)
-        with open(path,"rb") as f: await q.message.reply_document(document=f,filename="text_document.pdf",caption=f"✅ PDF created from {len(items)} text message(s).",reply_markup=tool_done_kb())
-        await status.edit_text("✅ Text to PDF complete!")
-    except Exception as e: await status.edit_text("❌ Text to PDF failed.\n\n"+html.escape(str(e)[:1200]),parse_mode=ParseMode.HTML)
-    finally:
-        context.user_data.pop(PDF_DRAFT_KEY,None); context.user_data["state"]=None
-        if path:
-            try: os.unlink(path)
-            except OSError: pass
-async def cancel_text_to_pdf(update, context):
-    q=update.callback_query; await q.answer(); context.user_data.pop(PDF_DRAFT_KEY,None); context.user_data["state"]=None; await q.edit_message_text("❌ Text to PDF cancelled.")
+# ============================================================
+# TEXT TO PDF
+# Unicode / Amharic / English supported
+# ============================================================
 
+PDF_DRAFT_KEY = "text_pdf_items"
+
+
+def text_pdf_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "➕ Enter Next Text",
+                callback_data="pdftext_next"
+            ),
+            InlineKeyboardButton(
+                "✅ Done",
+                callback_data="pdftext_done"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "❌ Cancel",
+                callback_data="pdftext_cancel"
+            )
+        ]
+    ])
+
+
+# ------------------------------------------------------------
+# Find a Unicode font
+# ------------------------------------------------------------
+
+def get_pdf_unicode_font():
+    """
+    Find and register a Unicode font that supports
+    English + Amharic/Ethiopic characters.
+    """
+
+    font_name = "BotUnicodeFont"
+
+    # If already registered, use it.
+    try:
+        pdfmetrics.getFont(font_name)
+        return font_name
+    except KeyError:
+        pass
+
+    # Common locations on Render/Linux
+    font_candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/local/share/fonts/DejaVuSans.ttf",
+
+        # Other possible Linux locations
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    ]
+
+    for font_path in font_candidates:
+        if os.path.exists(font_path):
+            try:
+                pdfmetrics.registerFont(
+                    TTFont(font_name, font_path)
+                )
+
+                print(
+                    f"[Text to PDF] Unicode font loaded: {font_path}"
+                )
+
+                return font_name
+
+            except Exception as font_error:
+                print(
+                    f"[Text to PDF] Could not load font "
+                    f"{font_path}: {font_error}"
+                )
+
+    raise RuntimeError(
+        "No Unicode font was found on the server. "
+        "Please install DejaVu Sans in Render."
+    )
+
+
+# ------------------------------------------------------------
+# Receive text
+# ------------------------------------------------------------
+
+async def handle_text_pdf_input(update, context):
+
+    if context.user_data.get("state") != "awaiting_text_pdf":
+        return
+
+    text = (update.message.text or "").strip()
+
+    if not text:
+        await update.message.reply_text(
+            "❌ Please send some text."
+        )
+        return
+
+    items = context.user_data.setdefault(
+        PDF_DRAFT_KEY,
+        []
+    )
+
+    items.append(text)
+
+    await update.message.reply_text(
+        f"✅ Text {len(items)} added.\n\n"
+        "➕ Press **Enter Next Text** to add another text.\n"
+        "✅ Press **Done** when you are finished.",
+        reply_markup=text_pdf_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+
+# ------------------------------------------------------------
+# Create PDF
+# ------------------------------------------------------------
+
+async def finish_text_to_pdf(update, context):
+
+    query = update.callback_query
+
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    items = context.user_data.get(
+        PDF_DRAFT_KEY,
+        []
+    )
+
+    if not items:
+        await query.message.reply_text(
+            "❌ No text has been added yet."
+        )
+        return
+
+    status = await query.message.reply_text(
+        "⏳ Creating PDF...\n\n"
+        "Please wait."
+    )
+
+    path = None
+
+    try:
+
+        # =====================================================
+        # 1. Create temporary PDF file
+        # =====================================================
+
+        fd, path = tempfile.mkstemp(
+            prefix="text_pdf_",
+            suffix=".pdf"
+        )
+
+        os.close(fd)
+
+        # =====================================================
+        # 2. Load Unicode font
+        # =====================================================
+
+        font_name = get_pdf_unicode_font()
+
+        # =====================================================
+        # 3. Create PDF styles
+        # =====================================================
+
+        styles = getSampleStyleSheet()
+
+        body = ParagraphStyle(
+            "UnicodeBody",
+
+            parent=styles["BodyText"],
+
+            fontName=font_name,
+
+            fontSize=12,
+
+            leading=19,
+
+            spaceAfter=14,
+
+            leftIndent=0,
+
+            rightIndent=0,
+
+            firstLineIndent=0,
+
+            alignment=0,
+
+            wordWrap="LTR",
+
+        )
+
+        # =====================================================
+        # 4. Create PDF document
+        # =====================================================
+
+        doc = SimpleDocTemplate(
+            path,
+
+            pagesize=letter,
+
+            rightMargin=54,
+
+            leftMargin=54,
+
+            topMargin=54,
+
+            bottomMargin=54,
+
+            title="Text to PDF",
+
+            author="Telegram Bot"
+        )
+
+        story = []
+
+        # =====================================================
+        # 5. Add every text message
+        # =====================================================
+
+        for index, item in enumerate(items):
+
+            if not item:
+                continue
+
+            # Escape HTML characters.
+            # This prevents user text from breaking
+            # ReportLab's Paragraph parser.
+            safe_text = html.escape(item)
+
+            # Preserve line breaks.
+            safe_text = safe_text.replace(
+                "\r\n",
+                "\n"
+            )
+
+            safe_text = safe_text.replace(
+                "\r",
+                "\n"
+            )
+
+            safe_text = safe_text.replace(
+                "\n",
+                "<br/>"
+            )
+
+            paragraph = Paragraph(
+                safe_text,
+                body
+            )
+
+            story.append(paragraph)
+
+            # Space between separate Telegram messages
+            if index < len(items) - 1:
+                story.append(
+                    Spacer(1, 8)
+                )
+
+        # =====================================================
+        # 6. Build PDF
+        # =====================================================
+
+        doc.build(story)
+
+        # =====================================================
+        # 7. Send PDF to Telegram
+        # =====================================================
+
+        with open(path, "rb") as pdf_file:
+
+            await query.message.reply_document(
+                document=pdf_file,
+
+                filename="text_document.pdf",
+
+                caption=(
+                    "✅ **PDF created successfully!**\n\n"
+                    f"📝 Text messages: {len(items)}\n"
+                    "🌍 English + Amharic supported."
+                ),
+
+                reply_markup=tool_done_kb(),
+
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+        # =====================================================
+        # 8. Success message
+        # =====================================================
+
+        await status.edit_text(
+            "✅ Text → PDF completed successfully!"
+        )
+
+    except Exception as e:
+
+        print(
+            "[Text to PDF ERROR]",
+            type(e).__name__,
+            str(e)
+        )
+
+        try:
+
+            await status.edit_text(
+                "❌ **Text → PDF failed.**\n\n"
+                "Error:\n"
+                + html.escape(
+                    str(e)[:1500]
+                ),
+                parse_mode=ParseMode.HTML
+            )
+
+        except Exception:
+            pass
+
+    finally:
+
+        # =====================================================
+        # 9. Clear PDF session
+        # =====================================================
+
+        context.user_data.pop(
+            PDF_DRAFT_KEY,
+            None
+        )
+
+        context.user_data["state"] = None
+
+        # =====================================================
+        # 10. Delete temporary PDF
+        # =====================================================
+
+        if path:
+
+            try:
+                os.unlink(path)
+
+            except OSError:
+                pass
+
+
+# ------------------------------------------------------------
+# Cancel PDF
+# ------------------------------------------------------------
+
+async def cancel_text_to_pdf(update, context):
+
+    query = update.callback_query
+
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    context.user_data.pop(
+        PDF_DRAFT_KEY,
+        None
+    )
+
+    context.user_data["state"] = None
+
+    await query.edit_message_text(
+        "❌ Text to PDF cancelled."
+    )
 # --- TEXT TO IMAGE ---
 HF_TOKEN=os.environ.get("HF_TOKEN","")
 TEXT_TO_IMAGE_MODEL=os.environ.get("TEXT_TO_IMAGE_MODEL","black-forest-labs/FLUX.1-schnell")
