@@ -174,30 +174,48 @@ def tool_done_kb():
     ])
 
 async def safe_send(chat_id, bot, msg, from_chat_id, message_id):
-    text = msg.message
+    """Copy a Telegram message to the bot chat while preserving media + caption."""
+    text = (getattr(msg, "message", None) or "").strip()
     try:
+        # Telegram Bot API captions are shorter than normal messages. If a caption
+        # is too long, send the media first and then the full text separately.
+        caption = text if len(text) <= 1024 else None
+
         if msg.photo or msg.video or msg.document or msg.voice or msg.audio or msg.gif:
             media_bytes = BytesIO()
             await telethon_client.download_media(msg, file=media_bytes)
             media_bytes.seek(0)
-            if msg.photo: await bot.send_photo(chat_id, photo=media_bytes, caption=text)
-            elif msg.video: await bot.send_video(chat_id, video=media_bytes, caption=text)
-            elif msg.document: await bot.send_document(chat_id, document=media_bytes, caption=text)
-            elif msg.voice: await bot.send_voice(chat_id, voice=media_bytes, caption=text)
-            elif msg.audio: await bot.send_audio(chat_id, audio=media_bytes, caption=text)
-            elif msg.gif: await bot.send_animation(chat_id, animation=media_bytes, caption=text)
-        elif msg.sticker:
+            if msg.photo:
+                sent = await bot.send_photo(chat_id, photo=media_bytes, caption=caption)
+            elif msg.video:
+                sent = await bot.send_video(chat_id, video=media_bytes, caption=caption)
+            elif msg.gif:
+                sent = await bot.send_animation(chat_id, animation=media_bytes, caption=caption)
+            elif msg.voice:
+                sent = await bot.send_voice(chat_id, voice=media_bytes, caption=caption)
+            elif msg.audio:
+                sent = await bot.send_audio(chat_id, audio=media_bytes, caption=caption)
+            else:
+                sent = await bot.send_document(chat_id, document=media_bytes, caption=caption)
+            if text and caption is None:
+                await bot.send_message(chat_id, text=text)
+            return sent
+
+        if msg.sticker:
             sticker_bytes = BytesIO()
             await telethon_client.download_media(msg, file=sticker_bytes)
             sticker_bytes.seek(0)
-            await bot.send_sticker(chat_id, sticker=sticker_bytes)
-        elif text: await bot.send_message(chat_id, text=text)
-        else: await bot.send_message(chat_id, "Unsupported message type.")
+            return await bot.send_sticker(chat_id, sticker=sticker_bytes)
+
+        if text:
+            return await bot.send_message(chat_id, text=text)
+
+        return await bot.send_message(chat_id, text="📎 Unsupported/empty Telegram message.")
     except Exception as e:
-        if "must forward even restricted" in str(e).lower():
-            await bot.send_message(chat_id, "🔒 Restricted media.")
+        if "must forward even restricted" in str(e).lower() or "protected" in str(e).lower():
+            await bot.send_message(chat_id, "🔒 This Telegram message has protected media and cannot be copied.")
         else:
-            await bot.send_message(chat_id, f"Failed to send media: {e}")
+            await bot.send_message(chat_id, f"⚠️ Could not display one message: {type(e).__name__}: {e}")
 
 async def handle_telethon_error(update, error):
     if isinstance(error, FloodWaitError):
@@ -340,6 +358,17 @@ async def menu_callback(update, context):
         await display_search_page(update, context, page, filter_type)
         return
 
+    if data == "inbox":
+        await show_inbox(update, context)
+        return
+    if data.startswith("inbox_open_"):
+        try:
+            index = int(data.removeprefix("inbox_open_"))
+        except ValueError:
+            index = -1
+        await open_inbox_chat(update, context, index)
+        return
+
     if data == "main_menu":
         keyboard = [[InlineKeyboardButton("📥 Inbox", callback_data="inbox"), InlineKeyboardButton("👤 Profile", callback_data="profile")], [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")], [InlineKeyboardButton("➕ More Commands", callback_data="more")]]
         await query.message.reply_text("🤖 TELEGRAM ASSISTANT", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -423,35 +452,13 @@ async def menu_callback(update, context):
         await query.message.reply_text("📄 PDF FETCH\n\nPlease upload the PDF file directly to this chat.")
         context.user_data['state'] = 'awaiting_pdf'
     elif data.startswith("posts_"):
-        page = int(data.split("_")[1])
-        await handle_posts_pagination(update, context, page)
+        await query.answer("Profile posts have been removed.", show_alert=True)
+        return
     elif data.startswith("story_"):
-        if data == "story_start":
-            context.user_data["story_index"] = 0
-            entity = context.user_data.get("story_entity") or context.user_data.get("profile_entity")
-            if not entity:
-                await query.message.reply_text("❌ No profile selected.")
-                return
-            await query.answer("Fetching Stories…")
-            try:
-                if not GetPeerStoriesRequest:
-                    await query.message.reply_text("❌ Telethon does not support stories in this installation.")
-                    return
-                response = await telethon_client(GetPeerStoriesRequest(peer=entity))
-                stories = list(getattr(response, "stories", []) or [])
-                if not stories:
-                    await query.message.reply_text("❌ No active Stories are available.")
-                    return
-                context.user_data["stories_list"] = stories
-                await display_story(update, context)
-            except Exception as e:
-                await query.message.reply_text(f"❌ Could not retrieve Stories: {e}")
-        elif data == "story_next":
-            context.user_data["story_index"] = context.user_data.get("story_index", 0) + 1
-            await display_story(update, context)
-        elif data == "story_prev":
-            context.user_data["story_index"] = context.user_data.get("story_index", 0) - 1
-            await display_story(update, context)
+        # Stories were intentionally removed from Profile. This also safely
+        # handles old/stale Telegram buttons created by an older bot version.
+        await query.answer("Stories have been removed from Profile.", show_alert=True)
+        return
 
 # --- PHOTO EDITING ---
 async def handle_photo_edit_selection(update, context, data):
@@ -1428,18 +1435,148 @@ async def process_image_pdf(update, context):
         context.user_data['state'] = None; context.user_data['pdf_images'] = []
 
 # --- OTHER FEATURES (Profile, Search, etc.) ---
+async def _inbox_title(entity):
+    return (
+        getattr(entity, "title", None)
+        or " ".join(x for x in [getattr(entity, "first_name", ""), getattr(entity, "last_name", "")] if x).strip()
+        or getattr(entity, "username", None)
+        or "Telegram chat"
+    )
+
+
+def _inbox_preview(message):
+    if not message:
+        return "No messages yet."
+    text = (getattr(message, "message", None) or "").strip().replace("\n", " ")
+    if message.photo:
+        return "🖼️ Photo" + (f": {text[:55]}" if text else "")
+    if message.video:
+        return "🎬 Video" + (f": {text[:55]}" if text else "")
+    if message.voice:
+        return "🎤 Voice message"
+    if message.audio:
+        return "🎵 Audio" + (f": {text[:55]}" if text else "")
+    if message.document:
+        return "📄 File" + (f": {text[:55]}" if text else "")
+    if message.gif:
+        return "🎞️ GIF" + (f": {text[:55]}" if text else "")
+    if message.sticker:
+        return "🧩 Sticker"
+    return text[:90] if text else "💬 Message"
+
+
+async def show_inbox(update, context):
+    """Build the inbox directly from Telegram, not from the SQLite listener cache."""
+    query = update.callback_query
+    if query:
+        await query.answer("Loading inbox…")
+        chat_id = query.message.chat_id
+        sender_message = query.message
+    else:
+        chat_id = update.effective_chat.id
+        sender_message = update.message
+
+    try:
+        dialogs = []
+        async for dialog in telethon_client.iter_dialogs(limit=50):
+            entity = dialog.entity
+            # Inbox = private one-to-one conversations and bots.
+            if getattr(entity, "bot", False) or entity.__class__.__name__ in ("User",):
+                if not getattr(entity, "deleted", False):
+                    dialogs.append(dialog)
+
+        context.user_data["inbox_entities"] = {}
+        rows = []
+        for idx, dialog in enumerate(dialogs[:30]):
+            entity = dialog.entity
+            context.user_data["inbox_entities"][str(idx)] = entity
+            title = await _inbox_title(entity)
+            last = dialog.message
+            rows.append((idx, title, _inbox_preview(last), dialog.unread_count or 0))
+
+        if not rows:
+            kb = [[InlineKeyboardButton("🔄 Refresh", callback_data="inbox")],
+                  [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]
+            text = "📥 INBOX\n\nNo private conversations were found."
+        else:
+            lines = ["📥 INBOX", "", "Your latest Telegram private conversations:", ""]
+            kb = []
+            for idx, title, preview, unread in rows:
+                badge = f" • {unread} unread" if unread else ""
+                lines.append(f"{idx + 1}. <b>{html.escape(title)}</b>{badge}\n   {html.escape(preview)}")
+                kb.append([InlineKeyboardButton(f"💬 {title[:28]}", callback_data=f"inbox_open_{idx}")])
+            kb.append([InlineKeyboardButton("🔄 Refresh", callback_data="inbox"), InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")])
+            text = "\n".join(lines)
+
+        if query:
+            try:
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+            except Exception:
+                await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+        else:
+            await sender_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+    except Exception as e:
+        msg = f"❌ Could not load Inbox: {type(e).__name__}: {e}"
+        if query:
+            await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]))
+        else:
+            await sender_message.reply_text(msg)
+
+
+async def open_inbox_chat(update, context, index):
+    query = update.callback_query
+    await query.answer()
+    entity = context.user_data.get("inbox_entities", {}).get(str(index))
+    if not entity:
+        await query.edit_message_text("❌ This inbox item expired. Please refresh the Inbox.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Inbox", callback_data="inbox")]]))
+        return
+
+    try:
+        title = await _inbox_title(entity)
+        messages = await telethon_client.get_messages(entity, limit=10)
+        messages = list(reversed([m for m in messages if m]))
+        if not messages:
+            await query.edit_message_text(
+                f"💬 <b>{html.escape(title)}</b>\n\nNo messages found.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Inbox", callback_data="inbox")]])
+            )
+            return
+
+        # Replace the button message with a compact header, then send each real
+        # Telegram message. This preserves text, photo+caption, photo, video,
+        # documents, audio and voice instead of reducing everything to a preview.
+        await query.edit_message_text(
+            f"💬 <b>{html.escape(title)}</b>\n\nShowing the latest {len(messages)} messages…",
+            parse_mode=ParseMode.HTML
+        )
+        for msg in messages:
+            await safe_send(query.message.chat_id, context.bot, msg, entity, msg.id)
+
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"📥 <b>{html.escape(title)}</b>\n\nEnd of inbox conversation.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Inbox", callback_data="inbox"), InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+            ])
+        )
+    except FloodWaitError as e:
+        await query.message.reply_text(f"⏳ Telegram asks us to wait {e.seconds} seconds before loading this conversation.")
+    except Exception as e:
+        await query.message.reply_text(f"❌ Could not open conversation: {type(e).__name__}: {e}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Inbox", callback_data="inbox")]]))
+
+
 async def fetch_profile(update, context, target):
     try:
         entity = await telethon_client.get_entity(target)
         context.user_data["profile_entity"] = entity
-        context.user_data["post_entity"] = entity
-        context.user_data["story_entity"] = entity
         save_user_history(entity.id, getattr(entity, "username", None), getattr(entity, "first_name", ""), getattr(entity, "last_name", ""))
         first_name = getattr(entity, "first_name", "") or ""
         last_name = getattr(entity, "last_name", "") or ""
         display_name = f"{first_name} {last_name}".strip() or getattr(entity, "title", "Unknown")
         text = f"<blockquote><b>{display_name}</b>\n@{getattr(entity, 'username', None) or 'N/A'}\n\n{getattr(entity, 'about', 'No bio')}\n\nID: {entity.id}\nVerified: {getattr(entity, 'verified', False)}\nPremium: {getattr(entity, 'premium', False)}\nBot: {getattr(entity, 'bot', False)}</blockquote>"
-        kb = [[InlineKeyboardButton("📰 View Posts", callback_data="posts_1"), InlineKeyboardButton("👁 View Story", callback_data="story_start")], [InlineKeyboardButton("⬅️ Back", callback_data="more")]]
+        kb = [[InlineKeyboardButton("⬅️ Back", callback_data="more")]]
         try:
             photo = await telethon_client.download_profile_photo(entity, file=BytesIO())
             if photo:
@@ -2054,34 +2191,6 @@ async def fetch_names(update, context, target):
         text += "</blockquote>"
         await update.message.reply_text(text, parse_mode=ParseMode.HTML)
     except Exception as e: await update.message.reply_text(f"❌ Error: {e}")
-
-async def display_story(update, context):
-    query = update.callback_query
-    await query.answer()
-    stories = context.user_data.get("stories_list", [])
-    index = context.user_data.get("story_index", 0)
-    if not stories:
-        await query.edit_message_text("❌ No accessible active Stories found.")
-        return
-    index = max(0, min(index, len(stories) - 1))
-    context.user_data["story_index"] = index
-    story = stories[index]
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Previous", callback_data="story_prev"), InlineKeyboardButton("Next ➡️", callback_data="story_next")], [InlineKeyboardButton("⬅️ Back to Profile", callback_data="profile")]])
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg" if story.media.photo else ".mp4") as tmp:
-            await telethon_client.download_media(story, file=tmp.name)
-            tmp_path = tmp.name
-        caption = getattr(story, "caption", None) or ""
-        caption = f"{caption}\n\n📖 Story {index + 1}/{len(stories)}".strip()
-        with open(tmp_path, "rb") as f:
-            if hasattr(story.media, 'photo') and story.media.photo:
-                media = InputMediaPhoto(media=InputFile(f), caption=caption)
-            else:
-                media = InputMediaVideo(media=InputFile(f), caption=caption)
-            await query.edit_message_media(media=media, reply_markup=kb)
-        os.unlink(tmp_path)
-    except Exception as e:
-        await query.edit_message_text(f"❌ Could not fetch story: {e}", reply_markup=kb)
 
 @telethon_client.on(events.NewMessage(incoming=True))
 async def inbox_listener(event):
