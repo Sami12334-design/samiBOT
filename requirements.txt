@@ -4,9 +4,7 @@ flask>=3
 pymupdf>=1.26
 pdf2docx>=0.5
 img2pdf>=0.6
-yt-dlp[default,curl-cffi]
 Pillow>=11
-SpeechRecognition>=3.14
 imageio-ffmpeg>=0.6
 groq>=0.30
 edge-tts>=7
@@ -15,3 +13,6 @@ reportlab>=4
 rembg>=2
 onnxruntime>=1.22
 quickjs>=1.19.4
+yt-dlp[default,curl-cffi]
+faster-whisper>=1.2
+huggingface_hub>=0.34
