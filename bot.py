@@ -1,4 +1,8 @@
 import re
+import json
+import random
+import socket
+import shutil
 import asyncio
 import os
 import sys
@@ -785,13 +789,15 @@ async def handle_voice_to_text(update, context, language):
 
 VIDEO_MAX_UPLOAD = 50 * 1024 * 1024
 VIDEO_QUALITIES = [1080, 720, 480, 360, 240]
-PIPED_APIS = [
-    "https://pipedapi.kavin.rocks",
-    "https://pipedapi.leptons.xyz",
-    "https://pipedapi.nosebs.ru",
-    "https://piped-api.privacy.com.de",
-    "https://pipedapi.adminforge.de",
-]
+PIPED_INSTANCES_URL = "https://raw.githubusercontent.com/TeamPiped/documentation/main/content/docs/public-instances/index.md"
+PIPED_CACHE_TTL = 60 * 60
+PIPED_HEALTH_TIMEOUT = 3
+PIPED_REQUEST_TIMEOUT = 12
+PIPED_MAX_HEALTHY = 12
+PIPED_APIS = []
+_PIPED_CACHE = {"expires": 0.0, "instances": []}
+_PIPED_BAD_UNTIL = {}
+
 TIKWM_API = "https://www.tikwm.com/api/"
 
 
@@ -869,6 +875,14 @@ def ytdlp_base_options():
         # YouTube extraction working when challenge scripts change.
         "remote_components": {"ejs:github"},
     }
+    # Prefer Deno when installed; otherwise enable Node 22+ if available.
+    # yt-dlp's current EJS setup requires a supported JS runtime for YouTube.
+    deno_path = shutil.which("deno") if "shutil" in globals() else None
+    node_path = shutil.which("node") if "shutil" in globals() else None
+    if deno_path:
+        options["js_runtimes"] = {"deno": {"path": deno_path}}
+    elif node_path:
+        options["js_runtimes"] = {"node": {"path": node_path}}
     cookies = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
     if cookies and os.path.isfile(cookies):
         options["cookiefile"] = cookies
@@ -934,30 +948,189 @@ def ytdlp_download(url: str, output_dir: str, *, height=None, audio=False, title
         return {"path": filepath, "title": info.get("title") or title_hint, "info": info}
 
 
-def piped_get_json(url: str):
+def _normalize_piped_url(url: str):
+    url = (url or "").strip().rstrip("/")
+    if not url.startswith(("https://", "http://")):
+        return None
+    return url
+
+
+def _parse_piped_instances(markdown: str):
+    """Parse TeamPiped's public-instance table without hardcoding instances."""
+    found = []
+    for line in markdown.splitlines():
+        if "|" not in line:
+            continue
+        parts = [x.strip() for x in line.split("|")]
+        for part in parts:
+            match = re.search(r"https?://[^\s|)]+", part)
+            if not match:
+                continue
+            url = _normalize_piped_url(match.group(0))
+            if not url:
+                continue
+            # We only want API hosts, not frontend/proxy/documentation links.
+            host = urllib.parse.urlparse(url).netloc.lower()
+            if "pipedapi" in host or "piped-api" in host or host.startswith("api-piped."):
+                if url not in found:
+                    found.append(url)
+    return found
+
+
+def _http_get_text(url: str, timeout: int):
     request = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json,text/plain,*/*",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/147.0 Safari/537.36",
+            "Accept": "text/plain,text/markdown,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.8",
+            "Connection": "close",
         },
     )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        return __import__("json").load(response)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read().decode("utf-8", "replace")
 
+
+def _piped_health_check(api: str):
+    """Return True only when the instance responds quickly to a harmless endpoint."""
+    candidates = ("/healthcheck", "/", "/config")
+    for suffix in candidates:
+        try:
+            request = urllib.request.Request(
+                api + suffix,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/147.0 Safari/537.36",
+                    "Accept": "application/json,text/plain,*/*",
+                    "Connection": "close",
+                },
+            )
+            with urllib.request.urlopen(request, timeout=PIPED_HEALTH_TIMEOUT) as response:
+                if 200 <= getattr(response, "status", 200) < 400:
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def _refresh_piped_instances(force=False):
+    global PIPED_APIS
+    now = time.time()
+    if not force and _PIPED_CACHE["instances"] and now < _PIPED_CACHE["expires"]:
+        PIPED_APIS = list(_PIPED_CACHE["instances"])
+        return PIPED_APIS
+
+    discovered = []
+    try:
+        docs = _http_get_text(PIPED_INSTANCES_URL, timeout=10)
+        discovered = _parse_piped_instances(docs)
+    except Exception:
+        discovered = []
+
+    # Keep the previous good pool as a temporary emergency fallback if GitHub is unavailable.
+    candidates = discovered or list(_PIPED_CACHE.get("instances") or [])
+    if not candidates:
+        # These are emergency seeds only; normal operation is dynamic discovery.
+        candidates = [
+            "https://pipedapi.kavin.rocks",
+            "https://pipedapi.tokhmi.xyz",
+            "https://pipedapi.moomoo.me",
+            "https://pipedapi.syncpundit.io",
+        ]
+
+    healthy = []
+    random.shuffle(candidates)
+    for api in candidates:
+        bad_until = _PIPED_BAD_UNTIL.get(api, 0)
+        if bad_until > now:
+            continue
+        if _piped_health_check(api):
+            healthy.append(api)
+            if len(healthy) >= PIPED_MAX_HEALTHY:
+                break
+
+    # If all checks fail, retain discovered candidates; the request path will produce useful errors.
+    selected = healthy or candidates[:PIPED_MAX_HEALTHY]
+    _PIPED_CACHE["instances"] = selected
+    _PIPED_CACHE["expires"] = now + PIPED_CACHE_TTL
+    PIPED_APIS = list(selected)
+    return PIPED_APIS
+
+
+def _mark_piped_bad(api: str, seconds: int):
+    _PIPED_BAD_UNTIL[api] = time.time() + seconds
+
+
+def piped_get_json(url: str, timeout=PIPED_REQUEST_TIMEOUT):
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/147.0 Safari/537.36",
+            "Accept": "application/json,text/plain,*/*",
+            "Accept-Language": "en-US,en;q=0.8",
+            "Connection": "close",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+
+def _piped_request_with_retry(api: str, video_id: str):
+    endpoint = f"{api}/streams/{urllib.parse.quote(video_id)}"
+    last_error = None
+    for attempt in range(2):
+        try:
+            return piped_get_json(endpoint)
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            # 526 = broken origin certificate. Avoid this instance for a while.
+            if exc.code == 526:
+                _mark_piped_bad(api, 6 * 60 * 60)
+                raise
+            # 403 can be temporary/rate limiting; retry once with exponential backoff.
+            if exc.code == 403 and attempt == 0:
+                time.sleep(1.5)
+                continue
+            if exc.code == 403:
+                _mark_piped_bad(api, 15 * 60)
+            raise
+        except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+            last_error = exc
+            _mark_piped_bad(api, 10 * 60)
+            raise
+        except Exception as exc:
+            last_error = exc
+            _mark_piped_bad(api, 5 * 60)
+            raise
+    raise last_error or RuntimeError("Piped request failed")
 
 def piped_metadata(video_id: str):
     errors = []
-    for api in PIPED_APIS:
+    instances = _refresh_piped_instances()
+    for api in instances:
         try:
-            data = piped_get_json(f"{api}/streams/{urllib.parse.quote(video_id)}")
+            data = _piped_request_with_retry(api, video_id)
             if data.get("videoStreams") or data.get("audioStreams"):
                 return data
             errors.append(f"{api}: no streams")
         except Exception as exc:
             errors.append(f"{api}: {exc}")
-    raise RuntimeError("All YouTube fallback services failed: " + " | ".join(errors[:3]))
 
+    # Refresh the pool immediately once when every current instance fails.
+    fresh = _refresh_piped_instances(force=True)
+    for api in fresh:
+        if api in instances:
+            continue
+        try:
+            data = _piped_request_with_retry(api, video_id)
+            if data.get("videoStreams") or data.get("audioStreams"):
+                return data
+            errors.append(f"{api}: no streams")
+        except Exception as exc:
+            errors.append(f"{api}: {exc}")
+
+    raise RuntimeError(
+        "All dynamic Piped instances failed. " + " | ".join(errors[:6])
+    )
 
 def choose_piped_video_stream(streams, target_height):
     valid = [s for s in streams if s.get("url") and s.get("height")]
