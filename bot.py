@@ -10,8 +10,6 @@ import subprocess
 import urllib.request
 import urllib.parse
 import html
-import shutil
-from html.parser import HTMLParser
 from io import BytesIO
 from flask import Flask
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageChops
@@ -29,8 +27,9 @@ from pptx import Presentation
 from pptx.util import Inches
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 import yt_dlp
-import speech_recognition as sr
 import imageio_ffmpeg
 from groq import Groq
 import edge_tts
@@ -360,78 +359,6 @@ async def menu_callback(update, context):
         await display_search_page(update, context, page, filter_type)
         return
 
-    if data.startswith("search_mode_"):
-        mode = data.removeprefix("search_mode_")
-        if mode not in {"both", "public", "joined"}:
-            mode = "both"
-        context.user_data["search_mode"] = mode
-        labels = {"both": "🌐 Public + Joined", "public": "🌍 Public only", "joined": "💬 Joined only"}
-        await query.edit_message_text(
-            f"✅ Search scope: <b>{labels[mode]}</b>\n\nNow send your keyword.",
-            parse_mode=ParseMode.HTML
-        )
-        context.user_data['state'] = 'search_query'
-        return
-
-    if data == "search_scope":
-        await query.edit_message_text(
-            "🎯 <b>SEARCH SCOPE</b>\n\nChoose where to search:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🌐 Public + Joined", callback_data="search_mode_both"),
-                InlineKeyboardButton("🌍 Public only", callback_data="search_mode_public"),
-            ], [
-                InlineKeyboardButton("💬 Joined only", callback_data="search_mode_joined"),
-                InlineKeyboardButton("⬅️ Back", callback_data="search_back_results"),
-            ]])
-        )
-        return
-
-    if data == "search_back_results":
-        await display_search_page(update, context, context.user_data.get("search_page", 1), context.user_data.get("search_filter", "all"))
-        return
-
-    if data == "search_sort":
-        await query.edit_message_text(
-            "↕️ <b>SORT RESULTS</b>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("⭐ Relevance", callback_data="search_sort_relevance"),
-                InlineKeyboardButton("🕐 Newest", callback_data="search_sort_recent"),
-            ], [InlineKeyboardButton("⬅️ Back", callback_data="search_back_results")]])
-        )
-        return
-
-    if data.startswith("search_sort_"):
-        sort_type = data.removeprefix("search_sort_")
-        context.user_data["search_sort"] = sort_type if sort_type in {"relevance", "recent"} else "relevance"
-        await display_search_page(update, context, 1, context.user_data.get("search_filter", "all"))
-        return
-
-    if data == "search_history":
-        history = context.user_data.get("search_history", [])
-        if not history:
-            await query.answer("No recent searches yet.", show_alert=True)
-            return
-        rows = [[InlineKeyboardButton(f"🔎 {h[:45]}", callback_data=f"search_hist_{i}")] for i, h in enumerate(history)]
-        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="search_back_results")])
-        await query.edit_message_text("🕘 <b>RECENT SEARCHES</b>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
-        return
-
-    if data.startswith("search_hist_"):
-        try:
-            idx = int(data.removeprefix("search_hist_"))
-            history = context.user_data.get("search_history", [])
-            old_query = history[idx]
-        except (ValueError, IndexError):
-            await query.answer("Search history item is unavailable.", show_alert=True)
-            return
-        context.user_data["state"] = None
-        await query.edit_message_text(f"🔎 Searching again for <b>{html.escape(old_query)}</b>...", parse_mode=ParseMode.HTML)
-        # Reuse the exact same hybrid search engine without requiring the user to type again.
-        await fetch_search(update, context, old_query)
-        return
-
     if data == "inbox":
         await show_inbox(update, context)
         return
@@ -454,7 +381,7 @@ async def menu_callback(update, context):
         kb.append([InlineKeyboardButton("⬅️ Back", callback_data="main_menu")])
         await query.message.reply_text("➕ MORE COMMANDS", reply_markup=InlineKeyboardMarkup(kb))
     elif data == "converter":
-        kb = [[InlineKeyboardButton("📄 PDF to Word", callback_data="pdf_to_word"), InlineKeyboardButton("🖼️ Image to Text", callback_data="image_to_text")], [InlineKeyboardButton("🖼️ Image to PDF", callback_data="image_to_pdf"), InlineKeyboardButton("🖼️ Edit Photo", callback_data="image_edit")], [InlineKeyboardButton("🗣️ Text to Voice (ENG)", callback_data="tts_en"), InlineKeyboardButton("🗣️ Text to Voice (AM)", callback_data="tts_am")], [InlineKeyboardButton("📷 Image Format", callback_data="img_fmt_menu"), InlineKeyboardButton("📚 Document Format", callback_data="doc_fmt_menu")], [InlineKeyboardButton("🎙️ Voice to Text (ENG)", callback_data="voice_en"), InlineKeyboardButton("🎙️ Voice to Text (AM)", callback_data="voice_am")], [InlineKeyboardButton("⬅️ Back", callback_data="more")]]
+        kb = [[InlineKeyboardButton("📄 PDF to Word", callback_data="pdf_to_word"), InlineKeyboardButton("🖼️ Image to Text", callback_data="image_to_text")], [InlineKeyboardButton("📄 Text to PDF", callback_data="text_to_pdf"), InlineKeyboardButton("🎨 Text to Image", callback_data="text_to_image")], [InlineKeyboardButton("🖼️ Image to PDF", callback_data="image_to_pdf"), InlineKeyboardButton("🖼️ Edit Photo", callback_data="image_edit")], [InlineKeyboardButton("🗣️ Text to Voice (ENG)", callback_data="tts_en"), InlineKeyboardButton("🗣️ Text to Voice (AM)", callback_data="tts_am")], [InlineKeyboardButton("📷 Image Format", callback_data="img_fmt_menu"), InlineKeyboardButton("📚 Document Format", callback_data="doc_fmt_menu")], [InlineKeyboardButton("🎙️ Voice to Text (ENG)", callback_data="voice_en"), InlineKeyboardButton("🎙️ Voice to Text (AM)", callback_data="voice_am")], [InlineKeyboardButton("⬅️ Back", callback_data="more")]]
         await query.message.reply_text("🔄 MEDIA CONVERTER & AI TOOLS\n\nChoose an option:", reply_markup=InlineKeyboardMarkup(kb))
     elif data == "img_fmt_menu":
         kb = [[InlineKeyboardButton("PNG to JPG", callback_data="img_png_jpg"), InlineKeyboardButton("JPG to PNG", callback_data="img_jpg_png")], [InlineKeyboardButton("Image to GIF", callback_data="img_gif"), InlineKeyboardButton("⬅️ Back", callback_data="converter")]]
@@ -467,6 +394,17 @@ async def menu_callback(update, context):
         context.user_data['state'] = 'awaiting_edit_photo'
     elif data.startswith("edit_"):
         await handle_photo_edit_selection(update, context, data)
+    elif data == "text_to_pdf":
+        context.user_data[PDF_DRAFT_KEY]=[]; context.user_data["state"]="awaiting_text_pdf"
+        await query.message.reply_text("📄 TEXT TO PDF\n\nSend your first text. Add more or press Done.",reply_markup=text_pdf_keyboard())
+    elif data == "pdftext_next":
+        context.user_data["state"]="awaiting_text_pdf"; await query.message.reply_text("➕ Send the next text.")
+    elif data == "pdftext_done":
+        await finish_text_to_pdf(update,context)
+    elif data == "pdftext_cancel":
+        await cancel_text_to_pdf(update,context)
+    elif data == "text_to_image":
+        context.user_data["state"]="awaiting_text_to_image"; await query.message.reply_text("🎨 TEXT TO IMAGE\n\nDescribe the image you want. Example:\nA realistic lion on a mountain at sunset")
     elif data == "pdf_to_word":
         await query.message.reply_text("📄 PDF to Word\n\nPlease upload the PDF file.")
         context.user_data['state'] = 'awaiting_pdf_to_word'
@@ -520,15 +458,7 @@ async def menu_callback(update, context):
         await query.message.reply_text("🔗 Fetch Telegram\n\nSend me a link (e.g., t.me/channel/123 or t.me/channel/123-130):")
         context.user_data['state'] = 'fetch_link'
     elif data == "search":
-        context.user_data["search_mode"] = "both"
-        await query.message.reply_text(
-            "🔎 SEARCH\n\nChoose a search scope, then send your keyword.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🌐 Public + Joined", callback_data="search_mode_both"),
-                InlineKeyboardButton("🌍 Public only", callback_data="search_mode_public"),
-                InlineKeyboardButton("💬 Joined only", callback_data="search_mode_joined"),
-            ]])
-        )
+        await query.message.reply_text("🔎 SEARCH\n\nEnter a keyword to search Telegram globally.\n\nI will prioritize public results outside the chats/channels you already joined.\nExample: Logic mid")
         context.user_data['state'] = 'search_query'
     elif data == "pdf_fetch":
         await query.message.reply_text("📄 PDF FETCH\n\nPlease upload the PDF file directly to this chat.")
@@ -550,6 +480,10 @@ async def handle_photo_edit_selection(update, context, data):
         await query.message.reply_text("❌ No image found. Please send a photo first.")
         return
     img = context.user_data['edit_image']
+    if data == "edit_clear":
+        context.user_data.pop("edit_image",None); context.user_data.pop("bg_image",None); context.user_data["state"]=None
+        await query.message.reply_text("🗑️ Current photo removed. Send another photo to edit."); return
+
     if data == "edit_remove_bg":
         async def run_bg_removal():
             def do_work():
@@ -628,7 +562,7 @@ async def handle_edit_photo(update, context):
         img_bytes = BytesIO(); await file.download_to_memory(img_bytes); img_bytes.seek(0)
         img = Image.open(img_bytes)
         context.user_data['edit_image'] = img
-        kb = [[InlineKeyboardButton("🖼️ Original", callback_data="edit_orig"), InlineKeyboardButton("✨ HD 100x", callback_data="edit_hd"), InlineKeyboardButton("🎨 Vivid", callback_data="edit_vivid")], [InlineKeyboardButton("⬛ B&W", callback_data="edit_bw"), InlineKeyboardButton("🟤 Sepia", callback_data="edit_sepia"), InlineKeyboardButton("🔪 Sharpen", callback_data="edit_sharp")], [InlineKeyboardButton("☀️ Brighten", callback_data="edit_bright"), InlineKeyboardButton("🌙 Darken", callback_data="edit_dark"), InlineKeyboardButton("🌫️ Blur", callback_data="edit_blur")], [InlineKeyboardButton("🟥 Pixel", callback_data="edit_pixel"), InlineKeyboardButton("🔄 Invert", callback_data="edit_invert"), InlineKeyboardButton("✏️ Sketch", callback_data="edit_sketch")], [InlineKeyboardButton("🧊 Emboss", callback_data="edit_emboss"), InlineKeyboardButton("🎞️ Poster", callback_data="edit_poster"), InlineKeyboardButton("🔥 Solarize", callback_data="edit_solar")], [InlineKeyboardButton("🖼️ Remove BG", callback_data="edit_remove_bg"), InlineKeyboardButton("🖼️ Change BG", callback_data="edit_change_bg")]]
+        kb = [[InlineKeyboardButton("🖼️ Original", callback_data="edit_orig"), InlineKeyboardButton("✨ HD 100x", callback_data="edit_hd"), InlineKeyboardButton("🎨 Vivid", callback_data="edit_vivid")], [InlineKeyboardButton("⬛ B&W", callback_data="edit_bw"), InlineKeyboardButton("🟤 Sepia", callback_data="edit_sepia"), InlineKeyboardButton("🔪 Sharpen", callback_data="edit_sharp")], [InlineKeyboardButton("☀️ Brighten", callback_data="edit_bright"), InlineKeyboardButton("🌙 Darken", callback_data="edit_dark"), InlineKeyboardButton("🌫️ Blur", callback_data="edit_blur")], [InlineKeyboardButton("🟥 Pixel", callback_data="edit_pixel"), InlineKeyboardButton("🔄 Invert", callback_data="edit_invert"), InlineKeyboardButton("✏️ Sketch", callback_data="edit_sketch")], [InlineKeyboardButton("🧊 Emboss", callback_data="edit_emboss"), InlineKeyboardButton("🎞️ Poster", callback_data="edit_poster"), InlineKeyboardButton("🔥 Solarize", callback_data="edit_solar")], [InlineKeyboardButton("🗑️ Remove", callback_data="edit_clear"), InlineKeyboardButton("🖼️ Remove BG", callback_data="edit_remove_bg"), InlineKeyboardButton("🖼️ Change BG", callback_data="edit_change_bg")]]
         await status_msg.edit_text("✅ Image loaded!\n\nChoose an editing feature below:", reply_markup=InlineKeyboardMarkup(kb))
         context.user_data['state'] = None
     except Exception as e:
@@ -812,112 +746,144 @@ async def handle_pptx_to_pdf(update, context):
         await status_msg.edit_text(f"❌ Conversion failed: {e}")
         context.user_data['state'] = None
 
-# --- VOICE TO TEXT ---
-async def handle_voice_to_text(update, context, language):
-    if not update.message.voice and not update.message.audio:
-        await update.message.reply_text("❌ Please send a voice message OR an audio file.")
-        return
-    status_msg = await update.message.reply_text("⏳ Transcribing voice/audio...")
+# --- TEXT TO PDF ---
+PDF_DRAFT_KEY = "text_pdf_items"
+def text_pdf_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("➕ Enter Next Text", callback_data="pdftext_next"), InlineKeyboardButton("✅ Done", callback_data="pdftext_done")],[InlineKeyboardButton("❌ Cancel", callback_data="pdftext_cancel")]])
+async def handle_text_pdf_input(update, context):
+    if context.user_data.get("state") != "awaiting_text_pdf": return
+    text=(update.message.text or "").strip()
+    if not text: await update.message.reply_text("❌ Please send some text."); return
+    items=context.user_data.setdefault(PDF_DRAFT_KEY,[]); items.append(text)
+    await update.message.reply_text(f"✅ Text {len(items)} added.\n\nAdd another text or press Done.",reply_markup=text_pdf_keyboard())
+async def finish_text_to_pdf(update, context):
+    q=update.callback_query; await q.answer(); items=context.user_data.get(PDF_DRAFT_KEY,[])
+    if not items: await q.message.reply_text("❌ No text has been added yet."); return
+    status=await q.message.reply_text("⏳ Creating PDF…"); path=None
     try:
-        if update.message.voice: file_id = update.message.voice.file_id
-        else: file_id = update.message.audio.file_id
-        file = await context.bot.get_file(file_id)
-        voice_bytes = BytesIO(); await file.download_to_memory(voice_bytes); voice_bytes.seek(0)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as tmp_ogg:
-            tmp_ogg.write(voice_bytes.read()); tmp_ogg_path = tmp_ogg.name
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav:
-            tmp_wav_path = tmp_wav.name
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        cmd = [ffmpeg_exe, "-i", tmp_ogg_path, "-ar", "16000", "-ac", "1", tmp_wav_path, "-y"]
-        subprocess.run(cmd, check=True, capture_output=True)
-        if GROQ_API_KEY:
-            try:
-                client = Groq(api_key=GROQ_API_KEY)
-                with open(tmp_wav_path, "rb") as f:
-                    transcription = client.audio.transcriptions.create(file=(tmp_wav_path, f), model="whisper-large-v3", language=language.split('-')[0], response_format="text")
-                await update.message.reply_text(f"📝 **Transcribed Text (Groq):**\n\n{transcription}", reply_markup=tool_done_kb())
-                await status_msg.edit_text("✅ Transcription complete!")
-                os.unlink(tmp_ogg_path); os.unlink(tmp_wav_path)
-                context.user_data['state'] = None
-                return
-            except Exception: pass
-        recognizer = sr.Recognizer()
-        with sr.AudioFile(tmp_wav_path) as source:
-            audio_data = recognizer.record(source)
-        try:
-            text = recognizer.recognize_google(audio_data, language=language)
-            await update.message.reply_text(f"📝 **Transcribed Text (Google):**\n\n{text}", reply_markup=tool_done_kb())
-            await status_msg.edit_text("✅ Transcription complete!")
-        except sr.UnknownValueError:
-            await status_msg.edit_text("❌ Could not understand the audio.")
-        except sr.RequestError:
-            await status_msg.edit_text("❌ Speech recognition service is unavailable.")
-        os.unlink(tmp_ogg_path); os.unlink(tmp_wav_path)
-        context.user_data['state'] = None
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Transcription failed: {e}")
-        context.user_data['state'] = None
+        fd,path=tempfile.mkstemp(prefix="text_pdf_",suffix=".pdf"); os.close(fd)
+        styles=getSampleStyleSheet(); body=ParagraphStyle("BotBody",parent=styles["BodyText"],fontName="Helvetica",fontSize=11,leading=16,spaceAfter=12)
+        doc=SimpleDocTemplate(path,pagesize=letter,rightMargin=54,leftMargin=54,topMargin=54,bottomMargin=54,title="Text to PDF")
+        story=[]
+        for item in items: story += [Paragraph(html.escape(item).replace("\n","<br/>"),body),Spacer(1,4)]
+        doc.build(story)
+        with open(path,"rb") as f: await q.message.reply_document(document=f,filename="text_document.pdf",caption=f"✅ PDF created from {len(items)} text message(s).",reply_markup=tool_done_kb())
+        await status.edit_text("✅ Text to PDF complete!")
+    except Exception as e: await status.edit_text("❌ Text to PDF failed.\n\n"+html.escape(str(e)[:1200]),parse_mode=ParseMode.HTML)
+    finally:
+        context.user_data.pop(PDF_DRAFT_KEY,None); context.user_data["state"]=None
+        if path:
+            try: os.unlink(path)
+            except OSError: pass
+async def cancel_text_to_pdf(update, context):
+    q=update.callback_query; await q.answer(); context.user_data.pop(PDF_DRAFT_KEY,None); context.user_data["state"]=None; await q.edit_message_text("❌ Text to PDF cancelled.")
+
+# --- TEXT TO IMAGE ---
+HF_TOKEN=os.environ.get("HF_TOKEN","")
+TEXT_TO_IMAGE_MODEL=os.environ.get("TEXT_TO_IMAGE_MODEL","black-forest-labs/FLUX.1-schnell")
+async def handle_text_to_image(update, context):
+    if context.user_data.get("state") != "awaiting_text_to_image": return
+    prompt=(update.message.text or "").strip()
+    if not prompt: await update.message.reply_text("❌ Please describe the image you want."); return
+    if len(prompt)>2000: await update.message.reply_text("❌ Prompt is too long. Keep it under 2000 characters."); return
+    status=await update.message.reply_text("🎨 Generating your image…")
+    try:
+        if not HF_TOKEN: await status.edit_text("❌ Text-to-Image needs HF_TOKEN in Render Environment Variables."); return
+        def generate():
+            from huggingface_hub import InferenceClient
+            return InferenceClient(provider="auto",api_key=HF_TOKEN).text_to_image(prompt=prompt,model=TEXT_TO_IMAGE_MODEL)
+        image=await asyncio.to_thread(generate); out=BytesIO(); image.save(out,format="PNG"); out.seek(0)
+        await update.message.reply_photo(photo=out,caption=f"🎨 Generated image\n\nPrompt: {prompt[:900]}",reply_markup=tool_done_kb()); await status.edit_text("✅ Image generated successfully!")
+    except Exception as e: await status.edit_text("❌ Text-to-Image failed.\n\n"+html.escape(str(e)[:1500]),parse_mode=ParseMode.HTML)
+    finally: context.user_data["state"]=None
+
+# --- VOICE TO TEXT: FASTER-WHISPER (NO GROQ) ---
+_WHISPER_MODEL=None; _WHISPER_LOCK=threading.Lock()
+WHISPER_MODEL_NAME=os.environ.get("WHISPER_MODEL","small")
+WHISPER_DEVICE=os.environ.get("WHISPER_DEVICE","cpu")
+WHISPER_COMPUTE_TYPE=os.environ.get("WHISPER_COMPUTE_TYPE","int8")
+def _get_whisper_model():
+    global _WHISPER_MODEL
+    if _WHISPER_MODEL is not None: return _WHISPER_MODEL
+    with _WHISPER_LOCK:
+        if _WHISPER_MODEL is None:
+            from faster_whisper import WhisperModel
+            _WHISPER_MODEL=WhisperModel(WHISPER_MODEL_NAME,device=WHISPER_DEVICE,compute_type=WHISPER_COMPUTE_TYPE)
+    return _WHISPER_MODEL
+def _transcribe_whisper_sync(wav_path,language_code):
+    model=_get_whisper_model(); segments,info=model.transcribe(wav_path,language=language_code,beam_size=5,vad_filter=True,condition_on_previous_text=True)
+    return " ".join(x.text.strip() for x in segments).strip(),getattr(info,"language",language_code)
+async def handle_voice_to_text(update, context, language):
+    if not update.message.voice and not update.message.audio: await update.message.reply_text("❌ Please send a voice message or audio file."); return
+    status=await update.message.reply_text("⏳ Transcribing with Whisper AI… First use may take longer while the model loads."); paths=[]
+    try:
+        file_id=update.message.voice.file_id if update.message.voice else update.message.audio.file_id
+        tg=await context.bot.get_file(file_id); data=BytesIO(); await tg.download_to_memory(data); data.seek(0)
+        with tempfile.NamedTemporaryFile(delete=False,suffix=".ogg") as f: f.write(data.read()); ogg=f.name; paths.append(ogg)
+        with tempfile.NamedTemporaryFile(delete=False,suffix=".wav") as f: wav=f.name; paths.append(wav)
+        ff=imageio_ffmpeg.get_ffmpeg_exe(); subprocess.run([ff,"-y","-i",ogg,"-ar","16000","-ac","1",wav],check=True,capture_output=True)
+        text,detected=await asyncio.to_thread(_transcribe_whisper_sync,wav,language.split("-")[0].lower())
+        if not text: await status.edit_text("❌ Whisper could not detect understandable speech.")
+        else: await update.message.reply_text(f"📝 Transcribed Text (Whisper):\n\n{text}",reply_markup=tool_done_kb()); await status.edit_text(f"✅ Transcription complete! Language: {detected}")
+    except Exception as e: await status.edit_text("❌ Whisper transcription failed.\n\n"+html.escape(str(e)[:1500]),parse_mode=ParseMode.HTML)
+    finally:
+        for x in paths:
+            try: os.unlink(x)
+            except OSError: pass
+        context.user_data["state"]=None
 
 # --- POWERFUL MULTI-SOURCE VIDEO DOWNLOADER ---
-# Direct yt-dlp is the PRIMARY YouTube downloader.
-# Public Piped instances are ONLY a last-resort metadata/stream fallback.
-# The Piped discovery code accepts ROOT API URLs only; paths such as
-# /registered/badge are deliberately rejected.
+# Supported input: YouTube, TikTok, Instagram, Facebook.
+# The bot first uses yt-dlp. For YouTube/TikTok failures, it can use public
+# fallback services that return stream URLs. No CAPTCHA or anti-bot bypass code
+# is used. Optional authenticated cookies can be provided by the owner through
+# YTDLP_COOKIES_FILE if the service requires login.
 
 VIDEO_MAX_UPLOAD = 50 * 1024 * 1024
 VIDEO_QUALITIES = [1080, 720, 480, 360, 240]
+PIPED_APIS = [
+    "https://pipedapi.kavin.rocks",
+    "https://pipedapi.leptons.xyz",
+    "https://pipedapi.nosebs.ru",
+    "https://piped-api.privacy.com.de",
+    "https://pipedapi.adminforge.de",
+]
 TIKWM_API = "https://www.tikwm.com/api/"
-
-# TeamPiped publishes the public API list. We do not hard-code individual
-# instances because public instances frequently disappear or change.
-PIPED_DISCOVERY_URLS = (
-    "https://raw.githubusercontent.com/TeamPiped/wiki/master/Instances.md",
-    "https://raw.githubusercontent.com/TeamPiped/documentation/main/content/docs/public-instances/index.md",
-)
-PIPED_CACHE_TTL = 60 * 60
-PIPED_TIMEOUT = 10
-PIPED_MAX_CANDIDATES = 20
-PIPED_BAD = {}
-PIPED_CACHE = {"time": 0.0, "items": []}
-PIPED_LOCK = threading.Lock()
-
-BROWSER_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/139.0.0.0 Safari/537.36"
-)
 
 
 def video_platform(url: str) -> str:
     host = urllib.parse.urlparse(url).netloc.lower().split(":", 1)[0]
     if host.startswith("www."):
         host = host[4:]
-    if host == "youtu.be" or host.endswith("youtube.com"):
+    if "youtube.com" in host or host == "youtu.be":
         return "youtube"
-    if host.endswith("tiktok.com"):
+    if "tiktok.com" in host:
         return "tiktok"
-    if host.endswith("instagram.com"):
+    if "instagram.com" in host:
         return "instagram"
-    if host == "fb.watch" or host.endswith("facebook.com"):
+    if "facebook.com" in host or host == "fb.watch":
         return "facebook"
     return "unknown"
 
 
 def normalize_public_url(url: str) -> str:
+    """Follow ordinary HTTP redirects (especially short TikTok links)."""
     url = (url or "").strip()
-    if not re.match(r"^https?://", url, re.I):
-        return url
-    request = urllib.request.Request(
+    req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": BROWSER_UA,
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/147.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.8",
         },
+        method="GET",
     )
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
-            return response.geturl() or url
+        with urllib.request.urlopen(req, timeout=15) as response:
+            final_url = response.geturl()
+            return final_url or url
     except Exception:
         return url
 
@@ -926,9 +892,9 @@ def youtube_video_id(url: str):
     parsed = urllib.parse.urlparse(url)
     host = parsed.netloc.lower().split(":", 1)[0]
     if host == "youtu.be":
-        parts = [p for p in parsed.path.split("/") if p]
-        return parts[0] if parts else None
-    if host.endswith("youtube.com"):
+        value = parsed.path.strip("/").split("/")
+        return value[0] if value and value[0] else None
+    if "youtube.com" in host:
         qs = urllib.parse.parse_qs(parsed.query)
         if qs.get("v"):
             return qs["v"][0]
@@ -938,97 +904,41 @@ def youtube_video_id(url: str):
     return None
 
 
-def _find_js_runtime():
-    """Find a supported JS runtime, including a Deno installed by build.sh."""
-    candidates = []
-    local_deno = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".deno", "bin", "deno")
-    local_node = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".node", "bin", "node")
-    candidates.extend([
-        ("deno", local_deno),
-        ("node", local_node),
-    ])
-    for runtime, path in candidates:
-        if os.path.isfile(path) and os.access(path, os.X_OK):
-            return runtime, path
-    deno = shutil.which("deno")
-    if deno:
-        return "deno", deno
-    node = shutil.which("node")
-    if node:
-        return "node", node
-    return None, None
-
-
 def ytdlp_base_options():
     options = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "socket_timeout": 30,
+        "socket_timeout": 25,
         "retries": 3,
         "fragment_retries": 3,
         "file_access_retries": 3,
         "concurrent_fragment_downloads": 4,
         "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
         "http_headers": {
-            "User-Agent": BROWSER_UA,
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/147.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.8",
         },
-        # Current yt-dlp can load the EJS challenge scripts remotely.
+        # Current yt-dlp supports remote EJS components. They help keep
+        # YouTube extraction working when challenge scripts change.
         "remote_components": {"ejs:github"},
     }
-
     cookies = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
     if cookies and os.path.isfile(cookies):
         options["cookiefile"] = cookies
-
-    runtime, runtime_path = _find_js_runtime()
-    if runtime == "deno":
-        options["js_runtimes"] = {"deno": {"path": runtime_path}}
-    elif runtime == "node":
-        options["js_runtimes"] = {"node": {"path": runtime_path}}
-
-    # Optional owner-controlled extractor args. Example:
-    # YTDLP_EXTRACTOR_ARGS=player_client=web
-    # Leave empty by default so current yt-dlp can choose its own clients.
-    extractor_args = os.environ.get("YTDLP_EXTRACTOR_ARGS", "").strip()
-    if extractor_args:
-        parsed = {}
-        for item in extractor_args.split(";"):
-            if "=" not in item:
-                continue
-            key, value = item.split("=", 1)
-            parsed[key.strip()] = [x.strip() for x in value.split(",") if x.strip()]
-        if parsed:
-            options["extractor_args"] = {"youtube": parsed}
-
+    # Do NOT set `impersonate='chrome'` blindly. That was the source of the
+    # user's "Impersonate target chrome is not available" error.
     return options
 
 
-def _youtube_extraction_profiles():
-    """Return conservative retries for transient YouTube extractor failures."""
-    profiles = [None]
-    # Only add alternatives if the owner did not explicitly configure one.
-    if not os.environ.get("YTDLP_EXTRACTOR_ARGS", "").strip():
-        profiles.extend([
-            {"youtube": {"player_client": ["web"]}},
-            {"youtube": {"player_client": ["mweb"]}},
-        ])
-    return profiles
-
-
 def extract_ytdlp_info(url: str):
-    errors = []
-    for profile in _youtube_extraction_profiles():
-        opts = ytdlp_base_options()
-        if profile:
-            opts["extractor_args"] = profile
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                return ydl.extract_info(url, download=False)
-        except Exception as exc:
-            errors.append(str(exc))
-    raise RuntimeError("yt-dlp extraction failed: " + " | ".join(errors[-3:]))
+    opts = ytdlp_base_options()
+    # Let current yt-dlp select its working YouTube player client. If one
+    # client is blocked, yt-dlp can try another supported client.
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        return ydl.extract_info(url, download=False)
 
 
 def build_ytdlp_format(height=None, audio=False, platform="unknown"):
@@ -1044,202 +954,65 @@ def build_ytdlp_format(height=None, audio=False, platform="unknown"):
     return "bestvideo+bestaudio/best"
 
 
-def _download_with_ytdlp_options(url, output_dir, opts, title_hint):
+def ytdlp_download(url: str, output_dir: str, *, height=None, audio=False, title_hint="video"):
+    platform = video_platform(url)
+    opts = ytdlp_base_options()
+    opts.update({
+        "format": build_ytdlp_format(height, audio, platform),
+        "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
+        "merge_output_format": "mp4",
+        "overwrites": True,
+    })
+    if audio:
+        opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }]
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filepath = ydl.prepare_filename(info)
-        return info, filepath
-
-
-def ytdlp_download(url: str, output_dir: str, *, height=None, audio=False, title_hint="video"):
-    platform = video_platform(url)
-    errors = []
-    for profile in _youtube_extraction_profiles() if platform == "youtube" else [None]:
-        opts = ytdlp_base_options()
-        opts.update({
-            "format": build_ytdlp_format(height, audio, platform),
-            "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
-            "merge_output_format": "mp4",
-            "overwrites": True,
-        })
-        if profile:
-            opts["extractor_args"] = profile
         if audio:
-            opts["postprocessors"] = [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }]
-        try:
-            info, filepath = _download_with_ytdlp_options(url, output_dir, opts, title_hint)
-            if audio:
-                base, _ = os.path.splitext(filepath)
-                candidate = base + ".mp3"
-                if os.path.isfile(candidate):
-                    filepath = candidate
-            if not os.path.isfile(filepath):
+            base, _ = os.path.splitext(filepath)
+            mp3_path = base + ".mp3"
+            if os.path.exists(mp3_path):
+                filepath = mp3_path
+        else:
+            # yt-dlp can change extension after merge/postprocessing.
+            if not os.path.exists(filepath):
                 stem = os.path.splitext(filepath)[0]
-                for ext in (".mp4", ".mkv", ".webm", ".mov", ".mp3", ".m4a"):
-                    if os.path.isfile(stem + ext):
+                for ext in (".mp4", ".mkv", ".webm", ".mov"):
+                    if os.path.exists(stem + ext):
                         filepath = stem + ext
                         break
-            if not os.path.isfile(filepath):
-                raise FileNotFoundError("yt-dlp finished without creating a media file")
-            return {"path": filepath, "title": info.get("title") or title_hint, "info": info}
-        except Exception as exc:
-            errors.append(str(exc))
-            for name in os.listdir(output_dir):
-                path = os.path.join(output_dir, name)
-                if os.path.isfile(path):
-                    try:
-                        os.unlink(path)
-                    except Exception:
-                        pass
-    raise RuntimeError("yt-dlp download failed: " + " | ".join(errors[-3:]))
+        if not os.path.isfile(filepath):
+            raise FileNotFoundError(f"Downloaded file was not created: {title_hint}")
+        return {"path": filepath, "title": info.get("title") or title_hint, "info": info}
 
 
-# --------------------------- PIPED LAST RESORT ---------------------------
-
-def _normalize_piped_url(raw):
-    """Accept ONLY the Piped API root, never /registered/badge or other paths."""
-    value = (raw or "").strip().strip("`<> ")
-    value = value.rstrip("/")
-    if not value.startswith(("https://", "http://")):
-        return None
-    try:
-        parsed = urllib.parse.urlparse(value)
-    except Exception:
-        return None
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        return None
-    if parsed.path not in {"", "/"} or parsed.params or parsed.query or parsed.fragment:
-        return None
-    host = parsed.hostname.lower() if parsed.hostname else ""
-    if not host or host.startswith("pipedapi.") is False and "piped" not in host:
-        # Discovery sources contain some non-Piped URLs. Reject them.
-        return None
-    return f"{parsed.scheme}://{parsed.netloc}"
-
-
-def _parse_piped_instances(markdown):
-    found = []
-    seen = set()
-    # Parse markdown table rows. We ONLY inspect the API URL column (column 2).
-    for line in markdown.splitlines():
-        if "|" not in line:
-            continue
-        cells = [c.strip() for c in line.split("|")]
-        if len(cells) < 3:
-            continue
-        api_cell = cells[2]
-        urls = re.findall(r"https?://[^\s|<>`]+", api_cell)
-        for raw in urls:
-            raw = raw.rstrip(".,;)]")
-            api = _normalize_piped_url(raw)
-            if api and api not in seen:
-                seen.add(api)
-                found.append(api)
-    return found
-
-
-def _discover_piped_instances():
-    discovered = []
-    for source in PIPED_DISCOVERY_URLS:
-        try:
-            req = urllib.request.Request(
-                source,
-                headers={"User-Agent": BROWSER_UA, "Accept": "text/plain,*/*"},
-            )
-            with urllib.request.urlopen(req, timeout=PIPED_TIMEOUT) as response:
-                text = response.read().decode("utf-8", "replace")
-            for api in _parse_piped_instances(text):
-                if api not in discovered:
-                    discovered.append(api)
-        except Exception:
-            continue
-    return discovered[:PIPED_MAX_CANDIDATES]
-
-
-def _piped_get_json(api, video_id):
-    endpoint = f"{api}/streams/{urllib.parse.quote(video_id, safe='')}"
+def piped_get_json(url: str):
     request = urllib.request.Request(
-        endpoint,
+        url,
         headers={
-            "User-Agent": BROWSER_UA,
-            "Accept": "application/json",
-            "Accept-Language": "en-US,en;q=0.8",
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json,text/plain,*/*",
         },
     )
-    with urllib.request.urlopen(request, timeout=PIPED_TIMEOUT) as response:
-        status = getattr(response, "status", 200)
-        raw = response.read()
-    if status != 200:
-        raise RuntimeError(f"HTTP {status}")
-    try:
-        data = json.loads(raw.decode("utf-8", "replace"))
-    except Exception:
-        preview = raw[:120].decode("utf-8", "replace").replace("\n", " ")
-        raise RuntimeError(f"non-JSON response: {preview!r}")
-    if not isinstance(data, dict):
-        raise RuntimeError("invalid Piped JSON object")
-    return data
-
-
-def _piped_bad(api, minutes):
-    PIPED_BAD[api] = time.time() + minutes * 60
-
-
-def _piped_metadata_one(api, video_id):
-    now = time.time()
-    if PIPED_BAD.get(api, 0) > now:
-        return None, f"{api}: temporarily skipped"
-    try:
-        return _piped_get_json(api, video_id), None
-    except urllib.error.HTTPError as exc:
-        code = exc.code
-        if code == 526:
-            _piped_bad(api, 360)
-        elif code == 403:
-            # A public instance may temporarily rate-limit/block Render.
-            _piped_bad(api, 30)
-        elif code in {404, 410}:
-            _piped_bad(api, 120)
-        elif code in {429, 500, 502, 503, 504}:
-            _piped_bad(api, 10)
-        else:
-            _piped_bad(api, 10)
-        return None, f"{api}: HTTP {code}"
-    except (socket.gaierror, urllib.error.URLError, TimeoutError) as exc:
-        _piped_bad(api, 10)
-        return None, f"{api}: network/DNS failure"
-    except Exception as exc:
-        _piped_bad(api, 10)
-        return None, f"{api}: {str(exc)[:120]}"
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return __import__("json").load(response)
 
 
 def piped_metadata(video_id: str):
-    with PIPED_LOCK:
-        now = time.time()
-        if now - PIPED_CACHE["time"] > PIPED_CACHE_TTL or not PIPED_CACHE["items"]:
-            PIPED_CACHE["items"] = _discover_piped_instances()
-            PIPED_CACHE["time"] = now
-        candidates = [x for x in PIPED_CACHE["items"] if PIPED_BAD.get(x, 0) <= now]
-
-    if not candidates:
-        candidates = _discover_piped_instances()
-
     errors = []
-    for api in candidates:
-        data, error = _piped_metadata_one(api, video_id)
-        if data and (data.get("videoStreams") or data.get("audioStreams")):
-            return data
-        if error:
-            errors.append(error)
-
-    raise RuntimeError(
-        "No healthy public Piped instance returned YouTube streams. "
-        + (" | ".join(errors[:8]) if errors else "No candidates were available.")
-    )
+    for api in PIPED_APIS:
+        try:
+            data = piped_get_json(f"{api}/streams/{urllib.parse.quote(video_id)}")
+            if data.get("videoStreams") or data.get("audioStreams"):
+                return data
+            errors.append(f"{api}: no streams")
+        except Exception as exc:
+            errors.append(f"{api}: {exc}")
+    raise RuntimeError("All YouTube fallback services failed: " + " | ".join(errors[:3]))
 
 
 def choose_piped_video_stream(streams, target_height):
@@ -1266,9 +1039,12 @@ def choose_piped_audio_stream(streams):
 def download_url_to_file(url: str, path: str, headers=None):
     request = urllib.request.Request(
         url,
-        headers=headers or {"User-Agent": BROWSER_UA, "Accept": "*/*"},
+        headers=headers or {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "*/*",
+        },
     )
-    with urllib.request.urlopen(request, timeout=45) as response, open(path, "wb") as dst:
+    with urllib.request.urlopen(request, timeout=30) as response, open(path, "wb") as dst:
         while True:
             chunk = response.read(1024 * 1024)
             if not chunk:
@@ -1278,9 +1054,17 @@ def download_url_to_file(url: str, path: str, headers=None):
 
 def ffmpeg_merge(video_path: str, audio_path: str, out_path: str):
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    cmd = [ffmpeg, "-y", "-i", video_path, "-i", audio_path,
-           "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
-           "-movflags", "+faststart", out_path]
+    cmd = [
+        ffmpeg, "-y",
+        "-i", video_path,
+        "-i", audio_path,
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-movflags", "+faststart",
+        out_path,
+    ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout or "FFmpeg merge failed")[-1500:])
@@ -1292,13 +1076,15 @@ def download_from_piped(meta, output_dir: str, *, height=None, audio=False):
     if audio:
         stream = choose_piped_audio_stream(meta.get("audioStreams") or [])
         if not stream:
-            raise RuntimeError("Piped returned no audio stream")
-        raw = os.path.join(output_dir, "audio.bin")
+            raise RuntimeError("YouTube fallback has no audio stream")
+        raw = os.path.join(output_dir, "audio.m4a")
         mp3 = os.path.join(output_dir, "audio.mp3")
         download_url_to_file(stream["url"], raw)
-        result = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", raw,
-                                 "-vn", "-c:a", "libmp3lame", "-b:a", "192k", mp3],
-                                capture_output=True, text=True)
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        result = subprocess.run([
+            ffmpeg, "-y", "-i", raw,
+            "-vn", "-c:a", "libmp3lame", "-b:a", "192k", mp3,
+        ], capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError((result.stderr or "Audio conversion failed")[-1200:])
         return {"path": mp3, "title": title}
@@ -1306,19 +1092,20 @@ def download_from_piped(meta, output_dir: str, *, height=None, audio=False):
     target = height or 720
     stream = choose_piped_video_stream(meta.get("videoStreams") or [], target)
     if not stream:
-        raise RuntimeError("Piped returned no video stream")
+        raise RuntimeError("YouTube fallback has no video stream")
     video_raw = os.path.join(output_dir, "video.bin")
     download_url_to_file(stream["url"], video_raw)
     mime = (stream.get("mimeType") or "").lower()
-    has_audio = not bool(stream.get("videoOnly"))
+    has_audio = not bool(stream.get("videoOnly")) or mime.startswith("video/mp4") and not stream.get("videoOnly")
     if has_audio:
         final = os.path.join(output_dir, "video.mp4")
-        if mime.startswith("video/mp4"):
+        if mime == "video/mp4":
             os.replace(video_raw, final)
         else:
-            result = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", video_raw,
-                                     "-c:v", "copy", "-c:a", "aac", "-movflags", "+faststart", final],
-                                    capture_output=True, text=True)
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+            result = subprocess.run([
+                ffmpeg, "-y", "-i", video_raw, "-c:v", "copy", "-c:a", "aac", "-movflags", "+faststart", final,
+            ], capture_output=True, text=True)
             if result.returncode != 0:
                 raise RuntimeError((result.stderr or "Video conversion failed")[-1200:])
             os.unlink(video_raw)
@@ -1326,7 +1113,7 @@ def download_from_piped(meta, output_dir: str, *, height=None, audio=False):
 
     audio_stream = choose_piped_audio_stream(meta.get("audioStreams") or [])
     if not audio_stream:
-        raise RuntimeError("Piped returned video-only stream and no audio stream")
+        raise RuntimeError("YouTube fallback video is video-only and no audio stream was found")
     audio_raw = os.path.join(output_dir, "audio.bin")
     final = os.path.join(output_dir, "video.mp4")
     download_url_to_file(audio_stream["url"], audio_raw)
@@ -1337,12 +1124,13 @@ def download_from_piped(meta, output_dir: str, *, height=None, audio=False):
 
 
 def tikwm_get_data(url: str):
-    endpoint = TIKWM_API + "?" + urllib.parse.urlencode({"url": url})
-    request = urllib.request.Request(endpoint, headers={"User-Agent": BROWSER_UA, "Accept": "application/json,*/*"})
+    query = urllib.parse.urlencode({"url": url})
+    endpoint = TIKWM_API + "?" + query
+    request = urllib.request.Request(endpoint, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,*/*"})
     with urllib.request.urlopen(request, timeout=25) as response:
-        data = json.loads(response.read().decode("utf-8", "replace"))
+        data = __import__("json").load(response)
     if int(data.get("code", -1)) != 0 or not data.get("data"):
-        raise RuntimeError(data.get("msg") or "TikTok fallback returned no data")
+        raise RuntimeError(data.get("msg") or "TikTok fallback service returned no data")
     return data["data"]
 
 
@@ -1353,12 +1141,11 @@ def tikwm_download(url: str, output_dir: str, *, quality="hd", audio=False):
         media_url = data.get("music")
         if not media_url:
             raise RuntimeError("TikTok fallback has no audio URL")
-        raw = os.path.join(output_dir, "tiktok_audio.bin")
         out = os.path.join(output_dir, "tiktok_audio.mp3")
+        raw = os.path.join(output_dir, "tiktok_audio.bin")
         download_url_to_file(media_url, raw)
-        result = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", raw,
-                                 "-vn", "-c:a", "libmp3lame", "-b:a", "192k", out],
-                                capture_output=True, text=True)
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        result = subprocess.run([ffmpeg, "-y", "-i", raw, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", out], capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError((result.stderr or "TikTok audio conversion failed")[-1200:])
         os.unlink(raw)
@@ -1372,65 +1159,38 @@ def tikwm_download(url: str, output_dir: str, *, quality="hd", audio=False):
     return {"path": out, "title": title}
 
 
-def _quality_list_from_formats(formats):
-    heights = sorted({int(f["height"]) for f in formats or []
-                      if f.get("vcodec") != "none" and f.get("height")}, reverse=True)
-    qualities = [q for q in VIDEO_QUALITIES if any(h >= q for h in heights)]
-    return qualities or ([max(heights)] if heights else [])
-
-
 def extract_download_options(url: str):
     platform = video_platform(url)
     normalized = normalize_public_url(url) if platform == "tiktok" else url
-    first_error = None
-
-    # PRIMARY: direct yt-dlp.
+    # Direct yt-dlp path first.
     try:
         info = extract_ytdlp_info(normalized)
         title = info.get("title") or "Video"
-        qualities = _quality_list_from_formats(info.get("formats"))
-        return {
-            "source": "ytdlp",
-            "platform": platform,
-            "url": normalized,
-            "title": title,
-            "qualities": qualities or [720],
-            "audio": bool(info.get("formats")) or True,
-        }
-    except Exception as exc:
-        first_error = str(exc)
-
-    # LAST RESORT: public Piped for YouTube only.
-    if platform == "youtube":
-        vid = youtube_video_id(normalized)
-        if not vid:
-            raise RuntimeError(f"YouTube URL could not be parsed. yt-dlp error: {first_error[:700]}")
-        try:
+        if platform == "youtube":
+            available = set()
+            for f in info.get("formats") or []:
+                if f.get("vcodec") != "none" and f.get("height"):
+                    available.add(int(f["height"]))
+            qualities = [q for q in VIDEO_QUALITIES if any(h >= q for h in available)]
+            if not qualities and available:
+                qualities = [max(available)]
+            return {"source": "ytdlp", "platform": platform, "url": normalized, "title": title, "qualities": qualities or [720], "audio": True}
+        # For other sites, expose the qualities yt-dlp actually knows about.
+        heights = sorted({int(f["height"]) for f in info.get("formats") or [] if f.get("vcodec") != "none" and f.get("height")}, reverse=True)
+        qualities = [q for q in VIDEO_QUALITIES if any(h >= q for h in heights)]
+        return {"source": "ytdlp", "platform": platform, "url": normalized, "title": title, "qualities": qualities or [720], "audio": True}
+    except Exception as first_error:
+        if platform == "youtube":
+            vid = youtube_video_id(normalized)
+            if not vid:
+                raise RuntimeError(f"YouTube extraction failed: {first_error}")
             piped = piped_metadata(vid)
             heights = sorted({int(s.get("height")) for s in piped.get("videoStreams") or [] if s.get("height")}, reverse=True)
             qualities = [q for q in VIDEO_QUALITIES if any(h >= q for h in heights)]
             if not qualities and heights:
                 qualities = [max(heights)]
-            return {
-                "source": "piped",
-                "platform": platform,
-                "url": normalized,
-                "title": piped.get("title") or "YouTube video",
-                "qualities": qualities or [720],
-                "audio": bool(piped.get("audioStreams")),
-                "piped": piped,
-            }
-        except Exception as piped_error:
-            runtime, _ = _find_js_runtime()
-            runtime_msg = runtime or "none"
-            raise RuntimeError(
-                "YouTube could not be extracted directly and no healthy public Piped fallback responded. "
-                f"JS runtime: {runtime_msg}. "
-                f"yt-dlp: {first_error[:500]} | Piped: {str(piped_error)[:700]}"
-            )
-
-    if platform == "tiktok":
-        try:
+            return {"source": "piped", "platform": platform, "url": normalized, "title": piped.get("title") or "YouTube video", "qualities": qualities or [720], "audio": bool(piped.get("audioStreams")), "piped": piped}
+        if platform == "tiktok":
             data = tikwm_get_data(normalized)
             qualities = []
             if data.get("hdplay"):
@@ -1440,14 +1200,9 @@ def extract_download_options(url: str):
             if not qualities and data.get("wmplay"):
                 qualities.append("sd")
             if not qualities:
-                raise RuntimeError("TikTok fallback returned no video")
-            return {"source": "tikwm", "platform": platform, "url": normalized,
-                    "title": data.get("title") or data.get("desc") or "TikTok video",
-                    "qualities": qualities, "audio": bool(data.get("music")), "tikwm": data}
-        except Exception as fallback_error:
-            raise RuntimeError(f"TikTok extraction failed. yt-dlp: {first_error[:400]} | fallback: {str(fallback_error)[:500]}")
-
-    raise RuntimeError(f"Extraction failed: {first_error[:900]}")
+                raise RuntimeError(f"TikTok extraction failed: {first_error}")
+            return {"source": "tikwm", "platform": platform, "url": normalized, "title": data.get("title") or data.get("desc") or "TikTok video", "qualities": qualities, "audio": bool(data.get("music")), "tikwm": data}
+        raise RuntimeError(f"Extraction failed: {first_error}")
 
 
 def format_bytes(value):
@@ -1486,7 +1241,7 @@ async def handle_video_download(update, context):
         await update.message.reply_text("❌ Please send a valid YouTube, TikTok, Instagram, or Facebook URL.")
         return
 
-    status_msg = await update.message.reply_text("🔎 Checking the video with the direct downloader…")
+    status_msg = await update.message.reply_text("🔎 Checking the video and available qualities…")
     try:
         job = await asyncio.to_thread(extract_download_options, raw_url)
         job["chat_id"] = update.effective_chat.id
@@ -1494,16 +1249,25 @@ async def handle_video_download(update, context):
         context.user_data["state"] = None
         title = job.get("title") or "Video"
         platform = job["platform"].title()
+        safe_title = html.escape(title[:120])
         await status_msg.edit_text(
             f"🎬 <b>{html.escape(platform)} Downloader</b>\n\n"
-            f"<b>{html.escape(title[:120])}</b>\n\n"
+            f"<b>{safe_title}</b>\n\n"
             "Choose the quality you want:",
             reply_markup=video_quality_keyboard(job),
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
         context.user_data["state"] = None
-        await status_msg.edit_text(f"❌ Could not prepare download.\n\n{str(e)[:1200]}")
+        msg = str(e)
+        if "Sign in to confirm" in msg or "LOGIN_REQUIRED" in msg:
+            msg = (
+                "YouTube is currently requiring authentication from this server. "
+                "The bot already tried its normal extractor and the public fallback. "
+                "For videos that remain protected, the supported option is to provide "
+                "a fresh cookies file through YTDLP_COOKIES_FILE."
+            )
+        await status_msg.edit_text(f"❌ Could not prepare download.\n\n{msg[:900]}")
 
 
 async def handle_video_callback(update, context, data):
@@ -1522,6 +1286,7 @@ async def handle_video_callback(update, context, data):
     selected = data.removeprefix("vd_q_")
     output_dir = tempfile.mkdtemp(prefix="tg_video_")
     status_msg = await query.message.reply_text("⏳ Preparing your download…")
+    filepath = None
     try:
         await query.edit_message_reply_markup(reply_markup=None)
         if selected == "audio":
@@ -1549,42 +1314,48 @@ async def handle_video_callback(update, context, data):
             raise FileNotFoundError("Downloaded file was not created")
 
         file_size = os.path.getsize(filepath)
-        if file_size > VIDEO_MAX_UPLOAD and not audio and job.get("platform") == "youtube":
-            lower = [q for q in VIDEO_QUALITIES if q < (quality or 999)]
-            for q in lower:
-                try:
-                    for name in os.listdir(output_dir):
-                        path = os.path.join(output_dir, name)
-                        if os.path.isfile(path):
-                            os.unlink(path)
-                    result = await asyncio.to_thread(do_download_for_quality, job, output_dir, q)
-                    filepath = result["path"]
-                    file_size = os.path.getsize(filepath)
-                    if file_size <= VIDEO_MAX_UPLOAD:
-                        quality = q
-                        break
-                except Exception:
-                    continue
-
         if file_size > VIDEO_MAX_UPLOAD:
-            raise RuntimeError(
-                f"The selected file is {format_bytes(file_size)}, above Telegram's 50 MB bot upload limit."
-            )
+            # Automatic quality fallback for videos: retry one step lower.
+            if not audio and job.get("platform") == "youtube":
+                lower = [q for q in VIDEO_QUALITIES if q < (quality or 999)]
+                if lower:
+                    await status_msg.edit_text("📦 That quality is over Telegram's 50 MB bot upload limit. Trying the next lower quality…")
+                    for q in lower:
+                        try:
+                            for name in os.listdir(output_dir):
+                                path = os.path.join(output_dir, name)
+                                if os.path.isfile(path):
+                                    os.unlink(path)
+                            result = await asyncio.to_thread(do_download_for_quality, job, output_dir, q)
+                            filepath = result["path"]
+                            if os.path.getsize(filepath) <= VIDEO_MAX_UPLOAD:
+                                quality = q
+                                file_size = os.path.getsize(filepath)
+                                break
+                        except Exception:
+                            continue
+                
+            if file_size > VIDEO_MAX_UPLOAD:
+                raise RuntimeError(
+                    f"The selected file is {format_bytes(file_size)}, above Telegram's current 50 MB bot upload limit."
+                )
 
         caption = f"✅ {job.get('title', 'Video')[:900]}"
         with open(filepath, "rb") as media:
             if audio:
-                await query.message.reply_audio(audio=media, filename=os.path.basename(filepath),
-                                                caption=caption, reply_markup=tool_done_kb())
+                await query.message.reply_audio(audio=media, filename=os.path.basename(filepath), caption=caption, reply_markup=tool_done_kb())
             else:
-                await query.message.reply_video(video=media, caption=caption,
-                                                supports_streaming=True, reply_markup=tool_done_kb())
+                await query.message.reply_video(video=media, caption=caption, supports_streaming=True, reply_markup=tool_done_kb())
         await status_msg.edit_text("✅ Download completed successfully!")
     except Exception as e:
         await status_msg.edit_text(f"❌ Download failed.\n\n{str(e)[:1000]}")
     finally:
         context.user_data.pop("video_job", None)
-        shutil.rmtree(output_dir, ignore_errors=True)
+        try:
+            import shutil
+            shutil.rmtree(output_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def do_download_for_quality(job, output_dir, quality):
@@ -1856,12 +1627,14 @@ async def fetch_profile(update, context, target):
     try:
         entity = await telethon_client.get_entity(target)
         context.user_data["profile_entity"] = entity
+        context.user_data["post_entity"] = entity
+        context.user_data["story_entity"] = entity
         save_user_history(entity.id, getattr(entity, "username", None), getattr(entity, "first_name", ""), getattr(entity, "last_name", ""))
         first_name = getattr(entity, "first_name", "") or ""
         last_name = getattr(entity, "last_name", "") or ""
         display_name = f"{first_name} {last_name}".strip() or getattr(entity, "title", "Unknown")
         text = f"<blockquote><b>{display_name}</b>\n@{getattr(entity, 'username', None) or 'N/A'}\n\n{getattr(entity, 'about', 'No bio')}\n\nID: {entity.id}\nVerified: {getattr(entity, 'verified', False)}\nPremium: {getattr(entity, 'premium', False)}\nBot: {getattr(entity, 'bot', False)}</blockquote>"
-        kb = [[InlineKeyboardButton("⬅️ Back", callback_data="more")]]
+        kb = [[InlineKeyboardButton("📰 View Posts", callback_data="posts_1"), InlineKeyboardButton("👁 View Story", callback_data="story_start")], [InlineKeyboardButton("⬅️ Back", callback_data="more")]]
         try:
             photo = await telethon_client.download_profile_photo(entity, file=BytesIO())
             if photo:
@@ -1905,55 +1678,29 @@ async def handle_posts_pagination(update, context, page):
     kb.append([InlineKeyboardButton("⬅️ Back to Profile", callback_data="profile")])
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
 
-# --- HYBRID TELEGRAM SEARCH ---
+# --- FAST GLOBAL TELEGRAM SEARCH ---
 #
-# Search design:
-# 1) JOINED: fast search inside the Telegram account's joined dialogs.
-# 2) PUBLIC: discover public t.me pages with web search, resolve those public
-#    usernames with Telethon, then search their messages. This works for many
-#    public channels/groups even when the account has NOT joined them.
-# 3) BOTH: run both sources and merge/deduplicate the results.
+# IMPORTANT:
+#   The old implementation opened up to 200 dialogs and then searched each
+#   dialog separately. That is why searches could take 1-5 minutes.
 #
-# We intentionally do NOT use messages.SearchGlobalRequest. That request is
-# brittle for this bot's requirement and was explicitly removed.
+#   This version uses Telegram's server-side global search once, then filters
+#   out chats/groups/channels that are already in the user's joined dialogs.
+#   The result is therefore much faster and is not limited to the user's
+#   joined-chat list.
+#
+#   NOTE: Telegram still requires an authenticated user session for this API.
+#   "Not from my account" here means "do not search only my joined chats".
+#   The server-side global search is used, and joined peers are removed from
+#   the displayed results.
 
 SEARCH_PAGE_SIZE = 8
+SEARCH_GLOBAL_LIMIT = 100
 SEARCH_JOINED_CACHE_SECONDS = 600
-SEARCH_MAX_JOINED_DIALOGS = 500
-SEARCH_MAX_JOINED_RESULTS_PER_DIALOG = 3
-SEARCH_MAX_PUBLIC_LINKS = 18
-SEARCH_MAX_PUBLIC_ENTITIES = 10
-SEARCH_MAX_PUBLIC_RESULTS_PER_ENTITY = 3
-SEARCH_HISTORY_SIZE = 8
-SEARCH_WEB_TIMEOUT = 12
-
-
-class _TelegramWebResultParser(HTMLParser):
-    """Small stdlib-only parser for search-engine HTML result pages."""
-    def __init__(self):
-        super().__init__()
-        self.results = []
-        self._href = None
-        self._text = []
-
-    def handle_starttag(self, tag, attrs):
-        if tag.lower() == "a":
-            self._href = dict(attrs).get("href")
-            self._text = []
-
-    def handle_data(self, data):
-        if self._href is not None:
-            self._text.append(data)
-
-    def handle_endtag(self, tag):
-        if tag.lower() == "a" and self._href:
-            text = re.sub(r"\s+", " ", " ".join(self._text)).strip()
-            self.results.append((self._href, text))
-            self._href = None
-            self._text = []
 
 
 def _search_peer_marked_id(entity):
+    """Return Telegram's marked peer ID without making a network request."""
     try:
         return int(get_peer_id(entity))
     except Exception:
@@ -1962,12 +1709,15 @@ def _search_peer_marked_id(entity):
 
 
 def _search_peer_kind(entity):
+    """Classify a Telegram peer as channel/group/user/bot."""
     if entity is None:
         return "unknown"
     if getattr(entity, "bot", False):
         return "bot"
+    # Telethon Channel represents both broadcast channels and supergroups.
     if hasattr(entity, "broadcast"):
         return "channel" if getattr(entity, "broadcast", False) else "group"
+    # Basic Telegram groups are represented by Chat.
     if entity.__class__.__name__ == "Chat":
         return "group"
     if hasattr(entity, "first_name") or hasattr(entity, "username"):
@@ -1983,18 +1733,28 @@ def _search_peer_name(entity):
         return str(title).strip()
     first = (getattr(entity, "first_name", None) or "").strip()
     last = (getattr(entity, "last_name", None) or "").strip()
-    return f"{first} {last}".strip() or "Unknown"
+    name = f"{first} {last}".strip()
+    return name or "Unknown"
 
 
 def _search_peer_link(entity):
     username = getattr(entity, "username", None)
-    return f"https://t.me/{username}" if username else None
+    if username:
+        return f"https://t.me/{username}"
+    return None
 
 
 def _search_message_link(entity, message_id):
     username = getattr(entity, "username", None)
     if username:
         return f"https://t.me/{username}/{message_id}"
+
+    # For public channels/groups without a username Telegram may not expose a
+    # normal clickable public URL. We keep the result but omit a fake link.
+    marked_id = _search_peer_marked_id(entity)
+    if marked_id is not None and marked_id < -1000000000000:
+        internal_id = str(abs(marked_id))[3:]
+        return f"https://t.me/c/{internal_id}/{message_id}"
     return None
 
 
@@ -2011,6 +1771,8 @@ def _search_message_type(message):
         return "gif"
     if getattr(message, "document", None):
         return "document"
+
+    # Detect URLs without doing another network request.
     text = (getattr(message, "message", None) or "").strip()
     if re.search(r"https?://|t\.me/|www\.", text, re.I):
         return "link"
@@ -2021,12 +1783,243 @@ def _search_content(message):
     text = (getattr(message, "message", None) or "").strip()
     if text:
         return re.sub(r"\s+", " ", text)[:180]
+    media_type = _search_message_type(message)
     labels = {
-        "photo": "📷 Photo", "video": "🎬 Video", "voice": "🎤 Voice message",
-        "audio": "🎵 Audio", "gif": "🎞️ GIF", "document": "📄 Document",
-        "link": "🔗 Link", "text": "💬 Message",
+        "photo": "📷 Photo",
+        "video": "🎬 Video",
+        "voice": "🎤 Voice message",
+        "audio": "🎵 Audio",
+        "gif": "🎞️ GIF",
+        "document": "📄 Document",
+        "link": "🔗 Link",
+        "text": "💬 Message",
     }
-    return labels.get(_search_message_type(message), "💬 Message")
+    return labels.get(media_type, "💬 Message")
+
+
+async def _get_joined_peer_ids(context):
+    """Cache joined peer IDs so every search does not call get_dialogs()."""
+    now = time.monotonic()
+    cached_at = context.application.bot_data.get("search_joined_cache_at", 0.0)
+    cached_ids = context.application.bot_data.get("search_joined_ids")
+    if cached_ids is not None and now - cached_at < SEARCH_JOINED_CACHE_SECONDS:
+        return set(cached_ids)
+
+    joined = set()
+    try:
+        # This call is only for the exclusion list. The actual search below is
+        # still one server-side global search request.
+        async for dialog in telethon_client.iter_dialogs(limit=500):
+            entity = getattr(dialog, "entity", None)
+            if entity is None:
+                continue
+            kind = _search_peer_kind(entity)
+            if kind in {"group", "channel"}:
+                marked = _search_peer_marked_id(entity)
+                if marked is not None:
+                    joined.add(marked)
+    except Exception as exc:
+        # If the cache cannot be refreshed, keep the previous cache rather than
+        # failing the whole global search.
+        print(f"[Search] joined-peer cache refresh failed: {exc}")
+        if cached_ids is not None:
+            return set(cached_ids)
+
+    context.application.bot_data["search_joined_ids"] = joined
+    context.application.bot_data["search_joined_cache_at"] = now
+    return joined
+
+
+def _search_peer_from_result(peer_id, peer_map):
+    if peer_id is None:
+        return None
+    try:
+        return peer_map.get(int(peer_id))
+    except Exception:
+        return None
+
+
+async def fetch_search(update, context, query):
+    query = (query or "").strip()
+    if not query:
+        await update.message.reply_text("🔎 Please enter a keyword, for example: Logic mid")
+        return
+
+    status_msg = await update.message.reply_text(
+        f"🔎 Searching Telegram globally for: <b>{html.escape(query)}</b>\n"
+        "⚡ Server-side search • excluding your joined groups/channels",
+        parse_mode=ParseMode.HTML,
+    )
+
+    started = time.monotonic()
+    try:
+        # Refresh the exclusion cache and run the global request concurrently.
+        joined_task = asyncio.create_task(_get_joined_peer_ids(context))
+
+        # Telegram's messages.searchGlobal is the server-side global search.
+        # It is NOT the old "get_dialogs -> search every dialog" approach.
+        global_result = await telethon_client(
+            functions.messages.SearchGlobalRequest(
+                q=query,
+                filter=types.InputMessagesFilterEmpty(),
+                min_date=0,
+                max_date=0,
+                offset_rate=0,
+                offset_peer=types.InputPeerEmpty(),
+                offset_id=0,
+                limit=SEARCH_GLOBAL_LIMIT,
+            )
+        )
+        joined_ids = await joined_task
+
+        # Build the peer map from Telegram's returned auxiliary objects.
+        peer_map = {}
+        for entity in list(getattr(global_result, "chats", []) or []) + list(getattr(global_result, "users", []) or []):
+            marked = _search_peer_marked_id(entity)
+            if marked is not None:
+                peer_map[marked] = entity
+
+        results = []
+        seen = set()
+        joined_hidden = 0
+
+        for message in list(getattr(global_result, "messages", []) or []):
+            marked_peer = None
+            try:
+                marked_peer = _search_peer_marked_id(message.peer_id)
+            except Exception:
+                marked_peer = None
+
+            entity = _search_peer_from_result(marked_peer, peer_map)
+
+            # Some result constructors expose chat_id more conveniently.
+            if entity is None:
+                chat_id = getattr(message, "chat_id", None)
+                if chat_id is not None:
+                    for candidate_id, candidate in peer_map.items():
+                        if candidate_id == int(chat_id):
+                            entity = candidate
+                            marked_peer = candidate_id
+                            break
+
+            if entity is None:
+                # Do not make one get_entity() request per result. That was one
+                # of the major causes of the old slow search.
+                continue
+
+            peer_kind = _search_peer_kind(entity)
+
+            # Main requirement: hide messages belonging to groups/channels the
+            # logged-in Telegram account has already joined.
+            if marked_peer in joined_ids and peer_kind in {"group", "channel"}:
+                joined_hidden += 1
+                continue
+
+            # Do not turn this into a private-chat/message search. The search is
+            # intended as public discovery. Bots are kept because they are a
+            # requested search category.
+            if peer_kind == "user":
+                continue
+
+            message_id = getattr(message, "id", None)
+            if not message_id:
+                continue
+
+            key = (marked_peer, int(message_id))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            media_type = _search_message_type(message)
+            link = _search_message_link(entity, message_id)
+            results.append({
+                "kind": "message",
+                "type": media_type,
+                "peer_type": peer_kind,
+                "peer_id": marked_peer,
+                "entity": entity,
+                "message": message,
+                "link": link,
+                "content": _search_content(message),
+                "title": _search_peer_name(entity),
+                "username": getattr(entity, "username", None),
+                "date": getattr(message, "date", None),
+                "score": 1000 - len(results),
+            })
+
+        # Also expose public peers returned by the global search. This gives
+        # users a useful "channel/group/bot" result even when the message list
+        # itself is short.
+        for entity in list(getattr(global_result, "chats", []) or []) + list(getattr(global_result, "users", []) or []):
+            kind = _search_peer_kind(entity)
+            marked = _search_peer_marked_id(entity)
+            if kind in {"group", "channel"} and marked in joined_ids:
+                continue
+            if kind not in {"group", "channel", "bot"}:
+                continue
+
+            name = _search_peer_name(entity)
+            username = getattr(entity, "username", None)
+            searchable = f"{name} @{username or ''}".lower()
+            if query.lower() not in searchable and not any(
+                r["peer_id"] == marked for r in results
+            ):
+                continue
+
+            peer_link = _search_peer_link(entity)
+            peer_key = ("peer", marked)
+            if peer_key in seen:
+                continue
+            seen.add(peer_key)
+            results.append({
+                "kind": "peer",
+                "type": kind,
+                "peer_type": kind,
+                "peer_id": marked,
+                "entity": entity,
+                "message": None,
+                "link": peer_link,
+                "content": f"{('🤖' if kind == 'bot' else '📢' if kind == 'channel' else '👥')} {name}"
+                            + (f"  @{username}" if username else ""),
+                "title": name,
+                "username": username,
+                "date": None,
+                "score": 2000 - len(results),
+            })
+
+        if not results:
+            await status_msg.edit_text(
+                f"❌ No public results found for <b>{html.escape(query)}</b>.\n\n"
+                "The search intentionally hides results from groups/channels you already joined.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        # Put actual messages first, then peer cards, preserving Telegram's
+        # relevance ordering as much as possible.
+        results.sort(key=lambda item: item.get("score", 0), reverse=True)
+
+        context.user_data["search_results"] = results
+        context.user_data["search_query"] = query
+        context.user_data["search_filter"] = "all"
+        context.user_data["search_page"] = 1
+        context.user_data["search_joined_hidden"] = joined_hidden
+        context.user_data["search_elapsed"] = round(time.monotonic() - started, 2)
+
+        await status_msg.delete()
+        await display_search_page(update, context, 1, "all")
+
+    except FloodWaitError as e:
+        await status_msg.edit_text(
+            f"⏳ Telegram rate limit. Please wait {e.seconds} seconds and try again."
+        )
+    except Exception as e:
+        print(f"[Search] Global search failed: {type(e).__name__}: {e}")
+        await status_msg.edit_text(
+            f"❌ Search failed: <code>{html.escape(type(e).__name__)}</code>\n\n"
+            f"{html.escape(str(e)[:700])}",
+            parse_mode=ParseMode.HTML,
+        )
 
 
 def _search_filter_match(item, filter_type):
@@ -2054,298 +2047,40 @@ def _search_filter_match(item, filter_type):
 
 
 def _search_filter_buttons(results, active):
+    """Create only filters that actually have results. This is dynamic."""
     definitions = [
-        ("all", "🔎 All"), ("messages", "💬 Messages"),
-        ("photos", "📷 Photos"), ("videos", "🎬 Videos"),
-        ("files", "📄 Files"), ("audio", "🎵 Audio"),
-        ("links", "🔗 Links"), ("channels", "📢 Channels"),
-        ("groups", "👥 Groups"), ("bots", "🤖 Bots"),
+        ("all", "🔎 All"),
+        ("messages", "💬 Messages"),
+        ("photos", "📷 Photos"),
+        ("videos", "🎬 Videos"),
+        ("files", "📄 Files"),
+        ("audio", "🎵 Audio"),
+        ("links", "🔗 Links"),
+        ("channels", "📢 Channels"),
+        ("groups", "👥 Groups"),
+        ("bots", "🤖 Bots"),
     ]
-    counts = {ft: sum(1 for x in results if _search_filter_match(x, ft)) for ft, _ in definitions}
+
+    counts = {}
+    for filter_type, _ in definitions:
+        counts[filter_type] = sum(1 for item in results if _search_filter_match(item, filter_type))
+
     available = []
-    for ft, label in definitions:
-        if ft == "all" or counts[ft] > 0:
-            shown = f"{label} ({counts[ft]})"
-            if ft == active:
+    for filter_type, label in definitions:
+        if filter_type == "all" or counts[filter_type] > 0:
+            shown = f"{label} ({counts[filter_type]})"
+            if filter_type == active:
                 shown = f"✅ {shown}"
-            available.append((ft, shown))
+            available.append((filter_type, shown))
+
     rows = []
+    # Five compact buttons per row; Telegram clients can render this cleanly.
     for i in range(0, len(available), 3):
-        rows.append([InlineKeyboardButton(label, callback_data=f"sf_{ft}") for ft, label in available[i:i+3]])
+        rows.append([
+            InlineKeyboardButton(label, callback_data=f"sf_{filter_type}")
+            for filter_type, label in available[i:i + 3]
+        ])
     return rows, counts
-
-
-def _normalize_tme_result(url):
-    """Return a public t.me username URL; reject non-Telegram links."""
-    if not url:
-        return None
-    url = html.unescape(url)
-    # DuckDuckGo/Bing can return redirect URLs. Pull the actual target.
-    parsed = urllib.parse.urlparse(url)
-    if parsed.netloc.lower().endswith("duckduckgo.com"):
-        qs = urllib.parse.parse_qs(parsed.query)
-        url = qs.get("uddg", [url])[0]
-    elif parsed.netloc.lower().endswith("bing.com"):
-        qs = urllib.parse.parse_qs(parsed.query)
-        url = qs.get("url", [url])[0]
-    parsed = urllib.parse.urlparse(url)
-    host = parsed.netloc.lower().split(":", 1)[0]
-    if host not in {"t.me", "telegram.me", "www.t.me", "www.telegram.me"}:
-        return None
-    parts = [p for p in parsed.path.split("/") if p]
-    if not parts:
-        return None
-    username = parts[0]
-    # Public username only. Numeric /c/ links and private invite links are not
-    # useful for unauthenticated public discovery.
-    if username in {"c", "joinchat", "addstickers", "iv"}:
-        return None
-    if not re.fullmatch(r"[A-Za-z0-9_]{4,64}", username):
-        return None
-    return f"https://t.me/{username}", username
-
-
-async def _web_search_tme(query):
-    """Discover public Telegram usernames without Telegram global search."""
-    encoded = urllib.parse.quote_plus(f'site:t.me "{query}"')
-    endpoints = [
-        f"https://html.duckduckgo.com/html/?q={encoded}",
-        f"https://www.bing.com/search?q={encoded}",
-    ]
-
-    def fetch(url):
-        req = urllib.request.Request(url, headers={
-            "User-Agent": BROWSER_UA,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.8",
-        })
-        with urllib.request.urlopen(req, timeout=SEARCH_WEB_TIMEOUT) as response:
-            return response.read().decode("utf-8", "ignore")
-
-    found = []
-    seen = set()
-    for endpoint in endpoints:
-        try:
-            raw = await asyncio.to_thread(fetch, endpoint)
-            parser = _TelegramWebResultParser()
-            parser.feed(raw)
-            for href, title in parser.results:
-                normalized = _normalize_tme_result(href)
-                if not normalized:
-                    continue
-                link, username = normalized
-                if username.lower() in seen:
-                    continue
-                seen.add(username.lower())
-                found.append({"username": username, "link": link, "title": title})
-                if len(found) >= SEARCH_MAX_PUBLIC_LINKS:
-                    return found
-        except Exception as exc:
-            print(f"[Search] public web discovery failed: {type(exc).__name__}: {exc}")
-    return found
-
-
-async def _get_joined_entities(context):
-    """Cache joined group/channel entities to avoid repeated get_dialogs calls."""
-    now = time.monotonic()
-    cached_at = context.application.bot_data.get("search_joined_cache_at", 0.0)
-    cached = context.application.bot_data.get("search_joined_entities")
-    if cached is not None and now - cached_at < SEARCH_JOINED_CACHE_SECONDS:
-        return list(cached)
-
-    entities = []
-    try:
-        async for dialog in telethon_client.iter_dialogs(limit=SEARCH_MAX_JOINED_DIALOGS):
-            entity = getattr(dialog, "entity", None)
-            if entity and _search_peer_kind(entity) in {"group", "channel"}:
-                entities.append(entity)
-    except Exception as exc:
-        print(f"[Search] joined cache refresh failed: {exc}")
-        if cached is not None:
-            return list(cached)
-
-    context.application.bot_data["search_joined_entities"] = entities
-    context.application.bot_data["search_joined_cache_at"] = now
-    return entities
-
-
-async def _search_entity(entity, query, limit=3, source="joined"):
-    try:
-        messages = await telethon_client.get_messages(entity, search=query, limit=limit)
-        output = []
-        for message in messages:
-            message_id = getattr(message, "id", None)
-            if not message_id:
-                continue
-            kind = _search_peer_kind(entity)
-            output.append({
-                "kind": "message", "type": _search_message_type(message),
-                "peer_type": kind, "peer_id": _search_peer_marked_id(entity),
-                "entity": entity, "message": message,
-                "link": _search_message_link(entity, message_id),
-                "content": _search_content(message),
-                "title": _search_peer_name(entity),
-                "username": getattr(entity, "username", None),
-                "date": getattr(message, "date", None),
-                "source": source,
-            })
-        return output
-    except Exception as exc:
-        print(f"[Search] entity search skipped {_search_peer_name(entity)}: {type(exc).__name__}: {exc}")
-        return []
-
-
-async def _search_joined(query, context):
-    entities = await _get_joined_entities(context)
-    # Search all joined groups/channels concurrently, but cap concurrency so a
-    # large account does not trigger a Telegram flood wait.
-    sem = asyncio.Semaphore(8)
-    async def worker(entity):
-        async with sem:
-            return await _search_entity(entity, query, SEARCH_MAX_JOINED_RESULTS_PER_DIALOG, "joined")
-    batches = await asyncio.gather(*(worker(e) for e in entities))
-    return [item for batch in batches for item in batch]
-
-
-async def _search_public(query):
-    discovered = await _web_search_tme(query)
-    if not discovered:
-        return [], 0
-
-    resolved = []
-    seen_usernames = set()
-    for item in discovered[:SEARCH_MAX_PUBLIC_ENTITIES]:
-        username = item["username"].lower()
-        if username in seen_usernames:
-            continue
-        try:
-            entity = await telethon_client.get_entity(item["username"])
-            kind = _search_peer_kind(entity)
-            if kind in {"channel", "group", "bot"}:
-                resolved.append(entity)
-                seen_usernames.add(username)
-        except Exception as exc:
-            print(f"[Search] public username @{item['username']} skipped: {type(exc).__name__}: {exc}")
-
-    sem = asyncio.Semaphore(5)
-    async def worker(entity):
-        async with sem:
-            return await _search_entity(entity, query, SEARCH_MAX_PUBLIC_RESULTS_PER_ENTITY, "public")
-    batches = await asyncio.gather(*(worker(e) for e in resolved))
-    results = [item for batch in batches for item in batch]
-
-    # Add peer cards for discovered public channels/groups/bots even if their
-    # message search returned nothing. This makes public discovery useful.
-    existing_peers = {r.get("peer_id") for r in results}
-    for entity in resolved:
-        peer_id = _search_peer_marked_id(entity)
-        if peer_id in existing_peers:
-            continue
-        results.append({
-            "kind": "peer", "type": _search_peer_kind(entity),
-            "peer_type": _search_peer_kind(entity), "peer_id": peer_id,
-            "entity": entity, "message": None,
-            "link": _search_peer_link(entity),
-            "content": f"{('🤖' if _search_peer_kind(entity) == 'bot' else '📢' if _search_peer_kind(entity) == 'channel' else '👥')} {_search_peer_name(entity)}",
-            "title": _search_peer_name(entity),
-            "username": getattr(entity, "username", None),
-            "date": None, "source": "public",
-        })
-    return results, len(discovered)
-
-
-async def fetch_search(update, context, query):
-    message = update.effective_message
-    query = (query or "").strip()
-    if not query:
-        await message.reply_text("🔎 Please enter a keyword, for example: Logic mid")
-        return
-    if len(query) > 100:
-        await message.reply_text("⚠️ Search query is too long. Please keep it under 100 characters.")
-        return
-
-    mode = context.user_data.get("search_mode", "both")
-    mode_label = {"joined": "Joined chats", "public": "Public Telegram", "both": "Joined + Public"}.get(mode, "Joined + Public")
-    status_msg = await message.reply_text(
-        f"🔎 Searching: <b>{html.escape(query)}</b>\n"
-        f"🎯 Scope: <b>{mode_label}</b>\n"
-        "⚡ Fast hybrid search — no Telegram global-search request",
-        parse_mode=ParseMode.HTML,
-    )
-    started = time.monotonic()
-
-    try:
-        tasks = []
-        if mode in {"joined", "both"}:
-            tasks.append(asyncio.create_task(_search_joined(query, context)))
-        else:
-            tasks.append(asyncio.create_task(asyncio.sleep(0, result=[])))
-        if mode in {"public", "both"}:
-            tasks.append(asyncio.create_task(_search_public(query)))
-        else:
-            tasks.append(asyncio.create_task(asyncio.sleep(0, result=([], 0))))
-
-        joined_results, public_payload = await asyncio.gather(*tasks)
-        public_results, discovered_count = public_payload
-        results = list(joined_results) + list(public_results)
-
-        # Deduplicate the same message found through multiple paths.
-        unique = []
-        seen = set()
-        for item in results:
-            key = (item.get("peer_id"), getattr(item.get("message"), "id", None), item.get("kind"))
-            if key in seen:
-                continue
-            seen.add(key)
-            unique.append(item)
-
-        # Relevance first, then newest date.
-        q_words = [w.lower() for w in re.findall(r"\w+", query) if len(w) > 1]
-        def relevance(item):
-            text = f"{item.get('title','')} {item.get('content','')}".lower()
-            hits = sum(text.count(word) for word in q_words)
-            source_bonus = 2 if item.get("source") == "public" else 1
-            date = getattr(item.get("date"), "timestamp", lambda: 0)() if item.get("date") else 0
-            return (hits, source_bonus, date)
-        unique.sort(key=relevance, reverse=True)
-
-        if not unique:
-            public_note = f"\n🌍 Public pages discovered: {discovered_count}" if mode in {"public", "both"} else ""
-            await status_msg.edit_text(
-                f"❌ No results found for <b>{html.escape(query)}</b>.{public_note}\n\n"
-                "Try a shorter keyword, a channel name, or switch Search Scope.",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-
-        history = context.user_data.get("search_history", [])
-        history = [query] + [x for x in history if x.lower() != query.lower()]
-        context.user_data["search_history"] = history[:SEARCH_HISTORY_SIZE]
-        context.user_data["search_results"] = unique
-        context.user_data["search_query"] = query
-        context.user_data["search_filter"] = "all"
-        context.user_data["search_sort"] = "relevance"
-        context.user_data["search_page"] = 1
-        context.user_data["search_elapsed"] = round(time.monotonic() - started, 2)
-        context.user_data["search_discovered"] = discovered_count
-        context.user_data["search_mode"] = mode
-
-        await status_msg.delete()
-        await display_search_page(update, context, 1, "all")
-    except FloodWaitError as e:
-        await status_msg.edit_text(f"⏳ Telegram rate limit. Please wait {e.seconds} seconds and try again.")
-    except Exception as e:
-        print(f"[Search] hybrid search failed: {type(e).__name__}: {e}")
-        await status_msg.edit_text(
-            f"❌ Search failed: <code>{html.escape(type(e).__name__)}</code>\n\n{html.escape(str(e)[:700])}",
-            parse_mode=ParseMode.HTML,
-        )
-
-
-def _search_sort_results(results, sort_type):
-    if sort_type == "recent":
-        return sorted(results, key=lambda x: getattr(x.get("date"), "timestamp", lambda: 0)(), reverse=True)
-    return results
 
 
 async def display_search_page(update, context, page, filter_type=None):
@@ -2356,10 +2091,8 @@ async def display_search_page(update, context, page, filter_type=None):
     results = context.user_data.get("search_results", [])
     search_query = context.user_data.get("search_query", "")
     active = filter_type or context.user_data.get("search_filter", "all")
-    sort_type = context.user_data.get("search_sort", "relevance")
-    filtered = [item for item in results if _search_filter_match(item, active)]
-    filtered = _search_sort_results(filtered, sort_type)
 
+    filtered = [item for item in results if _search_filter_match(item, active)]
     per_page = SEARCH_PAGE_SIZE
     total_results = len(filtered)
     total_pages = max(1, (total_results + per_page - 1) // per_page)
@@ -2369,19 +2102,17 @@ async def display_search_page(update, context, page, filter_type=None):
 
     start = (page - 1) * per_page
     page_items = filtered[start:start + per_page]
+
     elapsed = context.user_data.get("search_elapsed", 0)
-    discovered = context.user_data.get("search_discovered", 0)
-    mode = context.user_data.get("search_mode", "both")
-    mode_label = {"joined": "Joined", "public": "Public", "both": "Both"}.get(mode, "Both")
+    joined_hidden = context.user_data.get("search_joined_hidden", 0)
 
     lines = [
-        "<blockquote>", "<b>🔎 TELEGRAM HYBRID SEARCH</b>",
-        f"🔍 <b>{html.escape(search_query)}</b>",
-        f"🎯 Scope: {mode_label} • ⚡ {elapsed}s",
+        "<blockquote>",
+        "<b>🌐 GLOBAL TELEGRAM SEARCH</b>",
+        f"🔎 <b>{html.escape(search_query)}</b>",
+        f"⚡ {elapsed}s • hidden joined results: {joined_hidden}",
+        "",
     ]
-    if discovered:
-        lines.append(f"🌍 Public pages discovered: {discovered}")
-    lines.append("")
 
     if not page_items:
         lines.append("<i>No results in this filter.</i>")
@@ -2395,28 +2126,27 @@ async def display_search_page(update, context, page, filter_type=None):
                 "audio": "🎵", "voice": "🎤", "link": "🔗", "bot": "🤖",
                 "channel": "📢", "group": "👥", "text": "💬",
             }.get(item.get("type"), "🔹")
-            source_icon = "🌍" if item.get("source") == "public" else "💬"
+
             content = html.escape(item.get("content") or "")
             if len(content) > 180:
                 content = content[:177] + "..."
+
             if item.get("link"):
                 lines.append(
-                    f"<b>{index}.</b> {source_icon}{icon} <a href=\"{html.escape(item['link'], quote=True)}\">"
+                    f"<b>{index}.</b> {icon} <a href=\"{html.escape(item['link'], quote=True)}\">"
                     f"{peer_name}{username_text}</a>\n{content}\n"
                 )
             else:
-                lines.append(f"<b>{index}.</b> {source_icon}{icon} <b>{peer_name}{username_text}</b>\n{content}\n")
+                lines.append(
+                    f"<b>{index}.</b> {icon} <b>{peer_name}{username_text}</b>\n{content}\n"
+                )
 
-    lines.append(f"Page {page}/{total_pages} • {total_results} results • Sort: {sort_type}")
+    lines.append(f"Page {page}/{total_pages} • {total_results} results")
     lines.append("</blockquote>")
     text = "\n".join(lines)
 
-    kb, _ = _search_filter_buttons(results, active)
-    kb.append([
-        InlineKeyboardButton("🎯 Scope", callback_data="search_scope"),
-        InlineKeyboardButton("↕️ Sort", callback_data="search_sort"),
-        InlineKeyboardButton("🕘 History", callback_data="search_history"),
-    ])
+    kb, counts = _search_filter_buttons(results, active)
+
     nav = []
     if page > 1:
         nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"search_page_{page - 1}"))
@@ -2424,6 +2154,7 @@ async def display_search_page(update, context, page, filter_type=None):
         nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"search_page_{page + 1}"))
     if nav:
         kb.append(nav)
+
     kb.append([
         InlineKeyboardButton("🔄 New Search", callback_data="search"),
         InlineKeyboardButton("⬅️ Back", callback_data="more"),
@@ -2432,12 +2163,23 @@ async def display_search_page(update, context, page, filter_type=None):
 
     if callback:
         try:
-            await callback.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            await callback.edit_message_text(
+                text,
+                reply_markup=markup,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
         except Exception as exc:
+            # Telegram may reject an edit if the content is unchanged.
             if "message is not modified" not in str(exc).lower():
                 raise
     else:
-        await update.message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        await update.message.reply_text(
+            text,
+            reply_markup=markup,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
 
 async def fetch_words(update, context, target):
     try:
@@ -2522,6 +2264,8 @@ async def handle_link(update, context):
     user_id = update.effective_user.id
     text = update.message.text if update.message.text else ""
     self_ping()
+    if context.user_data.get('state') == 'awaiting_text_pdf': await handle_text_pdf_input(update, context); return
+    if context.user_data.get('state') == 'awaiting_text_to_image': await handle_text_to_image(update, context); return
     if context.user_data.get('state') == 'awaiting_image_to_pdf': await handle_image_collect(update, context); return
     if context.user_data.get('state') == 'awaiting_pdf': await handle_pdf_upload(update, context); return
     if context.user_data.get('state') == 'awaiting_pdf_to_word': await handle_pdf_to_word(update, context); return
