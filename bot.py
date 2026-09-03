@@ -1,8 +1,4 @@
 import re
-import json
-import random
-import socket
-import shutil
 import asyncio
 import os
 import sys
@@ -781,59 +777,65 @@ async def handle_voice_to_text(update, context, language):
         context.user_data['state'] = None
 
 # --- POWERFUL MULTI-SOURCE VIDEO DOWNLOADER ---
-# Supported input: YouTube, TikTok, Instagram, Facebook.
-# The bot first uses yt-dlp. For YouTube/TikTok failures, it can use public
-# fallback services that return stream URLs. No CAPTCHA or anti-bot bypass code
-# is used. Optional authenticated cookies can be provided by the owner through
-# YTDLP_COOKIES_FILE if the service requires login.
+# Direct yt-dlp is the PRIMARY YouTube downloader.
+# Public Piped instances are ONLY a last-resort metadata/stream fallback.
+# The Piped discovery code accepts ROOT API URLs only; paths such as
+# /registered/badge are deliberately rejected.
 
 VIDEO_MAX_UPLOAD = 50 * 1024 * 1024
 VIDEO_QUALITIES = [1080, 720, 480, 360, 240]
-PIPED_INSTANCES_URL = "https://raw.githubusercontent.com/TeamPiped/documentation/main/content/docs/public-instances/index.md"
-PIPED_CACHE_TTL = 60 * 60
-PIPED_HEALTH_TIMEOUT = 3
-PIPED_REQUEST_TIMEOUT = 12
-PIPED_MAX_HEALTHY = 12
-PIPED_APIS = []
-_PIPED_CACHE = {"expires": 0.0, "instances": []}
-_PIPED_BAD_UNTIL = {}
-
 TIKWM_API = "https://www.tikwm.com/api/"
+
+# TeamPiped publishes the public API list. We do not hard-code individual
+# instances because public instances frequently disappear or change.
+PIPED_DISCOVERY_URLS = (
+    "https://raw.githubusercontent.com/TeamPiped/wiki/master/Instances.md",
+    "https://raw.githubusercontent.com/TeamPiped/documentation/main/content/docs/public-instances/index.md",
+)
+PIPED_CACHE_TTL = 60 * 60
+PIPED_TIMEOUT = 10
+PIPED_MAX_CANDIDATES = 20
+PIPED_BAD = {}
+PIPED_CACHE = {"time": 0.0, "items": []}
+PIPED_LOCK = threading.Lock()
+
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/139.0.0.0 Safari/537.36"
+)
 
 
 def video_platform(url: str) -> str:
     host = urllib.parse.urlparse(url).netloc.lower().split(":", 1)[0]
     if host.startswith("www."):
         host = host[4:]
-    if "youtube.com" in host or host == "youtu.be":
+    if host == "youtu.be" or host.endswith("youtube.com"):
         return "youtube"
-    if "tiktok.com" in host:
+    if host.endswith("tiktok.com"):
         return "tiktok"
-    if "instagram.com" in host:
+    if host.endswith("instagram.com"):
         return "instagram"
-    if "facebook.com" in host or host == "fb.watch":
+    if host == "fb.watch" or host.endswith("facebook.com"):
         return "facebook"
     return "unknown"
 
 
 def normalize_public_url(url: str) -> str:
-    """Follow ordinary HTTP redirects (especially short TikTok links)."""
     url = (url or "").strip()
-    req = urllib.request.Request(
+    if not re.match(r"^https?://", url, re.I):
+        return url
+    request = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/147.0.0.0 Safari/537.36",
+            "User-Agent": BROWSER_UA,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.8",
         },
-        method="GET",
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as response:
-            final_url = response.geturl()
-            return final_url or url
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return response.geturl() or url
     except Exception:
         return url
 
@@ -842,9 +844,9 @@ def youtube_video_id(url: str):
     parsed = urllib.parse.urlparse(url)
     host = parsed.netloc.lower().split(":", 1)[0]
     if host == "youtu.be":
-        value = parsed.path.strip("/").split("/")
-        return value[0] if value and value[0] else None
-    if "youtube.com" in host:
+        parts = [p for p in parsed.path.split("/") if p]
+        return parts[0] if parts else None
+    if host.endswith("youtube.com"):
         qs = urllib.parse.parse_qs(parsed.query)
         if qs.get("v"):
             return qs["v"][0]
@@ -854,49 +856,97 @@ def youtube_video_id(url: str):
     return None
 
 
+def _find_js_runtime():
+    """Find a supported JS runtime, including a Deno installed by build.sh."""
+    candidates = []
+    local_deno = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".deno", "bin", "deno")
+    local_node = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".node", "bin", "node")
+    candidates.extend([
+        ("deno", local_deno),
+        ("node", local_node),
+    ])
+    for runtime, path in candidates:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return runtime, path
+    deno = shutil.which("deno")
+    if deno:
+        return "deno", deno
+    node = shutil.which("node")
+    if node:
+        return "node", node
+    return None, None
+
+
 def ytdlp_base_options():
     options = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "socket_timeout": 25,
+        "socket_timeout": 30,
         "retries": 3,
         "fragment_retries": 3,
         "file_access_retries": 3,
         "concurrent_fragment_downloads": 4,
         "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/147.0.0.0 Safari/537.36",
+            "User-Agent": BROWSER_UA,
             "Accept-Language": "en-US,en;q=0.8",
         },
-        # Current yt-dlp supports remote EJS components. They help keep
-        # YouTube extraction working when challenge scripts change.
+        # Current yt-dlp can load the EJS challenge scripts remotely.
         "remote_components": {"ejs:github"},
     }
-    # Prefer Deno when installed; otherwise enable Node 22+ if available.
-    # yt-dlp's current EJS setup requires a supported JS runtime for YouTube.
-    deno_path = shutil.which("deno") if "shutil" in globals() else None
-    node_path = shutil.which("node") if "shutil" in globals() else None
-    if deno_path:
-        options["js_runtimes"] = {"deno": {"path": deno_path}}
-    elif node_path:
-        options["js_runtimes"] = {"node": {"path": node_path}}
+
     cookies = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
     if cookies and os.path.isfile(cookies):
         options["cookiefile"] = cookies
-    # Do NOT set `impersonate='chrome'` blindly. That was the source of the
-    # user's "Impersonate target chrome is not available" error.
+
+    runtime, runtime_path = _find_js_runtime()
+    if runtime == "deno":
+        options["js_runtimes"] = {"deno": {"path": runtime_path}}
+    elif runtime == "node":
+        options["js_runtimes"] = {"node": {"path": runtime_path}}
+
+    # Optional owner-controlled extractor args. Example:
+    # YTDLP_EXTRACTOR_ARGS=player_client=web
+    # Leave empty by default so current yt-dlp can choose its own clients.
+    extractor_args = os.environ.get("YTDLP_EXTRACTOR_ARGS", "").strip()
+    if extractor_args:
+        parsed = {}
+        for item in extractor_args.split(";"):
+            if "=" not in item:
+                continue
+            key, value = item.split("=", 1)
+            parsed[key.strip()] = [x.strip() for x in value.split(",") if x.strip()]
+        if parsed:
+            options["extractor_args"] = {"youtube": parsed}
+
     return options
 
 
+def _youtube_extraction_profiles():
+    """Return conservative retries for transient YouTube extractor failures."""
+    profiles = [None]
+    # Only add alternatives if the owner did not explicitly configure one.
+    if not os.environ.get("YTDLP_EXTRACTOR_ARGS", "").strip():
+        profiles.extend([
+            {"youtube": {"player_client": ["web"]}},
+            {"youtube": {"player_client": ["mweb"]}},
+        ])
+    return profiles
+
+
 def extract_ytdlp_info(url: str):
-    opts = ytdlp_base_options()
-    # Let current yt-dlp select its working YouTube player client. If one
-    # client is blocked, yt-dlp can try another supported client.
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
+    errors = []
+    for profile in _youtube_extraction_profiles():
+        opts = ytdlp_base_options()
+        if profile:
+            opts["extractor_args"] = profile
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, download=False)
+        except Exception as exc:
+            errors.append(str(exc))
+    raise RuntimeError("yt-dlp extraction failed: " + " | ".join(errors[-3:]))
 
 
 def build_ytdlp_format(height=None, audio=False, platform="unknown"):
@@ -912,225 +962,203 @@ def build_ytdlp_format(height=None, audio=False, platform="unknown"):
     return "bestvideo+bestaudio/best"
 
 
-def ytdlp_download(url: str, output_dir: str, *, height=None, audio=False, title_hint="video"):
-    platform = video_platform(url)
-    opts = ytdlp_base_options()
-    opts.update({
-        "format": build_ytdlp_format(height, audio, platform),
-        "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
-        "merge_output_format": "mp4",
-        "overwrites": True,
-    })
-    if audio:
-        opts["postprocessors"] = [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }]
+def _download_with_ytdlp_options(url, output_dir, opts, title_hint):
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filepath = ydl.prepare_filename(info)
+        return info, filepath
+
+
+def ytdlp_download(url: str, output_dir: str, *, height=None, audio=False, title_hint="video"):
+    platform = video_platform(url)
+    errors = []
+    for profile in _youtube_extraction_profiles() if platform == "youtube" else [None]:
+        opts = ytdlp_base_options()
+        opts.update({
+            "format": build_ytdlp_format(height, audio, platform),
+            "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
+            "merge_output_format": "mp4",
+            "overwrites": True,
+        })
+        if profile:
+            opts["extractor_args"] = profile
         if audio:
-            base, _ = os.path.splitext(filepath)
-            mp3_path = base + ".mp3"
-            if os.path.exists(mp3_path):
-                filepath = mp3_path
-        else:
-            # yt-dlp can change extension after merge/postprocessing.
-            if not os.path.exists(filepath):
+            opts["postprocessors"] = [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }]
+        try:
+            info, filepath = _download_with_ytdlp_options(url, output_dir, opts, title_hint)
+            if audio:
+                base, _ = os.path.splitext(filepath)
+                candidate = base + ".mp3"
+                if os.path.isfile(candidate):
+                    filepath = candidate
+            if not os.path.isfile(filepath):
                 stem = os.path.splitext(filepath)[0]
-                for ext in (".mp4", ".mkv", ".webm", ".mov"):
-                    if os.path.exists(stem + ext):
+                for ext in (".mp4", ".mkv", ".webm", ".mov", ".mp3", ".m4a"):
+                    if os.path.isfile(stem + ext):
                         filepath = stem + ext
                         break
-        if not os.path.isfile(filepath):
-            raise FileNotFoundError(f"Downloaded file was not created: {title_hint}")
-        return {"path": filepath, "title": info.get("title") or title_hint, "info": info}
+            if not os.path.isfile(filepath):
+                raise FileNotFoundError("yt-dlp finished without creating a media file")
+            return {"path": filepath, "title": info.get("title") or title_hint, "info": info}
+        except Exception as exc:
+            errors.append(str(exc))
+            for name in os.listdir(output_dir):
+                path = os.path.join(output_dir, name)
+                if os.path.isfile(path):
+                    try:
+                        os.unlink(path)
+                    except Exception:
+                        pass
+    raise RuntimeError("yt-dlp download failed: " + " | ".join(errors[-3:]))
 
 
-def _normalize_piped_url(url: str):
-    url = (url or "").strip().rstrip("/")
-    if not url.startswith(("https://", "http://")):
+# --------------------------- PIPED LAST RESORT ---------------------------
+
+def _normalize_piped_url(raw):
+    """Accept ONLY the Piped API root, never /registered/badge or other paths."""
+    value = (raw or "").strip().strip("`<> ")
+    value = value.rstrip("/")
+    if not value.startswith(("https://", "http://")):
         return None
-    return url
+    try:
+        parsed = urllib.parse.urlparse(value)
+    except Exception:
+        return None
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    if parsed.path not in {"", "/"} or parsed.params or parsed.query or parsed.fragment:
+        return None
+    host = parsed.hostname.lower() if parsed.hostname else ""
+    if not host or host.startswith("pipedapi.") is False and "piped" not in host:
+        # Discovery sources contain some non-Piped URLs. Reject them.
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}"
 
 
-def _parse_piped_instances(markdown: str):
-    """Parse TeamPiped's public-instance table without hardcoding instances."""
+def _parse_piped_instances(markdown):
     found = []
+    seen = set()
+    # Parse markdown table rows. We ONLY inspect the API URL column (column 2).
     for line in markdown.splitlines():
         if "|" not in line:
             continue
-        parts = [x.strip() for x in line.split("|")]
-        for part in parts:
-            match = re.search(r"https?://[^\s|)]+", part)
-            if not match:
-                continue
-            url = _normalize_piped_url(match.group(0))
-            if not url:
-                continue
-            # We only want API hosts, not frontend/proxy/documentation links.
-            host = urllib.parse.urlparse(url).netloc.lower()
-            if "pipedapi" in host or "piped-api" in host or host.startswith("api-piped."):
-                if url not in found:
-                    found.append(url)
+        cells = [c.strip() for c in line.split("|")]
+        if len(cells) < 3:
+            continue
+        api_cell = cells[2]
+        urls = re.findall(r"https?://[^\s|<>`]+", api_cell)
+        for raw in urls:
+            raw = raw.rstrip(".,;)]")
+            api = _normalize_piped_url(raw)
+            if api and api not in seen:
+                seen.add(api)
+                found.append(api)
     return found
 
 
-def _http_get_text(url: str, timeout: int):
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/147.0 Safari/537.36",
-            "Accept": "text/plain,text/markdown,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.8",
-            "Connection": "close",
-        },
-    )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.read().decode("utf-8", "replace")
-
-
-def _piped_health_check(api: str):
-    """Return True only when the instance responds quickly to a harmless endpoint."""
-    candidates = ("/healthcheck", "/", "/config")
-    for suffix in candidates:
+def _discover_piped_instances():
+    discovered = []
+    for source in PIPED_DISCOVERY_URLS:
         try:
-            request = urllib.request.Request(
-                api + suffix,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/147.0 Safari/537.36",
-                    "Accept": "application/json,text/plain,*/*",
-                    "Connection": "close",
-                },
+            req = urllib.request.Request(
+                source,
+                headers={"User-Agent": BROWSER_UA, "Accept": "text/plain,*/*"},
             )
-            with urllib.request.urlopen(request, timeout=PIPED_HEALTH_TIMEOUT) as response:
-                if 200 <= getattr(response, "status", 200) < 400:
-                    return True
+            with urllib.request.urlopen(req, timeout=PIPED_TIMEOUT) as response:
+                text = response.read().decode("utf-8", "replace")
+            for api in _parse_piped_instances(text):
+                if api not in discovered:
+                    discovered.append(api)
         except Exception:
             continue
-    return False
+    return discovered[:PIPED_MAX_CANDIDATES]
 
 
-def _refresh_piped_instances(force=False):
-    global PIPED_APIS
-    now = time.time()
-    if not force and _PIPED_CACHE["instances"] and now < _PIPED_CACHE["expires"]:
-        PIPED_APIS = list(_PIPED_CACHE["instances"])
-        return PIPED_APIS
-
-    discovered = []
-    try:
-        docs = _http_get_text(PIPED_INSTANCES_URL, timeout=10)
-        discovered = _parse_piped_instances(docs)
-    except Exception:
-        discovered = []
-
-    # Keep the previous good pool as a temporary emergency fallback if GitHub is unavailable.
-    candidates = discovered or list(_PIPED_CACHE.get("instances") or [])
-    if not candidates:
-        # These are emergency seeds only; normal operation is dynamic discovery.
-        candidates = [
-            "https://pipedapi.kavin.rocks",
-            "https://pipedapi.tokhmi.xyz",
-            "https://pipedapi.moomoo.me",
-            "https://pipedapi.syncpundit.io",
-        ]
-
-    healthy = []
-    random.shuffle(candidates)
-    for api in candidates:
-        bad_until = _PIPED_BAD_UNTIL.get(api, 0)
-        if bad_until > now:
-            continue
-        if _piped_health_check(api):
-            healthy.append(api)
-            if len(healthy) >= PIPED_MAX_HEALTHY:
-                break
-
-    # If all checks fail, retain discovered candidates; the request path will produce useful errors.
-    selected = healthy or candidates[:PIPED_MAX_HEALTHY]
-    _PIPED_CACHE["instances"] = selected
-    _PIPED_CACHE["expires"] = now + PIPED_CACHE_TTL
-    PIPED_APIS = list(selected)
-    return PIPED_APIS
-
-
-def _mark_piped_bad(api: str, seconds: int):
-    _PIPED_BAD_UNTIL[api] = time.time() + seconds
-
-
-def piped_get_json(url: str, timeout=PIPED_REQUEST_TIMEOUT):
+def _piped_get_json(api, video_id):
+    endpoint = f"{api}/streams/{urllib.parse.quote(video_id, safe='')}"
     request = urllib.request.Request(
-        url,
+        endpoint,
         headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/147.0 Safari/537.36",
-            "Accept": "application/json,text/plain,*/*",
+            "User-Agent": BROWSER_UA,
+            "Accept": "application/json",
             "Accept-Language": "en-US,en;q=0.8",
-            "Connection": "close",
         },
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.load(response)
+    with urllib.request.urlopen(request, timeout=PIPED_TIMEOUT) as response:
+        status = getattr(response, "status", 200)
+        raw = response.read()
+    if status != 200:
+        raise RuntimeError(f"HTTP {status}")
+    try:
+        data = json.loads(raw.decode("utf-8", "replace"))
+    except Exception:
+        preview = raw[:120].decode("utf-8", "replace").replace("\n", " ")
+        raise RuntimeError(f"non-JSON response: {preview!r}")
+    if not isinstance(data, dict):
+        raise RuntimeError("invalid Piped JSON object")
+    return data
 
 
-def _piped_request_with_retry(api: str, video_id: str):
-    endpoint = f"{api}/streams/{urllib.parse.quote(video_id)}"
-    last_error = None
-    for attempt in range(2):
-        try:
-            return piped_get_json(endpoint)
-        except urllib.error.HTTPError as exc:
-            last_error = exc
-            # 526 = broken origin certificate. Avoid this instance for a while.
-            if exc.code == 526:
-                _mark_piped_bad(api, 6 * 60 * 60)
-                raise
-            # 403 can be temporary/rate limiting; retry once with exponential backoff.
-            if exc.code == 403 and attempt == 0:
-                time.sleep(1.5)
-                continue
-            if exc.code == 403:
-                _mark_piped_bad(api, 15 * 60)
-            raise
-        except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
-            last_error = exc
-            _mark_piped_bad(api, 10 * 60)
-            raise
-        except Exception as exc:
-            last_error = exc
-            _mark_piped_bad(api, 5 * 60)
-            raise
-    raise last_error or RuntimeError("Piped request failed")
+def _piped_bad(api, minutes):
+    PIPED_BAD[api] = time.time() + minutes * 60
+
+
+def _piped_metadata_one(api, video_id):
+    now = time.time()
+    if PIPED_BAD.get(api, 0) > now:
+        return None, f"{api}: temporarily skipped"
+    try:
+        return _piped_get_json(api, video_id), None
+    except urllib.error.HTTPError as exc:
+        code = exc.code
+        if code == 526:
+            _piped_bad(api, 360)
+        elif code == 403:
+            # A public instance may temporarily rate-limit/block Render.
+            _piped_bad(api, 30)
+        elif code in {404, 410}:
+            _piped_bad(api, 120)
+        elif code in {429, 500, 502, 503, 504}:
+            _piped_bad(api, 10)
+        else:
+            _piped_bad(api, 10)
+        return None, f"{api}: HTTP {code}"
+    except (socket.gaierror, urllib.error.URLError, TimeoutError) as exc:
+        _piped_bad(api, 10)
+        return None, f"{api}: network/DNS failure"
+    except Exception as exc:
+        _piped_bad(api, 10)
+        return None, f"{api}: {str(exc)[:120]}"
+
 
 def piped_metadata(video_id: str):
-    errors = []
-    instances = _refresh_piped_instances()
-    for api in instances:
-        try:
-            data = _piped_request_with_retry(api, video_id)
-            if data.get("videoStreams") or data.get("audioStreams"):
-                return data
-            errors.append(f"{api}: no streams")
-        except Exception as exc:
-            errors.append(f"{api}: {exc}")
+    with PIPED_LOCK:
+        now = time.time()
+        if now - PIPED_CACHE["time"] > PIPED_CACHE_TTL or not PIPED_CACHE["items"]:
+            PIPED_CACHE["items"] = _discover_piped_instances()
+            PIPED_CACHE["time"] = now
+        candidates = [x for x in PIPED_CACHE["items"] if PIPED_BAD.get(x, 0) <= now]
 
-    # Refresh the pool immediately once when every current instance fails.
-    fresh = _refresh_piped_instances(force=True)
-    for api in fresh:
-        if api in instances:
-            continue
-        try:
-            data = _piped_request_with_retry(api, video_id)
-            if data.get("videoStreams") or data.get("audioStreams"):
-                return data
-            errors.append(f"{api}: no streams")
-        except Exception as exc:
-            errors.append(f"{api}: {exc}")
+    if not candidates:
+        candidates = _discover_piped_instances()
+
+    errors = []
+    for api in candidates:
+        data, error = _piped_metadata_one(api, video_id)
+        if data and (data.get("videoStreams") or data.get("audioStreams")):
+            return data
+        if error:
+            errors.append(error)
 
     raise RuntimeError(
-        "All dynamic Piped instances failed. " + " | ".join(errors[:6])
+        "No healthy public Piped instance returned YouTube streams. "
+        + (" | ".join(errors[:8]) if errors else "No candidates were available.")
     )
+
 
 def choose_piped_video_stream(streams, target_height):
     valid = [s for s in streams if s.get("url") and s.get("height")]
@@ -1156,12 +1184,9 @@ def choose_piped_audio_stream(streams):
 def download_url_to_file(url: str, path: str, headers=None):
     request = urllib.request.Request(
         url,
-        headers=headers or {
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "*/*",
-        },
+        headers=headers or {"User-Agent": BROWSER_UA, "Accept": "*/*"},
     )
-    with urllib.request.urlopen(request, timeout=30) as response, open(path, "wb") as dst:
+    with urllib.request.urlopen(request, timeout=45) as response, open(path, "wb") as dst:
         while True:
             chunk = response.read(1024 * 1024)
             if not chunk:
@@ -1171,17 +1196,9 @@ def download_url_to_file(url: str, path: str, headers=None):
 
 def ffmpeg_merge(video_path: str, audio_path: str, out_path: str):
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    cmd = [
-        ffmpeg, "-y",
-        "-i", video_path,
-        "-i", audio_path,
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-movflags", "+faststart",
-        out_path,
-    ]
+    cmd = [ffmpeg, "-y", "-i", video_path, "-i", audio_path,
+           "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
+           "-movflags", "+faststart", out_path]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout or "FFmpeg merge failed")[-1500:])
@@ -1193,15 +1210,13 @@ def download_from_piped(meta, output_dir: str, *, height=None, audio=False):
     if audio:
         stream = choose_piped_audio_stream(meta.get("audioStreams") or [])
         if not stream:
-            raise RuntimeError("YouTube fallback has no audio stream")
-        raw = os.path.join(output_dir, "audio.m4a")
+            raise RuntimeError("Piped returned no audio stream")
+        raw = os.path.join(output_dir, "audio.bin")
         mp3 = os.path.join(output_dir, "audio.mp3")
         download_url_to_file(stream["url"], raw)
-        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-        result = subprocess.run([
-            ffmpeg, "-y", "-i", raw,
-            "-vn", "-c:a", "libmp3lame", "-b:a", "192k", mp3,
-        ], capture_output=True, text=True)
+        result = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", raw,
+                                 "-vn", "-c:a", "libmp3lame", "-b:a", "192k", mp3],
+                                capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError((result.stderr or "Audio conversion failed")[-1200:])
         return {"path": mp3, "title": title}
@@ -1209,20 +1224,19 @@ def download_from_piped(meta, output_dir: str, *, height=None, audio=False):
     target = height or 720
     stream = choose_piped_video_stream(meta.get("videoStreams") or [], target)
     if not stream:
-        raise RuntimeError("YouTube fallback has no video stream")
+        raise RuntimeError("Piped returned no video stream")
     video_raw = os.path.join(output_dir, "video.bin")
     download_url_to_file(stream["url"], video_raw)
     mime = (stream.get("mimeType") or "").lower()
-    has_audio = not bool(stream.get("videoOnly")) or mime.startswith("video/mp4") and not stream.get("videoOnly")
+    has_audio = not bool(stream.get("videoOnly"))
     if has_audio:
         final = os.path.join(output_dir, "video.mp4")
-        if mime == "video/mp4":
+        if mime.startswith("video/mp4"):
             os.replace(video_raw, final)
         else:
-            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-            result = subprocess.run([
-                ffmpeg, "-y", "-i", video_raw, "-c:v", "copy", "-c:a", "aac", "-movflags", "+faststart", final,
-            ], capture_output=True, text=True)
+            result = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", video_raw,
+                                     "-c:v", "copy", "-c:a", "aac", "-movflags", "+faststart", final],
+                                    capture_output=True, text=True)
             if result.returncode != 0:
                 raise RuntimeError((result.stderr or "Video conversion failed")[-1200:])
             os.unlink(video_raw)
@@ -1230,7 +1244,7 @@ def download_from_piped(meta, output_dir: str, *, height=None, audio=False):
 
     audio_stream = choose_piped_audio_stream(meta.get("audioStreams") or [])
     if not audio_stream:
-        raise RuntimeError("YouTube fallback video is video-only and no audio stream was found")
+        raise RuntimeError("Piped returned video-only stream and no audio stream")
     audio_raw = os.path.join(output_dir, "audio.bin")
     final = os.path.join(output_dir, "video.mp4")
     download_url_to_file(audio_stream["url"], audio_raw)
@@ -1241,13 +1255,12 @@ def download_from_piped(meta, output_dir: str, *, height=None, audio=False):
 
 
 def tikwm_get_data(url: str):
-    query = urllib.parse.urlencode({"url": url})
-    endpoint = TIKWM_API + "?" + query
-    request = urllib.request.Request(endpoint, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,*/*"})
+    endpoint = TIKWM_API + "?" + urllib.parse.urlencode({"url": url})
+    request = urllib.request.Request(endpoint, headers={"User-Agent": BROWSER_UA, "Accept": "application/json,*/*"})
     with urllib.request.urlopen(request, timeout=25) as response:
-        data = __import__("json").load(response)
+        data = json.loads(response.read().decode("utf-8", "replace"))
     if int(data.get("code", -1)) != 0 or not data.get("data"):
-        raise RuntimeError(data.get("msg") or "TikTok fallback service returned no data")
+        raise RuntimeError(data.get("msg") or "TikTok fallback returned no data")
     return data["data"]
 
 
@@ -1258,11 +1271,12 @@ def tikwm_download(url: str, output_dir: str, *, quality="hd", audio=False):
         media_url = data.get("music")
         if not media_url:
             raise RuntimeError("TikTok fallback has no audio URL")
-        out = os.path.join(output_dir, "tiktok_audio.mp3")
         raw = os.path.join(output_dir, "tiktok_audio.bin")
+        out = os.path.join(output_dir, "tiktok_audio.mp3")
         download_url_to_file(media_url, raw)
-        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-        result = subprocess.run([ffmpeg, "-y", "-i", raw, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", out], capture_output=True, text=True)
+        result = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", raw,
+                                 "-vn", "-c:a", "libmp3lame", "-b:a", "192k", out],
+                                capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError((result.stderr or "TikTok audio conversion failed")[-1200:])
         os.unlink(raw)
@@ -1276,38 +1290,65 @@ def tikwm_download(url: str, output_dir: str, *, quality="hd", audio=False):
     return {"path": out, "title": title}
 
 
+def _quality_list_from_formats(formats):
+    heights = sorted({int(f["height"]) for f in formats or []
+                      if f.get("vcodec") != "none" and f.get("height")}, reverse=True)
+    qualities = [q for q in VIDEO_QUALITIES if any(h >= q for h in heights)]
+    return qualities or ([max(heights)] if heights else [])
+
+
 def extract_download_options(url: str):
     platform = video_platform(url)
     normalized = normalize_public_url(url) if platform == "tiktok" else url
-    # Direct yt-dlp path first.
+    first_error = None
+
+    # PRIMARY: direct yt-dlp.
     try:
         info = extract_ytdlp_info(normalized)
         title = info.get("title") or "Video"
-        if platform == "youtube":
-            available = set()
-            for f in info.get("formats") or []:
-                if f.get("vcodec") != "none" and f.get("height"):
-                    available.add(int(f["height"]))
-            qualities = [q for q in VIDEO_QUALITIES if any(h >= q for h in available)]
-            if not qualities and available:
-                qualities = [max(available)]
-            return {"source": "ytdlp", "platform": platform, "url": normalized, "title": title, "qualities": qualities or [720], "audio": True}
-        # For other sites, expose the qualities yt-dlp actually knows about.
-        heights = sorted({int(f["height"]) for f in info.get("formats") or [] if f.get("vcodec") != "none" and f.get("height")}, reverse=True)
-        qualities = [q for q in VIDEO_QUALITIES if any(h >= q for h in heights)]
-        return {"source": "ytdlp", "platform": platform, "url": normalized, "title": title, "qualities": qualities or [720], "audio": True}
-    except Exception as first_error:
-        if platform == "youtube":
-            vid = youtube_video_id(normalized)
-            if not vid:
-                raise RuntimeError(f"YouTube extraction failed: {first_error}")
+        qualities = _quality_list_from_formats(info.get("formats"))
+        return {
+            "source": "ytdlp",
+            "platform": platform,
+            "url": normalized,
+            "title": title,
+            "qualities": qualities or [720],
+            "audio": bool(info.get("formats")) or True,
+        }
+    except Exception as exc:
+        first_error = str(exc)
+
+    # LAST RESORT: public Piped for YouTube only.
+    if platform == "youtube":
+        vid = youtube_video_id(normalized)
+        if not vid:
+            raise RuntimeError(f"YouTube URL could not be parsed. yt-dlp error: {first_error[:700]}")
+        try:
             piped = piped_metadata(vid)
             heights = sorted({int(s.get("height")) for s in piped.get("videoStreams") or [] if s.get("height")}, reverse=True)
             qualities = [q for q in VIDEO_QUALITIES if any(h >= q for h in heights)]
             if not qualities and heights:
                 qualities = [max(heights)]
-            return {"source": "piped", "platform": platform, "url": normalized, "title": piped.get("title") or "YouTube video", "qualities": qualities or [720], "audio": bool(piped.get("audioStreams")), "piped": piped}
-        if platform == "tiktok":
+            return {
+                "source": "piped",
+                "platform": platform,
+                "url": normalized,
+                "title": piped.get("title") or "YouTube video",
+                "qualities": qualities or [720],
+                "audio": bool(piped.get("audioStreams")),
+                "piped": piped,
+            }
+        except Exception as piped_error:
+            runtime, _ = _find_js_runtime()
+            runtime_msg = runtime or "none"
+            raise RuntimeError(
+                "YouTube could not be extracted directly and no healthy public Piped fallback responded. "
+                f"JS runtime: {runtime_msg}. "
+                f"yt-dlp: {first_error[:500]} | Piped: {str(piped_error)[:700]}"
+            )
+
+    if platform == "tiktok":
+        try:
             data = tikwm_get_data(normalized)
             qualities = []
             if data.get("hdplay"):
@@ -1317,9 +1358,14 @@ def extract_download_options(url: str):
             if not qualities and data.get("wmplay"):
                 qualities.append("sd")
             if not qualities:
-                raise RuntimeError(f"TikTok extraction failed: {first_error}")
-            return {"source": "tikwm", "platform": platform, "url": normalized, "title": data.get("title") or data.get("desc") or "TikTok video", "qualities": qualities, "audio": bool(data.get("music")), "tikwm": data}
-        raise RuntimeError(f"Extraction failed: {first_error}")
+                raise RuntimeError("TikTok fallback returned no video")
+            return {"source": "tikwm", "platform": platform, "url": normalized,
+                    "title": data.get("title") or data.get("desc") or "TikTok video",
+                    "qualities": qualities, "audio": bool(data.get("music")), "tikwm": data}
+        except Exception as fallback_error:
+            raise RuntimeError(f"TikTok extraction failed. yt-dlp: {first_error[:400]} | fallback: {str(fallback_error)[:500]}")
+
+    raise RuntimeError(f"Extraction failed: {first_error[:900]}")
 
 
 def format_bytes(value):
@@ -1358,7 +1404,7 @@ async def handle_video_download(update, context):
         await update.message.reply_text("❌ Please send a valid YouTube, TikTok, Instagram, or Facebook URL.")
         return
 
-    status_msg = await update.message.reply_text("🔎 Checking the video and available qualities…")
+    status_msg = await update.message.reply_text("🔎 Checking the video with the direct downloader…")
     try:
         job = await asyncio.to_thread(extract_download_options, raw_url)
         job["chat_id"] = update.effective_chat.id
@@ -1366,25 +1412,16 @@ async def handle_video_download(update, context):
         context.user_data["state"] = None
         title = job.get("title") or "Video"
         platform = job["platform"].title()
-        safe_title = html.escape(title[:120])
         await status_msg.edit_text(
             f"🎬 <b>{html.escape(platform)} Downloader</b>\n\n"
-            f"<b>{safe_title}</b>\n\n"
+            f"<b>{html.escape(title[:120])}</b>\n\n"
             "Choose the quality you want:",
             reply_markup=video_quality_keyboard(job),
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
         context.user_data["state"] = None
-        msg = str(e)
-        if "Sign in to confirm" in msg or "LOGIN_REQUIRED" in msg:
-            msg = (
-                "YouTube is currently requiring authentication from this server. "
-                "The bot already tried its normal extractor and the public fallback. "
-                "For videos that remain protected, the supported option is to provide "
-                "a fresh cookies file through YTDLP_COOKIES_FILE."
-            )
-        await status_msg.edit_text(f"❌ Could not prepare download.\n\n{msg[:900]}")
+        await status_msg.edit_text(f"❌ Could not prepare download.\n\n{str(e)[:1200]}")
 
 
 async def handle_video_callback(update, context, data):
@@ -1403,7 +1440,6 @@ async def handle_video_callback(update, context, data):
     selected = data.removeprefix("vd_q_")
     output_dir = tempfile.mkdtemp(prefix="tg_video_")
     status_msg = await query.message.reply_text("⏳ Preparing your download…")
-    filepath = None
     try:
         await query.edit_message_reply_markup(reply_markup=None)
         if selected == "audio":
@@ -1431,48 +1467,42 @@ async def handle_video_callback(update, context, data):
             raise FileNotFoundError("Downloaded file was not created")
 
         file_size = os.path.getsize(filepath)
+        if file_size > VIDEO_MAX_UPLOAD and not audio and job.get("platform") == "youtube":
+            lower = [q for q in VIDEO_QUALITIES if q < (quality or 999)]
+            for q in lower:
+                try:
+                    for name in os.listdir(output_dir):
+                        path = os.path.join(output_dir, name)
+                        if os.path.isfile(path):
+                            os.unlink(path)
+                    result = await asyncio.to_thread(do_download_for_quality, job, output_dir, q)
+                    filepath = result["path"]
+                    file_size = os.path.getsize(filepath)
+                    if file_size <= VIDEO_MAX_UPLOAD:
+                        quality = q
+                        break
+                except Exception:
+                    continue
+
         if file_size > VIDEO_MAX_UPLOAD:
-            # Automatic quality fallback for videos: retry one step lower.
-            if not audio and job.get("platform") == "youtube":
-                lower = [q for q in VIDEO_QUALITIES if q < (quality or 999)]
-                if lower:
-                    await status_msg.edit_text("📦 That quality is over Telegram's 50 MB bot upload limit. Trying the next lower quality…")
-                    for q in lower:
-                        try:
-                            for name in os.listdir(output_dir):
-                                path = os.path.join(output_dir, name)
-                                if os.path.isfile(path):
-                                    os.unlink(path)
-                            result = await asyncio.to_thread(do_download_for_quality, job, output_dir, q)
-                            filepath = result["path"]
-                            if os.path.getsize(filepath) <= VIDEO_MAX_UPLOAD:
-                                quality = q
-                                file_size = os.path.getsize(filepath)
-                                break
-                        except Exception:
-                            continue
-                
-            if file_size > VIDEO_MAX_UPLOAD:
-                raise RuntimeError(
-                    f"The selected file is {format_bytes(file_size)}, above Telegram's current 50 MB bot upload limit."
-                )
+            raise RuntimeError(
+                f"The selected file is {format_bytes(file_size)}, above Telegram's 50 MB bot upload limit."
+            )
 
         caption = f"✅ {job.get('title', 'Video')[:900]}"
         with open(filepath, "rb") as media:
             if audio:
-                await query.message.reply_audio(audio=media, filename=os.path.basename(filepath), caption=caption, reply_markup=tool_done_kb())
+                await query.message.reply_audio(audio=media, filename=os.path.basename(filepath),
+                                                caption=caption, reply_markup=tool_done_kb())
             else:
-                await query.message.reply_video(video=media, caption=caption, supports_streaming=True, reply_markup=tool_done_kb())
+                await query.message.reply_video(video=media, caption=caption,
+                                                supports_streaming=True, reply_markup=tool_done_kb())
         await status_msg.edit_text("✅ Download completed successfully!")
     except Exception as e:
         await status_msg.edit_text(f"❌ Download failed.\n\n{str(e)[:1000]}")
     finally:
         context.user_data.pop("video_job", None)
-        try:
-            import shutil
-            shutil.rmtree(output_dir, ignore_errors=True)
-        except Exception:
-            pass
+        shutil.rmtree(output_dir, ignore_errors=True)
 
 
 def do_download_for_quality(job, output_dir, quality):
