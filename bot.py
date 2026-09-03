@@ -4261,40 +4261,6 @@ def mm_should_refuse_message(sender_id, event):
         return False
 
 
-# ------------------------------------------------------------
-# FRIENDLY REFUSAL MESSAGE
-# ------------------------------------------------------------
-
-MM_REFUSAL_MESSAGE = (
-    "👋 Hello!\n\n"
-    "⚠️ This account is currently not accepting messages.\n\n"
-    "Please try again later. Thank you for understanding. 🙏"
-)
-
-MM_BLOCKED_MESSAGE = (
-    "👋 Hello!\n\n"
-    "⚠️ Your message could not be accepted at this
-      try:
-        await telethon_client.send_message(
-            admin_id,
-            notification
-        )
-
-        return True
-
-    except Exception as e:
-        print(
-            f"Message Manager fallback notification "
-            f"error: {e}"
-        )
-
-    return False
-
-
-# ------------------------------------------------------------
-# FORWARD COMPLETE INCOMING MESSAGE
-# ------------------------------------------------------------
-
 async def mm_forward_incoming_message(event, sender):
     """
     Forward an allowed incoming private message to every
