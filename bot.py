@@ -328,6 +328,8 @@ def init_db():
 # ============================================================
 # MESSAGE MANAGER DATABASE HELPERS
 # ============================================================
+# All functions use `rule_key` and `rule_value` columns.
+# ============================================================
 
 def mm_get_rule(key, default=None):
 
@@ -427,1368 +429,13 @@ def mm_set_messaging(enabled):
 
 
 # ============================================================
-# TIME HELPERS
+# DURATION HELPERS
 # ============================================================
-
-def mm_now():
-
-    return int(time.time())
-
-
-def mm_is_active_until(timestamp):
-
-    try:
-        timestamp = int(timestamp)
-    except Exception:
-        return False
-
-    if timestamp == 0:
-        return False
-
-    return timestamp > mm_now()
-
-
-def mm_remaining_seconds(timestamp):
-
-    try:
-        timestamp = int(timestamp)
-    except Exception:
-        return 0
-
-    return max(
-        0,
-        timestamp - mm_now()
-    )
-
-
+# Convention:
+#   -1  = permanent
+#    0  = inactive / not set
+#   >0  = Unix timestamp when the rule expires
 # ============================================================
-# DURATION PARSER
-# ============================================================
-
-def mm_parse_duration(text):
-
-    if not text:
-        return None
-
-    value = text.strip().lower()
-
-    # Permanent
-    if value in (
-        "permanent",
-        "forever",
-        "perm",
-        "always"
-    ):
-        return 0
-
-    # Examples:
-    # 30 seconds
-    # 5 minutes
-    # 2 hours
-    # 3 days
-    # 1 month
-
-    match = re.fullmatch(
-        r"(\d+(?:\.\d+)?)\s*"
-        r"(second|seconds|sec|secs|"
-        r"minute|minutes|min|mins|"
-        r"hour|hours|hr|hrs|"
-        r"day|days|"
-        r"month|months)",
-        value
-    )
-
-    if not match:
-        return None
-
-    number = float(match.group(1))
-
-    unit = match.group(2)
-
-    if unit in (
-        "second",
-        "seconds",
-        "sec",
-        "secs"
-    ):
-        seconds = number
-
-    elif unit in (
-        "minute",
-        "minutes",
-        "min",
-        "mins"
-    ):
-        seconds = number * 60
-
-    elif unit in (
-        "hour",
-        "hours",
-        "hr",
-        "hrs"
-    ):
-        seconds = number * 60 * 60
-
-    elif unit in (
-        "day",
-        "days"
-    ):
-        seconds = number * 24 * 60 * 60
-
-    elif unit in (
-        "month",
-        "months"
-    ):
-        # 30-day month
-        seconds = number * 30 * 24 * 60 * 60
-
-    else:
-        return None
-
-    return int(seconds)
-
-
-def mm_duration_to_until(duration_seconds):
-
-    # 0 means permanent
-    if duration_seconds == 0:
-        return 0
-
-    return mm_now() + duration_seconds
-
-
-# ============================================================
-# FORMAT DURATION
-# ============================================================
-
-def mm_format_duration(seconds):
-
-    if seconds == 0:
-        return "Permanent"
-
-    seconds = max(
-        0,
-        int(seconds)
-    )
-
-    days, remainder = divmod(
-        seconds,
-        86400
-    )
-
-    hours, remainder = divmod(
-        remainder,
-        3600
-    )
-
-    minutes, secs = divmod(
-        remainder,
-        60
-    )
-
-    parts = []
-
-    if days:
-        parts.append(
-            f"{days} day{'s' if days != 1 else ''}"
-        )
-
-    if hours:
-        parts.append(
-            f"{hours} hour{'s' if hours != 1 else ''}"
-        )
-
-    if minutes:
-        parts.append(
-            f"{minutes} minute{'s' if minutes != 1 else ''}"
-        )
-
-    if secs:
-        parts.append(
-            f"{secs} second{'s' if secs != 1 else ''}"
-        )
-
-    return " ".join(parts) if parts else "0 seconds"
-
-
-# ============================================================
-# AUTHENTICATION HELPERS
-# ============================================================
-
-def is_authenticated(user_id):
-
-    conn = sqlite3.connect(
-        "bot_data.db"
-    )
-
-    c = conn.cursor()
-
-    c.execute(
-        """
-        SELECT *
-        FROM users
-        WHERE user_id = ?
-        """,
-        (user_id,)
-    )
-
-    data = c.fetchone()
-
-    conn.close()
-
-    return data is not None
-
-
-def add_authenticated_user(user_id):
-
-    conn = sqlite3.connect(
-        "bot_data.db"
-    )
-
-    c = conn.cursor()
-
-    c.execute(
-        """
-        INSERT OR IGNORE INTO users
-        (user_id)
-        VALUES (?)
-        """,
-        (user_id,)
-    )
-
-    conn.commit()
-
-    conn.close()
-
-
-def remove_authenticated_user(user_id):
-
-    conn = sqlite3.connect(
-        "bot_data.db"
-    )
-
-    c = conn.cursor()
-
-    c.execute(
-        """
-        DELETE FROM users
-        WHERE user_id = ?
-        """,
-        (user_id,)
-    )
-
-    conn.commit()
-
-    conn.close()
-
-
-def get_all_authenticated_users():
-
-    conn = sqlite3.connect(
-        "bot_data.db"
-    )
-
-    c = conn.cursor()
-
-    c.execute(
-        """
-        SELECT user_id
-        FROM users
-        """
-    )
-
-    rows = c.fetchall()
-
-    conn.close()
-
-    return [
-        row[0]
-        for row in rows
-    ]
-  # ============================================================
-# INBOX FUNCTIONS
-# ============================================================
-
-def add_inbox_message(
-    chat_id,
-    sender_id,
-    name,
-    username,
-    text,
-    media_type,
-    date
-):
-    conn = sqlite3.connect("bot_data.db")
-    c = conn.cursor()
-
-    c.execute(
-        """
-        INSERT INTO inbox
-        (
-            chat_id,
-            sender_id,
-            name,
-            username,
-            text,
-            media_type,
-            date
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            chat_id,
-            sender_id,
-            name,
-            username,
-            text,
-            media_type,
-            date
-        )
-    )
-
-    conn.commit()
-    conn.close()
-
-
-def get_inbox_conversations():
-
-    conn = sqlite3.connect("bot_data.db")
-    c = conn.cursor()
-
-    c.execute(
-        """
-        SELECT
-            chat_id,
-            sender_id,
-            name,
-            username,
-            text,
-            media_type,
-            date
-        FROM inbox
-        ORDER BY id DESC
-        """
-    )
-
-    rows = c.fetchall()
-
-    conn.close()
-
-    return rows
-
-
-# ============================================================
-# USER HISTORY
-# ============================================================
-
-def save_user_history(
-    user_id,
-    username,
-    first_name,
-    last_name
-):
-
-    conn = sqlite3.connect("bot_data.db")
-    c = conn.cursor()
-
-    c.execute(
-        """
-        INSERT INTO user_history
-        (
-            user_id,
-            username,
-            first_name,
-            last_name,
-            date
-        )
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (
-            user_id,
-            username,
-            first_name,
-            last_name,
-            str(
-                __import__(
-                    "datetime"
-                ).datetime.now()
-            )
-        )
-    )
-
-    conn.commit()
-    conn.close()
-
-
-def get_user_history(user_id):
-
-    conn = sqlite3.connect("bot_data.db")
-    c = conn.cursor()
-
-    c.execute(
-        """
-        SELECT
-            username,
-            first_name,
-            last_name,
-            date
-        FROM user_history
-        WHERE user_id = ?
-        ORDER BY date DESC
-        """,
-        (user_id,)
-    )
-
-    rows = c.fetchall()
-
-    conn.close()
-
-    return rows
-
-
-# ============================================================
-# TELEGRAM LINK PARSER
-# ============================================================
-
-def parse_tg_link(text):
-
-    if not text:
-        return None, None, None
-
-    # --------------------------------------------------------
-    # Comment link
-    # Example:
-    # https://t.me/channel/123/456
-    # --------------------------------------------------------
-
-    comment_pattern = (
-        r"https?://t\.me/"
-        r"([a-zA-Z0-9_]+)/"
-        r"(\d+)/"
-        r"(\d+)"
-    )
-
-    match = re.search(
-        comment_pattern,
-        text
-    )
-
-    if match:
-        return (
-            match.group(1),
-            int(match.group(2)),
-            int(match.group(3))
-        )
-
-    # --------------------------------------------------------
-    # Message range
-    # Example:
-    # https://t.me/channel/123-130
-    # --------------------------------------------------------
-
-    range_pattern = (
-        r"https?://t\.me/"
-        r"([a-zA-Z0-9_]+)/"
-        r"(\d+)-(\d+)"
-    )
-
-    match = re.search(
-        range_pattern,
-        text
-    )
-
-    if match:
-        return (
-            match.group(1),
-            int(match.group(2)),
-            int(match.group(3))
-        )
-
-    # --------------------------------------------------------
-    # Single message
-    # Example:
-    # https://t.me/channel/123
-    # --------------------------------------------------------
-
-    single_pattern = (
-        r"https?://t\.me/"
-        r"([a-zA-Z0-9_]+)/"
-        r"(\d+)"
-    )
-
-    match = re.search(
-        single_pattern,
-        text
-    )
-
-    if match:
-        return (
-            match.group(1),
-            int(match.group(2)),
-            None
-        )
-
-    # --------------------------------------------------------
-    # Channel / username
-    # Example:
-    # https://t.me/channel
-    # --------------------------------------------------------
-
-    channel_pattern = (
-        r"https?://t\.me/"
-        r"([a-zA-Z0-9_]+)"
-    )
-
-    match = re.search(
-        channel_pattern,
-        text
-    )
-
-    if match:
-        return (
-            match.group(1),
-            None,
-            None
-        )
-
-    return None, None, None
-
-
-# ============================================================
-# MEDIA TYPE DETECTION
-# ============================================================
-
-def get_media_type(event):
-
-    try:
-
-        if event.photo:
-            return "📷"
-
-        elif event.video:
-            return "🎬"
-
-        elif event.document:
-            if event.gif:
-                return "🎞️"
-
-            return "📄"
-
-        elif event.audio:
-            return "🎵"
-
-        elif event.voice:
-            return "🎤"
-
-        elif event.sticker:
-            return "🧩"
-
-        else:
-            return "💬"
-
-    except Exception:
-        return "💬"
-
-
-# ============================================================
-# TOOL FINISHED KEYBOARD
-# ============================================================
-
-def tool_done_kb():
-
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "🔄 Continue",
-                    callback_data="converter"
-                ),
-
-                InlineKeyboardButton(
-                    "🏠 Main Menu",
-                    callback_data="main_menu"
-                )
-            ]
-        ]
-    )
-
-
-# ============================================================
-# SAFE TELEGRAM MESSAGE SENDER
-# ============================================================
-#
-# Used by the bot when displaying messages received through
-# the Telethon account.
-#
-# It supports:
-#   text
-#   photo
-#   video
-#   document
-#   voice
-#   audio
-#   GIF
-#   sticker
-#
-# ============================================================
-
-async def safe_send(
-    chat_id,
-    bot,
-    msg,
-    from_chat_id=None,
-    message_id=None
-):
-
-    text = (
-        getattr(
-            msg,
-            "message",
-            None
-        )
-        or ""
-    ).strip()
-
-    try:
-
-        # ----------------------------------------------------
-        # MEDIA
-        # ----------------------------------------------------
-
-        if (
-            msg.photo
-            or msg.video
-            or msg.document
-            or msg.voice
-            or msg.audio
-            or msg.gif
-        ):
-
-            media_bytes = BytesIO()
-
-            await telethon_client.download_media(
-                msg,
-                file=media_bytes
-            )
-
-            media_bytes.seek(0)
-
-            caption = text
-
-            # Telegram captions have a length limit.
-            if len(caption) > 1024:
-                caption = None
-
-            # PHOTO
-            if msg.photo:
-
-                sent = await bot.send_photo(
-                    chat_id=chat_id,
-                    photo=media_bytes,
-                    caption=caption
-                )
-
-            # VIDEO
-            elif msg.video:
-
-                sent = await bot.send_video(
-                    chat_id=chat_id,
-                    video=media_bytes,
-                    caption=caption
-                )
-
-            # GIF / ANIMATION
-            elif msg.gif:
-
-                sent = await bot.send_animation(
-                    chat_id=chat_id,
-                    animation=media_bytes,
-                    caption=caption
-                )
-
-            # VOICE
-            elif msg.voice:
-
-                sent = await bot.send_voice(
-                    chat_id=chat_id,
-                    voice=media_bytes,
-                    caption=caption
-                )
-
-            # AUDIO
-            elif msg.audio:
-
-                sent = await bot.send_audio(
-                    chat_id=chat_id,
-                    audio=media_bytes,
-                    caption=caption
-                )
-
-            # DOCUMENT
-            else:
-
-                sent = await bot.send_document(
-                    chat_id=chat_id,
-                    document=media_bytes,
-                    caption=caption
-                )
-
-            # If caption was too long, send the text separately.
-            if text and caption is None:
-
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=text
-                )
-
-            return sent
-
-        # ----------------------------------------------------
-        # STICKER
-        # ----------------------------------------------------
-
-        if msg.sticker:
-
-            sticker_bytes = BytesIO()
-
-            await telethon_client.download_media(
-                msg,
-                file=sticker_bytes
-            )
-
-            sticker_bytes.seek(0)
-
-            return await bot.send_sticker(
-                chat_id=chat_id,
-                sticker=sticker_bytes
-            )
-
-        # ----------------------------------------------------
-        # TEXT
-        # ----------------------------------------------------
-
-        if text:
-
-            return await bot.send_message(
-                chat_id=chat_id,
-                text=text
-            )
-
-        # ----------------------------------------------------
-        # EMPTY / UNSUPPORTED
-        # ----------------------------------------------------
-
-        return await bot.send_message(
-            chat_id=chat_id,
-            text="📎 Unsupported or empty Telegram message."
-        )
-
-    except Exception as e:
-
-        error_text = str(e).lower()
-
-        if (
-            "must forward even restricted"
-            in error_text
-            or "protected"
-            in error_text
-        ):
-
-            await bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "🔒 This Telegram message has "
-                    "protected media and cannot be copied."
-                )
-            )
-
-        else:
-
-            await bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "⚠️ Could not display this message.\n\n"
-                    f"Error: {type(e).__name__}: {e}"
-                )
-            )
-
-
-# ============================================================
-# TELETHON ERROR HANDLER
-# ============================================================
-
-async def handle_telethon_error(
-    update,
-    error
-):
-
-    if isinstance(
-        error,
-        FloodWaitError
-    ):
-
-        await update.message.reply_text(
-            f"⚠️ FloodWait: {error.seconds} seconds."
-        )
-
-    elif isinstance(
-        error,
-        UsernameNotOccupiedError
-    ):
-
-        await update.message.reply_text(
-            "❌ Telegram username was not found."
-        )
-
-    elif isinstance(
-        error,
-        ChannelPrivateError
-    ):
-
-        await update.message.reply_text(
-            "🔒 This channel or group is private "
-            "or you do not have access to it."
-        )
-
-    elif isinstance(
-        error,
-        MessageIdInvalidError
-    ):
-
-        await update.message.reply_text(
-            "❌ The Telegram message ID is invalid."
-        )
-
-    else:
-
-        await update.message.reply_text(
-            f"❌ Error: {type(error).__name__}: {error}"
-        )
-
-
-# ============================================================
-# MESSAGE MANAGER — LINK DETECTION
-# ============================================================
-
-def mm_contains_link(event):
-
-    try:
-
-        text = (
-            getattr(
-                event,
-                "raw_text",
-                None
-            )
-            or ""
-        )
-
-        if re.search(
-            r"(https?://|www\.|t\.me/|telegram\.me/)",
-            text,
-            re.IGNORECASE
-        ):
-            return True
-
-        # Also inspect message entities where possible.
-        message = getattr(
-            event,
-            "message",
-            None
-        )
-
-        if message:
-
-            entities = getattr(
-                message,
-                "entities",
-                None
-            )
-
-            if entities:
-                return True
-
-    except Exception:
-        pass
-
-    return False
-
-
-# ============================================================
-# MESSAGE MANAGER — VIDEO DETECTION
-# ============================================================
-
-def mm_is_video(event):
-
-    try:
-
-        if getattr(
-            event,
-            "video",
-            None
-        ):
-            return True
-
-        message = getattr(
-            event,
-            "message",
-            None
-        )
-
-        if message:
-
-            if getattr(
-                message,
-                "video",
-                None
-            ):
-                return True
-
-            media = getattr(
-                message,
-                "media",
-                None
-            )
-
-            if media:
-
-                if getattr(
-                    media,
-                    "document",
-                    None
-                ):
-
-                    mime_type = getattr(
-                        media.document,
-                        "mime_type",
-                        ""
-                    )
-
-                    if (
-                        mime_type
-                        and mime_type.lower().startswith(
-                            "video/"
-                        )
-                    ):
-                        return True
-
-    except Exception:
-        pass
-
-    return False
-
-
-# ============================================================
-# MESSAGE MANAGER — KEYWORD DETECTION
-# ============================================================
-
-def mm_find_keyword(event):
-
-    try:
-
-        text = (
-            getattr(
-                event,
-                "raw_text",
-                None
-            )
-            or ""
-        ).lower()
-
-        if not text:
-            return None
-
-        keyword_rules = mm_get_json_rule(
-            "keyword_rules",
-            {}
-        )
-
-        if not isinstance(
-            keyword_rules,
-            dict
-        ):
-            return None
-
-        now = mm_now()
-
-        expired = []
-
-        for keyword, until in keyword_rules.items():
-
-            try:
-                until = int(until)
-            except Exception:
-                continue
-
-            # Permanent keyword rule
-            if until == 0:
-
-                if keyword.lower() in text:
-                    return keyword
-
-                continue
-
-            # Active timed keyword rule
-            if until > now:
-
-                if keyword.lower() in text:
-                    return keyword
-
-            else:
-
-                expired.append(keyword)
-
-        # Clean expired keyword rules.
-        if expired:
-
-            for keyword in expired:
-                keyword_rules.pop(
-                    keyword,
-                    None
-                )
-
-            mm_set_json_rule(
-                "keyword_rules",
-                keyword_rules
-            )
-
-    except Exception:
-        pass
-
-    return None
-
-
-# ============================================================
-# MESSAGE MANAGER — SPECIFIC USER BLOCK CHECK
-# ============================================================
-
-def mm_is_user_blocked(user_id):
-
-    try:
-
-        blocked_users = mm_get_json_rule(
-            "blocked_users",
-            []
-        )
-
-        if not isinstance(
-            blocked_users,
-            list
-        ):
-            return False
-
-        now = mm_now()
-
-        changed = False
-
-        for item in list(blocked_users):
-
-            try:
-
-                # New format:
-                # {"user_id": 123, "until": 123456}
-                if isinstance(
-                    item,
-                    dict
-                ):
-
-                    blocked_id = int(
-                        item.get(
-                            "user_id",
-                            0
-                        )
-                    )
-
-                    until = int(
-                        item.get(
-                            "until",
-                            0
-                        )
-                    )
-
-                    if blocked_id != int(user_id):
-                        continue
-
-                    # Permanent
-                    if until == 0:
-                        return True
-
-                    # Still active
-                    if until > now:
-                        return True
-
-                    # Expired
-                    blocked_users.remove(item)
-                    changed = True
-
-            except Exception:
-                continue
-
-        if changed:
-
-            mm_set_json_rule(
-                "blocked_users",
-                blocked_users
-            )
-
-    except Exception:
-        pass
-
-    return False
-
-
-# ============================================================
-# MESSAGE MANAGER — BLOCK EVERYONE CHECK
-# ============================================================
-
-def mm_is_everyone_blocked():
-
-    try:
-
-        until = int(
-            mm_get_rule(
-                "block_everyone_until",
-                "0"
-            )
-        )
-
-    except Exception:
-        return False
-
-    # Permanent
-    if until == 0:
-        return False
-
-    return until > mm_now()
-
-
-# ============================================================
-# MESSAGE MANAGER — FILTER LINKS CHECK
-# ============================================================
-
-def mm_links_are_filtered():
-
-    try:
-
-        until = int(
-            mm_get_rule(
-                "filter_links_until",
-                "0"
-            )
-        )
-
-    except Exception:
-        return False
-
-    if until == 0:
-        return False
-
-    return until > mm_now()
-
-
-# ============================================================
-# MESSAGE MANAGER — FILTER VIDEOS CHECK
-# ============================================================
-
-def mm_videos_are_filtered():
-
-    try:
-
-        until = int(
-            mm_get_rule(
-                "filter_videos_until",
-                "0"
-            )
-        )
-
-    except Exception:
-        return False
-
-    if until == 0:
-        return False
-
-    return until > mm_now()
-
-
-# ============================================================
-# MESSAGE MANAGER — CHECK WHETHER MESSAGE IS ALLOWED
-# ============================================================
-
-def mm_should_block_message(
-    event,
-    sender_id
-):
-
-    # Admins are never blocked by the manager.
-    if sender_id in ADMIN_IDS:
-        return False, None
-
-    # --------------------------------------------------------
-    # Messaging OFF
-    # --------------------------------------------------------
-
-    if not mm_is_messaging_on():
-
-        return True, "messaging_off"
-
-    # --------------------------------------------------------
-    # Block everyone
-    # --------------------------------------------------------
-
-    if mm_is_everyone_blocked():
-
-        return True, "block_everyone"
-
-    # --------------------------------------------------------
-    # Specific user
-    # --------------------------------------------------------
-
-    if mm_is_user_blocked(
-        sender_id
-    ):
-
-        return True, "specific_user"
-
-    # --------------------------------------------------------
-    # Link filter
-    # --------------------------------------------------------
-
-    if (
-        mm_links_are_filtered()
-        and mm_contains_link(event)
-    ):
-
-        return True, "link"
-
-    # --------------------------------------------------------
-    # Video filter
-    # --------------------------------------------------------
-
-    if (
-        mm_videos_are_filtered()
-        and mm_is_video(event)
-    ):
-
-        return True, "video"
-
-    # --------------------------------------------------------
-    # Keyword filter
-    # --------------------------------------------------------
-
-    keyword = mm_find_keyword(event)
-
-    if keyword:
-
-        return True, f"keyword:{keyword}"
-
-    return False, None
-
-
-# ============================================================
-# MESSAGE MANAGER — REFUSAL MESSAGE
-# ============================================================
-
-def mm_refusal_text(reason):
-
-    if reason == "messaging_off":
-
-        return (
-            "🚫 **Messaging is currently OFF.**\n\n"
-            "Your message was not forwarded to the manager.\n"
-            "Please try again later."
-        )
-
-    if reason == "block_everyone":
-
-        return (
-            "🚫 **Messages are temporarily blocked.**\n\n"
-            "The manager is currently not accepting "
-            "incoming messages.\n\n"
-            "Please try again later."
-        )
-
-    if reason == "specific_user":
-
-        return (
-            "🚫 **Your messages are currently blocked.**\n\n"
-            "Please try again later."
-        )
-
-    if reason == "link":
-
-        return (
-            "🔗 **Links are currently blocked.**\n\n"
-            "Please remove the link and try again."
-        )
-
-    if reason == "video":
-
-        return (
-            "🎥 **Videos are currently blocked.**\n\n"
-            "Please send a text message instead."
-        )
-
-    if isinstance(
-        reason,
-        str
-    ) and reason.startswith(
-        "keyword:"
-    ):
-
-        return (
-            "🚫 **This message contains a blocked keyword.**\n\n"
-            "Please change the message and try again."
-        )
-
-    return (
-        "🚫 **Your message could not be accepted.**\n\n"
-        "Please try again later."
-    )
-
-
-# ============================================================
-# MESSAGE MANAGER — GET ACTIVE KEYWORDS
-# ============================================================
-
-def mm_get_active_keywords():
-
-    keyword_rules = mm_get_json_rule(
-        "keyword_rules",
-        {}
-    )
-
-    if not isinstance(
-        keyword_rules,
-        dict
-    ):
-        return {}
-
-    now = mm_now()
-
-    active = {}
-
-    for keyword, until in keyword_rules.items():
-
-        try:
-            until = int(until)
-        except Exception:
-            continue
-
-        if until == 0 or until > now:
-            active[keyword] = until
-
-    return active
-  # ============================================================
-# PART 3/6 — MESSAGE MANAGER CONTROL PANEL
-# ============================================================
-
-# ------------------------------------------------------------
-# FIXED DURATION SYSTEM
-# ------------------------------------------------------------
-# 0  = inactive
-# -1 = permanent
-# >0 = Unix timestamp when the rule expires
-# ------------------------------------------------------------
 
 def mm_parse_duration(text):
     """
@@ -1797,13 +444,14 @@ def mm_parse_duration(text):
       5 minutes
       2 hours
       3 days
+      1 week
       1 month
       permanent
 
     Returns:
-      seconds
-      0  = invalid
-      -1 = permanent
+      seconds (int)
+      0   = invalid / not understood
+      -1  = permanent
     """
     if not text:
         return 0
@@ -1869,7 +517,7 @@ def mm_duration_to_until(duration_seconds):
     Convert duration seconds into expiration timestamp.
 
     -1 = permanent
-     0 = inactive
+     0 = inactive (should not be used)
     """
     if duration_seconds == -1:
         return -1
@@ -1976,83 +624,9 @@ def mm_until_text(until):
     return mm_format_duration(remaining)
 
 
-# ------------------------------------------------------------
-# MESSAGE MANAGER DATABASE ACCESS
-# ------------------------------------------------------------
-
-def mm_get_rule(name, default="0"):
-    conn = sqlite3.connect("bot_data.db")
-    c = conn.cursor()
-
-    c.execute(
-        "SELECT value FROM message_manager_rules WHERE name = ?",
-        (name,)
-    )
-
-    row = c.fetchone()
-
-    conn.close()
-
-    if row is None:
-        return default
-
-    return row[0]
-
-
-def mm_set_rule(name, value):
-    conn = sqlite3.connect("bot_data.db")
-    c = conn.cursor()
-
-    c.execute(
-        """
-        INSERT INTO message_manager_rules (name, value)
-        VALUES (?, ?)
-        ON CONFLICT(name)
-        DO UPDATE SET value = excluded.value
-        """,
-        (name, str(value))
-    )
-
-    conn.commit()
-    conn.close()
-
-
-def mm_get_json_rule(name, default):
-    raw = mm_get_rule(name, "")
-
-    if not raw:
-        return default
-
-    try:
-        value = json.loads(raw)
-
-        if isinstance(value, type(default)):
-            return value
-
-        return default
-
-    except Exception:
-        return default
-
-
-def mm_set_json_rule(name, value):
-    mm_set_rule(name, json.dumps(value))
-
-
-# ------------------------------------------------------------
-# MESSAGE MANAGER MAIN SETTINGS
-# ------------------------------------------------------------
-
-def mm_is_messaging_on():
-    return mm_get_rule("messaging", "on").lower() == "on"
-
-
-def mm_set_messaging(enabled):
-    mm_set_rule(
-        "messaging",
-        "on" if enabled else "off"
-    )
-
+# ============================================================
+# BLOCK EVERYONE
+# ============================================================
 
 def mm_get_block_everyone_until():
     try:
@@ -2065,6 +639,16 @@ def mm_set_block_everyone_until(until):
     mm_set_rule("block_everyone_until", until)
 
 
+def mm_is_everyone_blocked():
+    return mm_is_active_until(
+        mm_get_block_everyone_until()
+    )
+
+
+# ============================================================
+# LINK FILTER
+# ============================================================
+
 def mm_get_filter_links_until():
     try:
         return int(mm_get_rule("filter_links_until", "0"))
@@ -2075,6 +659,16 @@ def mm_get_filter_links_until():
 def mm_set_filter_links_until(until):
     mm_set_rule("filter_links_until", until)
 
+
+def mm_links_are_filtered():
+    return mm_is_active_until(
+        mm_get_filter_links_until()
+    )
+
+
+# ============================================================
+# VIDEO FILTER
+# ============================================================
 
 def mm_get_filter_videos_until():
     try:
@@ -2087,9 +681,15 @@ def mm_set_filter_videos_until(until):
     mm_set_rule("filter_videos_until", until)
 
 
-# ------------------------------------------------------------
+def mm_videos_are_filtered():
+    return mm_is_active_until(
+        mm_get_filter_videos_until()
+    )
+
+
+# ============================================================
 # BLOCKED USERS
-# ------------------------------------------------------------
+# ============================================================
 
 def mm_get_blocked_users():
     data = mm_get_json_rule("blocked_users", [])
@@ -2199,9 +799,9 @@ def mm_is_user_blocked(user_id):
     return active
 
 
-# ------------------------------------------------------------
+# ============================================================
 # KEYWORD FILTER RULES
-# ------------------------------------------------------------
+# ============================================================
 
 def mm_get_keyword_rules():
     data = mm_get_json_rule("keyword_rules", {})
@@ -2295,9 +895,13 @@ def mm_find_keyword(text):
     return None
 
 
-# ------------------------------------------------------------
-# MESSAGE TYPE DETECTION
-# ------------------------------------------------------------
+def mm_get_active_keywords():
+    return mm_cleanup_keyword_rules()
+
+
+# ============================================================
+# MESSAGE DETECTION
+# ============================================================
 
 def mm_contains_link(event):
     """
@@ -2377,35 +981,9 @@ def mm_is_video(event):
     return False
 
 
-# ------------------------------------------------------------
-# MESSAGE MANAGER STATUS
-# ------------------------------------------------------------
-
-def mm_get_active_keywords():
-    return mm_cleanup_keyword_rules()
-
-
-def mm_is_everyone_blocked():
-    return mm_is_active_until(
-        mm_get_block_everyone_until()
-    )
-
-
-def mm_links_are_filtered():
-    return mm_is_active_until(
-        mm_get_filter_links_until()
-    )
-
-
-def mm_videos_are_filtered():
-    return mm_is_active_until(
-        mm_get_filter_videos_until()
-    )
-
-
-# ------------------------------------------------------------
+# ============================================================
 # MESSAGE MANAGER MAIN DECISION
-# ------------------------------------------------------------
+# ============================================================
 
 def mm_should_block_message(sender_id, event):
     """
@@ -2455,9 +1033,9 @@ def mm_refusal_text():
     )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # DURATION KEYBOARD
-# ------------------------------------------------------------
+# ============================================================
 
 def mm_duration_keyboard(prefix):
     """
@@ -2516,9 +1094,9 @@ def mm_duration_keyboard(prefix):
     ])
 
 
-# ------------------------------------------------------------
+# ============================================================
 # MESSAGE MANAGER MAIN MENU
-# ------------------------------------------------------------
+# ============================================================
 
 def message_manager_keyboard():
     messaging_status = (
@@ -3338,8 +1916,10 @@ async def show_mm_help(query, context):
         ]),
         parse_mode=ParseMode.MARKDOWN
     )
-  # ============================================================
-# PART 4/6 — MESSAGE MANAGER CALLBACK + INPUT CONTROLLER
+
+
+# ============================================================
+# MESSAGE MANAGER CALLBACK + INPUT CONTROLLER
 # ============================================================
 
 async def handle_message_manager_callback(query, context):
@@ -4207,13 +2787,11 @@ async def route_message_manager_callback(
     )
 
     return True
-  # ============================================================
-# PART 5/6 — MESSAGE MANAGER LIVE MESSAGE HANDLING
-# ============================================================
 
-# ------------------------------------------------------------
-# MESSAGE MANAGER — LIVE DECISION
-# ------------------------------------------------------------
+
+# ============================================================
+# MESSAGE MANAGER LIVE MESSAGE HANDLING
+# ============================================================
 
 def mm_should_refuse_message(sender_id, event):
     """
@@ -4250,8 +2828,6 @@ def mm_should_refuse_message(sender_id, event):
         return False
 
 
-
-
 async def mm_send_refusal(event, blocked=False):
     """
     Send an automatic response to the person whose message
@@ -4262,7 +2838,10 @@ async def mm_send_refusal(event, blocked=False):
     """
 
     try:
-        text = MM_BLOCKED_MESSAGE if blocked else MM_REFUSAL_MESSAGE
+        if blocked:
+            text = "🚫 Your message has been blocked by the administrator."
+        else:
+            text = "🤖 Sorry, messaging is currently unavailable.\n\nPlease try again later."
         await event.respond(text)
     except Exception as e:
         print(f"Message Manager refusal error: {e}")
@@ -4470,9 +3049,6 @@ async def mm_send_admin_control_message(
     # Fallback:
     # If Bot API cannot message the admin, use Telethon.
     try:
-        await telethon_client.send_message(
-            admin
-              try:
         await telethon_client.send_message(
             admin_id,
             notification
@@ -4737,11 +3313,9 @@ async def handle_mm_message_action_callback(
             "blocked from Message Manager:"
         )
 
-        await query.message.reply_markup if False else None
-
         # Reuse the existing duration keyboard.
         keyboard = mm_duration_keyboard(
-            "mm_user_block"
+            "block_user"
         )
 
         await query.message.reply_text(
@@ -4761,9 +3335,6 @@ async def handle_mm_message_action_callback(
 async def process_message_manager_incoming(event):
     """
     Main gatekeeper.
-
-    This function is called by the Telethon incoming-message
-    listener.
 
     Flow:
 
@@ -4932,6 +3503,417 @@ async def mm_cancel_reply(update, context):
     )
 
     return True
-  
-          
-  
+
+
+# ============================================================
+# QR CODE TOOLS
+# ============================================================
+# NOTE: Insert the QR button into your Converter keyboard as described in the instructions.
+# Also, add the QR callback handling inside `menu_callback()` and the input handling inside `handle_link()`.
+# The functions below are ready to be used.
+# ============================================================
+
+import qrcode
+import cv2
+import numpy as np
+
+
+def create_qr_image_sync(text):
+    """
+    Create a QR code image locally.
+    No external API required.
+    """
+
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=12,
+        border=4,
+    )
+
+    qr.add_data(text)
+    qr.make(fit=True)
+
+    img = qr.make_image(
+        fill_color="black",
+        back_color="white"
+    )
+
+    output = BytesIO()
+    img.save(output, format="PNG")
+    output.seek(0)
+
+    return output
+
+
+def scan_qr_image_sync(image_bytes):
+    """
+    Read one or more QR codes from an image.
+    Returns a list of decoded results.
+    """
+
+    image_array = bytearray(image_bytes)
+
+    np_array = np.frombuffer(
+        image_array,
+        dtype=np.uint8
+    )
+
+    image = cv2.imdecode(
+        np_array,
+        cv2.IMREAD_COLOR
+    )
+
+    if image is None:
+        raise ValueError(
+            "Could not open the image."
+        )
+
+    detector = cv2.QRCodeDetector()
+
+    results = []
+
+    # --------------------------------------------------------
+    # Try detecting multiple QR codes first.
+    # --------------------------------------------------------
+
+    try:
+        retval, decoded_info, points, straight_qrcode = (
+            detector.detectAndDecodeMulti(image)
+        )
+
+        if retval and decoded_info:
+
+            for value in decoded_info:
+
+                if value and value.strip():
+
+                    value = value.strip()
+
+                    if value not in results:
+                        results.append(value)
+
+    except Exception as e:
+        print(
+            f"Multi QR detection error: {e}"
+        )
+
+    # --------------------------------------------------------
+    # Fallback to normal single QR detection.
+    # --------------------------------------------------------
+
+    if not results:
+
+        try:
+            data, points, _ = (
+                detector.detectAndDecode(image)
+            )
+
+            if data and data.strip():
+                results.append(data.strip())
+
+        except Exception as e:
+            print(
+                f"Single QR detection error: {e}"
+            )
+
+    return results
+
+
+def qr_menu_keyboard():
+
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "📷 Scan QR",
+                callback_data="qr_scan"
+            ),
+            InlineKeyboardButton(
+                "🎨 Create QR",
+                callback_data="qr_create"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⬅️ Back",
+                callback_data="converter"
+            )
+        ]
+    ])
+
+
+async def show_qr_menu(update, context):
+
+    query = update.callback_query
+
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    context.user_data["qr_mode"] = None
+    context.user_data["state"] = None
+
+    text = (
+        "📱 QR CODE TOOLS\n\n"
+        "Choose what you want to do:\n\n"
+        "📷 Scan QR\n"
+        "Send a QR-code image and I will read "
+        "the information inside it.\n\n"
+        "🎨 Create QR\n"
+        "Send text, a website, contact information, "
+        "or another supported value and I will create "
+        "a QR-code image for you."
+    )
+
+    await query.message.reply_text(
+        text,
+        reply_markup=qr_menu_keyboard()
+    )
+
+
+async def start_qr_scan(update, context):
+
+    query = update.callback_query
+
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    context.user_data["qr_mode"] = "scan"
+    context.user_data["state"] = "qr_scan"
+
+    await query.message.reply_text(
+        "📷 SCAN QR CODE\n\n"
+        "Send me a photo containing a QR code.\n\n"
+        "I will automatically read the QR code "
+        "and show you its contents.\n\n"
+        "💡 You can send a screenshot or a normal photo."
+    )
+
+
+async def start_qr_create(update, context):
+
+    query = update.callback_query
+
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    context.user_data["qr_mode"] = "create"
+    context.user_data["state"] = "qr_create"
+
+    await query.message.reply_text(
+        "🎨 CREATE QR CODE\n\n"
+        "Send me the text or link you want to put "
+        "inside the QR code.\n\n"
+        "Example:\n"
+        "https://example.com\n\n"
+        "or:\n"
+        "Hello from Ethiopia 🇪🇹"
+    )
+
+
+async def handle_qr_photo(update, context):
+
+    if context.user_data.get("state") != "qr_scan":
+        return False
+
+    if not update.message or not update.message.photo:
+
+        await update.message.reply_text(
+            "❌ Please send a QR-code image."
+        )
+
+        return True
+
+    status = await update.message.reply_text(
+        "🔍 Scanning QR code...\n\n"
+        "Please wait."
+    )
+
+    temp_path = None
+
+    try:
+
+        photo = update.message.photo[-1]
+
+        telegram_file = await context.bot.get_file(
+            photo.file_id
+        )
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".jpg",
+            delete=False
+        ) as temp:
+
+            temp_path = temp.name
+
+        await telegram_file.download_to_drive(
+            custom_path=temp_path
+        )
+
+        with open(
+            temp_path,
+            "rb"
+        ) as image_file:
+
+            image_bytes = image_file.read()
+
+        results = await asyncio.to_thread(
+            scan_qr_image_sync,
+            image_bytes
+        )
+
+        if not results:
+
+            await status.edit_text(
+                "❌ No readable QR code was found.\n\n"
+                "Try sending a clearer image with the "
+                "complete QR code visible."
+            )
+
+            return True
+
+        lines = [
+            "✅ QR CODE FOUND!",
+            ""
+        ]
+
+        for index, value in enumerate(
+            results,
+            start=1
+        ):
+
+            lines.append(
+                f"📌 QR #{index}"
+            )
+
+            lines.append(value)
+
+            lines.append("")
+
+        lines.append(
+            "📷 You can send another QR image anytime."
+        )
+
+        result_text = "\n".join(lines)
+
+        if len(result_text) > 3900:
+            result_text = (
+                result_text[:3890]
+                + "\n..."
+            )
+
+        await status.edit_text(
+            result_text
+        )
+
+    except Exception as e:
+
+        print(
+            f"QR scan error: {e}"
+        )
+
+        await status.edit_text(
+            "❌ QR scanning failed.\n\n"
+            f"Error: {str(e)[:1000]}"
+        )
+
+    finally:
+
+        if temp_path:
+
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+
+        context.user_data["state"] = "qr_scan"
+
+    return True
+
+
+async def handle_qr_create(update, context):
+
+    if context.user_data.get("state") != "qr_create":
+        return False
+
+    if not update.message:
+        return True
+
+    text = (
+        update.message.text
+        or update.message.caption
+        or ""
+    ).strip()
+
+    if not text:
+
+        await update.message.reply_text(
+            "❌ Please send text or a link "
+            "to put inside the QR code."
+        )
+
+        return True
+
+    if len(text) > 4000:
+
+        await update.message.reply_text(
+            "❌ The content is too long.\n\n"
+            "Please use 4000 characters or less."
+        )
+
+        return True
+
+    status = await update.message.reply_text(
+        "🎨 Creating QR code..."
+    )
+
+    try:
+
+        qr_image = await asyncio.to_thread(
+            create_qr_image_sync,
+            text
+        )
+
+        await status.delete()
+
+        await update.message.reply_photo(
+            photo=qr_image,
+            caption=(
+                "✅ QR code created successfully!\n\n"
+                "📌 Content:\n"
+                f"{text[:900]}"
+            ),
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "📱 QR Code Menu",
+                        callback_data="qr_menu"
+                    )
+                ]
+            ])
+        )
+
+    except Exception as e:
+
+        print(
+            f"QR creation error: {e}"
+        )
+
+        await status.edit_text(
+            "❌ Could not create QR code.\n\n"
+            f"Error: {str(e)[:1000]}"
+        )
+
+    context.user_data["state"] = "qr_create"
+
+    return True
+
+
+# ============================================================
+# END OF QR CODE TOOLS
+# ============================================================
