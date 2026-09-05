@@ -1210,87 +1210,346 @@ async def handle_text_to_image(update, context):
     finally: context.user_data["state"]=None
 
 # --- VOICE TO TEXT: LOCAL OFFLINE SPEECH ENGINES (NO CLOUD AI API) ---
-# English uses Vosk (small local speech engine). Amharic uses the already bundled
-# local Whisper model when available because a reliable non-ML Amharic offline
-# recognizer is not available in the standard Python ecosystem.
-_VOSK_MODEL=None; _VOSK_LOCK=threading.Lock()
-VOSK_MODEL_PATH=os.environ.get("VOSK_MODEL_PATH","/opt/vosk-model-small-en-us-0.15")
+# English uses Vosk (small, fast, local). All other supported languages use
+# faster-whisper, which is a real multilingual model (unlike Vosk, which only
+# ships small single-language models) — this is why Amharic and anything
+# else route to Whisper, not because of a hardcoded special case.
+
+import os
+import wave
+import json as _json
+import shutil
+import threading
+import tempfile
+import asyncio
+import subprocess
+import html
+from io import BytesIO
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+VOSK_MODEL_PATH = os.environ.get("VOSK_MODEL_PATH", "/opt/vosk-model-small-en-us-0.15")
+WHISPER_MODEL_NAME = os.environ.get("WHISPER_MODEL", "small")
+WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")
+WHISPER_COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE_TYPE", "int8")
+
+# Fix #5: timeout now scales with audio duration instead of a flat 120s
+# that silently kills long recordings with no explanation.
+FFMPEG_BASE_TIMEOUT = 30
+FFMPEG_TIMEOUT_PER_MB = 5  # extra seconds per MB of input audio
+MAX_AUDIO_MB = 40          # hard cap so a giant file can't hang a worker forever
+WHISPER_BASE_TIMEOUT = 60
+WHISPER_TIMEOUT_PER_SEC_AUDIO = 1.5  # whisper on CPU is slower than real-time
+
+# Fix #1: proper language routing table instead of "starts with en, else Amharic".
+# Vosk only gets used for languages where you actually have a Vosk model path
+# configured; everything else goes to Whisper with its correct ISO code.
+# Add more entries here as you add more languages to your bot's UI.
+LANGUAGE_ENGINE_MAP = {
+    "en": {"engine": "vosk"},
+    "am": {"engine": "whisper", "whisper_code": "am"},
+    "es": {"engine": "whisper", "whisper_code": "es"},
+    "fr": {"engine": "whisper", "whisper_code": "fr"},
+    "ar": {"engine": "whisper", "whisper_code": "ar"},
+    "sw": {"engine": "whisper", "whisper_code": "sw"},
+    "om": {"engine": "whisper", "whisper_code": "om"},  # Afaan Oromo
+    "ti": {"engine": "whisper", "whisper_code": "ti"},  # Tigrinya
+}
+DEFAULT_ENGINE = "whisper"  # unknown/unlisted languages still get a real attempt via Whisper
+
+# Whisper's officially supported language codes (subset check — the full list
+# is ~100 codes; this is used only to give a clear error instead of a cryptic
+# faster-whisper exception when someone passes something invalid).
+WHISPER_KNOWN_CODES = {
+    "en", "am", "es", "fr", "ar", "sw", "om", "ti", "de", "it", "pt", "ru",
+    "zh", "ja", "ko", "hi", "tr", "nl", "pl", "uk", "vi", "th", "id", "he",
+    "fa", "ur", "bn", "ta", "te", "ml", "so",
+}
+
+# ============================================================
+# FFMPEG CHECK (Fix #4)
+# ============================================================
+
+_ffmpeg_path_cache = None
+_ffmpeg_lock = threading.Lock()
+
+
+def _get_ffmpeg_path():
+    """
+    Resolve an ffmpeg binary once, with a clear error if none is available,
+    instead of letting a missing imageio_ffmpeg import blow up deep inside
+    a background thread with a confusing traceback.
+    """
+    global _ffmpeg_path_cache
+    with _ffmpeg_lock:
+        if _ffmpeg_path_cache:
+            return _ffmpeg_path_cache
+        # Prefer a system ffmpeg if present (faster, no bundled binary needed).
+        sys_ffmpeg = shutil.which("ffmpeg")
+        if sys_ffmpeg:
+            _ffmpeg_path_cache = sys_ffmpeg
+            return _ffmpeg_path_cache
+        try:
+            import imageio_ffmpeg
+            _ffmpeg_path_cache = imageio_ffmpeg.get_ffmpeg_exe()
+            return _ffmpeg_path_cache
+        except Exception as e:
+            raise RuntimeError(
+                "FFmpeg is not available. Install it with 'apt-get install ffmpeg' "
+                "on your server, or add 'imageio-ffmpeg' to requirements.txt. "
+                f"(underlying error: {e})"
+            )
+
+
+# ============================================================
+# VOSK (English) — Fix #7: thread-safe lazy singleton
+# ============================================================
+
+_VOSK_MODEL = None
+_VOSK_LOCK = threading.Lock()
+
 
 def _get_vosk_model():
     global _VOSK_MODEL
-    if _VOSK_MODEL is not None: return _VOSK_MODEL
+    if _VOSK_MODEL is not None:
+        return _VOSK_MODEL
     with _VOSK_LOCK:
         if _VOSK_MODEL is None:
-            from vosk import Model
             if not os.path.isdir(VOSK_MODEL_PATH):
-                raise RuntimeError("Local English Vosk model is missing. Set VOSK_MODEL_PATH to a Vosk model directory.")
-            _VOSK_MODEL=Model(VOSK_MODEL_PATH)
+                raise RuntimeError(
+                    f"Local English Vosk model is missing at '{VOSK_MODEL_PATH}'. "
+                    "Set VOSK_MODEL_PATH to a valid Vosk model directory, or "
+                    "download one from https://alphacephei.com/vosk/models"
+                )
+            from vosk import Model
+            _VOSK_MODEL = Model(VOSK_MODEL_PATH)
     return _VOSK_MODEL
 
-def _transcribe_vosk_sync(wav_path):
-    import wave, json as _json
-    from vosk import KaldiRecognizer
-    model=_get_vosk_model(); wf=wave.open(wav_path,"rb")
-    if wf.getnchannels()!=1 or wf.getsampwidth()!=2 or wf.getframerate()!=16000:
-        wf.close(); raise RuntimeError("Audio must be mono 16-bit PCM at 16 kHz.")
-    rec=KaldiRecognizer(model,wf.getframerate()); parts=[]
-    while True:
-        data=wf.readframes(4000)
-        if not data: break
-        if rec.AcceptWaveform(data):
-            r=_json.loads(rec.Result());
-            if r.get("text"): parts.append(r["text"])
-    r=_json.loads(rec.FinalResult());
-    if r.get("text"): parts.append(r["text"])
-    wf.close(); return " ".join(parts).strip()
 
-_WHISPER_MODEL=None; _WHISPER_LOCK=threading.Lock()
-WHISPER_MODEL_NAME=os.environ.get("WHISPER_MODEL","small")
-WHISPER_DEVICE=os.environ.get("WHISPER_DEVICE","cpu")
-WHISPER_COMPUTE_TYPE=os.environ.get("WHISPER_COMPUTE_TYPE","int8")
+def _transcribe_vosk_sync(wav_path):
+    from vosk import KaldiRecognizer
+    model = _get_vosk_model()
+    wf = wave.open(wav_path, "rb")
+    try:
+        if wf.getnchannels() != 1 or wf.getsampwidth() != 2 or wf.getframerate() != 16000:
+            raise RuntimeError("Audio must be mono 16-bit PCM at 16 kHz (conversion step should guarantee this).")
+        rec = KaldiRecognizer(model, wf.getframerate())
+        parts = []
+        while True:
+            data = wf.readframes(4000)
+            if not data:
+                break
+            if rec.AcceptWaveform(data):
+                r = _json.loads(rec.Result())
+                if r.get("text"):
+                    parts.append(r["text"])
+        r = _json.loads(rec.FinalResult())
+        if r.get("text"):
+            parts.append(r["text"])
+        return " ".join(parts).strip()
+    finally:
+        wf.close()
+
+
+# ============================================================
+# WHISPER (all other languages) — Fix #2, #7
+# ============================================================
+
+_WHISPER_MODEL = None
+_WHISPER_LOCK = threading.Lock()
+
+
 def _get_whisper_model():
+    """
+    Lazy-load faster-whisper once and cache it. First call will be slow
+    (downloading/loading model weights) — the caller sends a status update
+    warning about this so the user isn't left staring at silence.
+    """
     global _WHISPER_MODEL
-    if _WHISPER_MODEL is not None: return _WHISPER_MODEL
+    if _WHISPER_MODEL is not None:
+        return _WHISPER_MODEL
     with _WHISPER_LOCK:
         if _WHISPER_MODEL is None:
-            from faster_whisper import WhisperModel
-            _WHISPER_MODEL=WhisperModel(WHISPER_MODEL_NAME,device=WHISPER_DEVICE,compute_type=WHISPER_COMPUTE_TYPE)
+            try:
+                from faster_whisper import WhisperModel
+            except ImportError:
+                raise RuntimeError(
+                    "faster-whisper is not installed. Run: pip install faster-whisper"
+                )
+            _WHISPER_MODEL = WhisperModel(
+                WHISPER_MODEL_NAME, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE
+            )
     return _WHISPER_MODEL
 
-def _transcribe_whisper_sync(wav_path,language_code):
-    model=_get_whisper_model(); segments,info=model.transcribe(wav_path,language=language_code,beam_size=5,vad_filter=True,condition_on_previous_text=True)
-    return " ".join(x.text.strip() for x in segments).strip(),getattr(info,"language",language_code)
+
+def _transcribe_whisper_sync(wav_path, language_code):
+    # Fix #2: validate the language code against Whisper's known set up front,
+    # so an unsupported code fails fast with a clear message instead of a
+    # confusing internal error or (worse) silently mis-transcribing.
+    if language_code not in WHISPER_KNOWN_CODES:
+        raise RuntimeError(
+            f"'{language_code}' is not a language Whisper supports here. "
+            "Add it to WHISPER_KNOWN_CODES if you've confirmed Whisper supports it."
+        )
+    model = _get_whisper_model()
+    segments, info = model.transcribe(
+        wav_path,
+        language=language_code,
+        beam_size=5,
+        vad_filter=True,
+        condition_on_previous_text=True,
+    )
+    text = " ".join(seg.text.strip() for seg in segments).strip()
+    detected = getattr(info, "language", language_code)
+    return text, detected
+
+
+# ============================================================
+# SAFE STATUS EDIT (Fix #6)
+# ============================================================
+
+async def _safe_edit(status_msg, text, **kwargs):
+    """
+    Telegram message edits can fail (message deleted, chat migrated, edit
+    with identical text, etc.). Never let a cosmetic status update crash
+    the whole transcription flow.
+    """
+    try:
+        await status_msg.edit_text(text, **kwargs)
+    except Exception:
+        pass
+
+
+# ============================================================
+# MAIN HANDLER
+# ============================================================
 
 async def handle_voice_to_text(update, context, language):
     if not update.message.voice and not update.message.audio:
-        await update.message.reply_text("❌ Please send a voice message or audio file."); return
-    status=await update.message.reply_text("⏳ Converting audio to 16 kHz mono…")
-    paths=[]
-    try:
-        file_id=update.message.voice.file_id if update.message.voice else update.message.audio.file_id
-        tg=await context.bot.get_file(file_id); data=BytesIO(); await tg.download_to_memory(data); data.seek(0)
-        with tempfile.NamedTemporaryFile(delete=False,suffix=".ogg") as f: f.write(data.read()); ogg=f.name; paths.append(ogg)
-        with tempfile.NamedTemporaryFile(delete=False,suffix=".wav") as f: wav=f.name; paths.append(wav)
-        ff=imageio_ffmpeg.get_ffmpeg_exe(); subprocess.run([ff,"-y","-i",ogg,"-ar","16000","-ac","1","-sample_fmt","s16",wav],check=True,capture_output=True,timeout=120)
-        if language.startswith("en"):
-            await status.edit_text("🎙️ Recognizing locally with Vosk (no cloud AI API)…")
-            text=await asyncio.to_thread(_transcribe_vosk_sync,wav); detected="en"
-        else:
-            await status.edit_text("🎙️ Recognizing Amharic locally…")
-            text,detected=await asyncio.to_thread(_transcribe_whisper_sync,wav,"am")
-        if not text:
-            await status.edit_text("❌ No understandable speech was detected.")
-        else:
-            await update.message.reply_text(f"📝 Transcribed Text ({detected}):\n\n{text}",reply_markup=tool_done_kb())
-            await status.edit_text("✅ Voice to text complete.")
-    except Exception as e:
-        await status.edit_text("❌ Voice to text failed.\n\n"+html.escape(str(e)[:1600]),parse_mode=ParseMode.HTML)
-    finally:
-        for x in paths:
-            try: os.unlink(x)
-            except OSError: pass
-        context.user_data["state"]=None
+        await update.message.reply_text("❌ Please send a voice message or audio file.")
+        return
 
+    status = await update.message.reply_text("⏳ Downloading audio…")
+    paths = []
+    try:
+        # --- Download (Fix #3: detect real format instead of assuming .ogg) ---
+        voice_or_audio = update.message.voice or update.message.audio
+        file_id = voice_or_audio.file_id
+        tg_file = await context.bot.get_file(file_id)
+
+        # Telegram voice notes are always .ogg/opus; audio uploads can be
+        # mp3/wav/m4a/etc. Use the real extension from Telegram's file_path
+        # (or the original filename for audio docs) so ffmpeg gets a
+        # correctly-named input instead of a mislabeled file.
+        src_ext = ".ogg"
+        candidate_name = getattr(tg_file, "file_path", None) or getattr(voice_or_audio, "file_name", None)
+        if candidate_name and "." in candidate_name:
+            ext = "." + candidate_name.rsplit(".", 1)[-1].lower()
+            if 1 < len(ext) <= 6:  # sane extension length guard
+                src_ext = ext
+
+        data = BytesIO()
+        await tg_file.download_to_memory(data)
+        data.seek(0)
+        raw_bytes = data.read()
+
+        size_mb = len(raw_bytes) / (1024 * 1024)
+        if size_mb > MAX_AUDIO_MB:
+            await _safe_edit(status, f"❌ Audio is too large ({size_mb:.1f} MB). Max supported is {MAX_AUDIO_MB} MB.")
+            return
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=src_ext) as f:
+            f.write(raw_bytes)
+            src_path = f.name
+            paths.append(src_path)
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
+            wav_path = f.name
+            paths.append(wav_path)
+
+        # --- Convert to 16kHz mono PCM WAV (Fix #4, #5) ---
+        await _safe_edit(status, "⏳ Converting audio to 16 kHz mono…")
+        ffmpeg_path = _get_ffmpeg_path()
+        ffmpeg_timeout = int(FFMPEG_BASE_TIMEOUT + size_mb * FFMPEG_TIMEOUT_PER_MB)
+        try:
+            subprocess.run(
+                [ffmpeg_path, "-y", "-i", src_path, "-ar", "16000", "-ac", "1", "-sample_fmt", "s16", wav_path],
+                check=True, capture_output=True, timeout=ffmpeg_timeout, text=True,
+            )
+        except subprocess.TimeoutExpired:
+            await _safe_edit(status, f"❌ Audio conversion timed out after {ffmpeg_timeout}s. Try a shorter clip.")
+            return
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or "").strip()[-500:]
+            await _safe_edit(status, "❌ Could not convert this audio format.\n\n" + html.escape(stderr), parse_mode="HTML")
+            return
+
+        if not os.path.exists(wav_path) or os.path.getsize(wav_path) < 100:
+            await _safe_edit(status, "❌ Audio conversion produced no output. The file may be corrupted or empty.")
+            return
+
+        # Estimate duration for the Whisper timeout, from the converted WAV header.
+        try:
+            with wave.open(wav_path, "rb") as wf:
+                duration_sec = wf.getnframes() / float(wf.getframerate())
+        except Exception:
+            duration_sec = 30.0  # safe fallback estimate
+
+        # --- Route to the correct engine (Fix #1) ---
+        lang_key = (language or "en").split("-")[0].lower()
+        route = LANGUAGE_ENGINE_MAP.get(lang_key, {"engine": DEFAULT_ENGINE, "whisper_code": lang_key})
+
+        if route["engine"] == "vosk":
+            await _safe_edit(status, "🎙️ Recognizing locally with Vosk (no cloud AI API)…")
+            text = await asyncio.to_thread(_transcribe_vosk_sync, wav_path)
+            detected = "en"
+        else:
+            whisper_code = route.get("whisper_code", lang_key)
+            await _safe_edit(
+                status,
+                f"🎙️ Recognizing '{whisper_code}' locally with Whisper…\n"
+                "(first run may take longer while the model loads)"
+            )
+            whisper_timeout = WHISPER_BASE_TIMEOUT + duration_sec * WHISPER_TIMEOUT_PER_SEC_AUDIO
+            try:
+                text, detected = await asyncio.wait_for(
+                    asyncio.to_thread(_transcribe_whisper_sync, wav_path, whisper_code),
+                    timeout=whisper_timeout,
+                )
+            except asyncio.TimeoutError:
+                await _safe_edit(
+                    status,
+                    f"❌ Transcription timed out after {int(whisper_timeout)}s. "
+                    "Try a shorter clip or a smaller WHISPER_MODEL (e.g. 'base' or 'tiny')."
+                )
+                return
+
+        if not text:
+            await _safe_edit(status, "❌ No understandable speech was detected. Try speaking more clearly or closer to the mic.")
+        else:
+            await update.message.reply_text(
+                f"📝 Transcribed Text ({detected}):\n\n{text}",
+                reply_markup=tool_done_kb()
+            )
+            await _safe_edit(status, "✅ Voice to text complete.")
+
+    except Exception as e:
+        await _safe_edit(
+            status,
+            "❌ Voice to text failed.\n\n" + html.escape(str(e)[:1600]),
+            parse_mode="HTML",
+        )
+    finally:
+        # Fix #6/#7: cleanup + state reset always runs, even on early returns above.
+        for p in paths:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        context.user_data["state"] = None
+        
 # --- POWERFUL MULTI-SOURCE VIDEO DOWNLOADER ---
 # Supported input: YouTube, TikTok, Instagram, Facebook.
 # The bot first uses yt-dlp. For YouTube/TikTok failures, it can use public
