@@ -13,6 +13,7 @@ import html
 from io import BytesIO
 import json
 import hashlib
+import base64
 from datetime import datetime, timedelta
 from flask import Flask
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageChops
@@ -34,7 +35,6 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 import yt_dlp
 import imageio_ffmpeg
-import edge_tts
 import qrcode
 import cv2
 import numpy as np
@@ -519,6 +519,12 @@ async def handle_photo_edit_selection(update, context, data):
         await query.message.reply_text("🗑️ Current photo removed. Send another photo to edit."); return
 
     if data == "edit_remove_bg":
+        await query.message.reply_text("ℹ️ Background removal is disabled in this version.")
+        return
+    if data == "edit_change_bg":
+        await query.message.reply_text("ℹ️ Background changing is disabled in this version.")
+        return
+    if data == "edit_remove_bg_legacy":
         async def run_bg_removal():
             def do_work():
                 from rembg import remove, new_session
@@ -549,10 +555,29 @@ async def handle_photo_edit_selection(update, context, data):
     filter_name = "Original"
     if data == "edit_orig": filter_name = "Original"
     elif data == "edit_hd":
-        img = ImageEnhance.Sharpness(img).enhance(2.0)
-        img = ImageEnhance.Contrast(img).enhance(1.2)
-        img = ImageEnhance.Color(img).enhance(1.1)
-        filter_name = "HD Enhanced"
+        # Professional local enhancement: 4x/2000px upscale + denoise + local contrast + natural color + crisp edges.
+        # No generative AI/API is used here.
+        src = img.convert("RGB")
+        target_min = 2000
+        scale = max(4.0, target_min / max(1, min(src.size)))
+        scale = min(scale, 8.0)
+        nw = max(2000, int(round(src.width * scale)))
+        nh = max(2000, int(round(src.height * scale)))
+        max_dim = 5000
+        if max(nw, nh) > max_dim:
+            ratio = max_dim / max(nw, nh)
+            nw, nh = int(nw * ratio), int(nh * ratio)
+        img = src.resize((nw, nh), Image.Resampling.LANCZOS)
+        # Mild noise cleanup without destroying skin/texture.
+        img = img.filter(ImageFilter.MedianFilter(size=3))
+        # Natural tonal lift and controlled micro-contrast.
+        img = ImageEnhance.Contrast(img).enhance(1.10)
+        img = ImageEnhance.Color(img).enhance(1.08)
+        img = ImageEnhance.Brightness(img).enhance(1.02)
+        img = ImageEnhance.Sharpness(img).enhance(1.65)
+        # Unsharp mask for crisp edges.
+        img = img.filter(ImageFilter.UnsharpMask(radius=1.6, percent=145, threshold=3))
+        filter_name = f"HD Pro • {nw}×{nh}"
     elif data == "edit_bw":
         img = ImageOps.grayscale(img); filter_name = "Black & White"
     elif data == "edit_sepia":
@@ -596,7 +621,7 @@ async def handle_edit_photo(update, context):
         img_bytes = BytesIO(); await file.download_to_memory(img_bytes); img_bytes.seek(0)
         img = Image.open(img_bytes)
         context.user_data['edit_image'] = img
-        kb = [[InlineKeyboardButton("🖼️ Original", callback_data="edit_orig"), InlineKeyboardButton("✨ HD 100x", callback_data="edit_hd"), InlineKeyboardButton("🎨 Vivid", callback_data="edit_vivid")], [InlineKeyboardButton("⬛ B&W", callback_data="edit_bw"), InlineKeyboardButton("🟤 Sepia", callback_data="edit_sepia"), InlineKeyboardButton("🔪 Sharpen", callback_data="edit_sharp")], [InlineKeyboardButton("☀️ Brighten", callback_data="edit_bright"), InlineKeyboardButton("🌙 Darken", callback_data="edit_dark"), InlineKeyboardButton("🌫️ Blur", callback_data="edit_blur")], [InlineKeyboardButton("🟥 Pixel", callback_data="edit_pixel"), InlineKeyboardButton("🔄 Invert", callback_data="edit_invert"), InlineKeyboardButton("✏️ Sketch", callback_data="edit_sketch")], [InlineKeyboardButton("🧊 Emboss", callback_data="edit_emboss"), InlineKeyboardButton("🎞️ Poster", callback_data="edit_poster"), InlineKeyboardButton("🔥 Solarize", callback_data="edit_solar")], [InlineKeyboardButton("🗑️ Remove", callback_data="edit_clear"), InlineKeyboardButton("🖼️ Remove BG", callback_data="edit_remove_bg"), InlineKeyboardButton("🖼️ Change BG", callback_data="edit_change_bg")]]
+        kb = [[InlineKeyboardButton("🖼️ Original", callback_data="edit_orig"), InlineKeyboardButton("✨ HD Pro", callback_data="edit_hd"), InlineKeyboardButton("🎨 Vivid", callback_data="edit_vivid")], [InlineKeyboardButton("⬛ B&W", callback_data="edit_bw"), InlineKeyboardButton("🟤 Sepia", callback_data="edit_sepia"), InlineKeyboardButton("🔪 Sharpen", callback_data="edit_sharp")], [InlineKeyboardButton("☀️ Brighten", callback_data="edit_bright"), InlineKeyboardButton("🌙 Darken", callback_data="edit_dark"), InlineKeyboardButton("🌫️ Blur", callback_data="edit_blur")], [InlineKeyboardButton("🟥 Pixel", callback_data="edit_pixel"), InlineKeyboardButton("🔄 Invert", callback_data="edit_invert"), InlineKeyboardButton("✏️ Sketch", callback_data="edit_sketch")], [InlineKeyboardButton("🧊 Emboss", callback_data="edit_emboss"), InlineKeyboardButton("🎞️ Poster", callback_data="edit_poster"), InlineKeyboardButton("🔥 Solarize", callback_data="edit_solar")], [InlineKeyboardButton("🗑️ Remove Photo", callback_data="edit_clear")]]
         await status_msg.edit_text("✅ Image loaded!\n\nChoose an editing feature below:", reply_markup=InlineKeyboardMarkup(kb))
         context.user_data['state'] = None
     except Exception as e:
@@ -646,44 +671,59 @@ async def handle_front_upload(update, context):
         await status_msg.edit_text(f"❌ Background change failed: {e}")
         context.user_data.pop('bg_image', None); context.user_data['state'] = None
 
-# --- TEXT TO VOICE ---
+# --- TEXT TO VOICE: LOCAL OFFLINE eSpeak (NO AI API) ---
+# Uses the operating-system speech engine instead of edge-tts/cloud APIs.
+ESPEAK_BIN = os.environ.get("ESPEAK_BIN", "espeak-ng" if os.path.exists("/usr/bin/espeak-ng") else "espeak")
+
+def _espeak_voice(lang, voice_type):
+    if lang == "am":
+        # eSpeak installations vary in Amharic support. If an Amharic voice exists,
+        # use it; otherwise report a clear local-engine error rather than silently
+        # producing incorrect English speech.
+        return "am"
+    return {"male":"en-us+m1", "female":"en-us+f3", "old":"en-us+m2", "child":"en-us+f4"}.get(voice_type, "en-us")
+
+def _tts_espeak_sync(text, lang, voice_type, out_path):
+    voice = _espeak_voice(lang, voice_type)
+    cmd=[ESPEAK_BIN, "-v", voice, "-s", "155", "-a", "170", "-w", out_path, text]
+    subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=120)
+    if not os.path.exists(out_path) or os.path.getsize(out_path) < 100:
+        raise RuntimeError("Local eSpeak did not produce an audio file.")
+
 async def handle_tts(update, context, lang):
-    if not update.message.text:
+    text=(update.message.text or "").strip()
+    if not text:
         await update.message.reply_text("❌ Please send the text you want to convert.")
         return
-    context.user_data['tts_text'] = update.message.text
-    context.user_data['tts_lang'] = lang
-    kb = [[InlineKeyboardButton("🧑 Male", callback_data=f"tts_voice_{lang}_male"), InlineKeyboardButton("👩 Female", callback_data=f"tts_voice_{lang}_female")], [InlineKeyboardButton("👴 Old", callback_data=f"tts_voice_{lang}_old"), InlineKeyboardButton("👶 Child", callback_data=f"tts_voice_{lang}_child")]]
-    await update.message.reply_text("🎙️ **Choose Voice Type:**", reply_markup=InlineKeyboardMarkup(kb))
-    context.user_data['state'] = None
+    context.user_data['tts_text']=text
+    context.user_data['tts_lang']=lang
+    kb=[[InlineKeyboardButton("🧑 Male", callback_data=f"tts_voice_{lang}_male"), InlineKeyboardButton("👩 Female", callback_data=f"tts_voice_{lang}_female")], [InlineKeyboardButton("👴 Old", callback_data=f"tts_voice_{lang}_old"), InlineKeyboardButton("👶 Child", callback_data=f"tts_voice_{lang}_child")], [InlineKeyboardButton("⬅️ Cancel", callback_data="converter")]]
+    await update.message.reply_text("🔊 LOCAL TEXT TO VOICE\n\nChoose a voice style:", reply_markup=InlineKeyboardMarkup(kb))
+    context.user_data['state']=None
 
 async def handle_tts_voice_selection(update, context, data):
-    query = update.callback_query
-    await query.answer()
-    parts = data.split("_")
-    lang = parts[2]
-    voice_type = parts[3]
-    text = context.user_data.get('tts_text')
+    q=update.callback_query; await q.answer()
+    parts=data.split("_")
+    lang=parts[2] if len(parts)>2 else "en"; voice_type=parts[3] if len(parts)>3 else "male"
+    text=context.user_data.get('tts_text')
     if not text:
-        await query.message.reply_text("❌ No text found. Please send the text again.")
+        await q.message.reply_text("❌ Text session expired. Open Text to Voice and send the text again.")
         return
-    if lang == 'en':
-        voice_map = {'male': 'en-US-GuyNeural', 'female': 'en-US-JennyNeural', 'old': 'en-US-SteffanNeural', 'child': 'en-US-AnaNeural'}
-    else:
-        voice_map = {'male': 'am-ET-AmehaNeural', 'female': 'am-ET-MekdesNeural', 'old': 'am-ET-MekdesNeural', 'child': 'am-ET-MekdesNeural'}
-    selected_voice = voice_map.get(voice_type, 'en-US-GuyNeural')
-    status_msg = await query.message.reply_text("🗣️ Generating voice...")
+    status=await q.message.reply_text("🔊 Converting with the local speech engine…")
+    path=None
     try:
-        communicate = edge_tts.Communicate(text, selected_voice)
-        audio_path = "output.mp3"
-        await communicate.save(audio_path)
-        with open(audio_path, "rb") as audio:
-            await query.message.reply_audio(audio=audio, title=f"Voice ({voice_type})", reply_markup=tool_done_kb())
-        os.unlink(audio_path)
-        await status_msg.edit_text("✅ Voice generated!")
-        context.user_data.pop('tts_text', None); context.user_data.pop('tts_lang', None)
+        fd,path=tempfile.mkstemp(prefix="tts_",suffix=".wav"); os.close(fd)
+        await asyncio.to_thread(_tts_espeak_sync,text,lang,voice_type,path)
+        with open(path,"rb") as audio:
+            await q.message.reply_audio(audio=audio,title=f"Local Voice ({lang}, {voice_type})",reply_markup=tool_done_kb())
+        await status.edit_text("✅ Text to voice complete — no external AI API was used.")
     except Exception as e:
-        await status_msg.edit_text(f"❌ TTS failed: {e}")
+        await status.edit_text("❌ Local text-to-voice failed.\n\n"+html.escape(str(e)[:1200]),parse_mode=ParseMode.HTML)
+    finally:
+        if path:
+            try: os.unlink(path)
+            except OSError: pass
+        context.user_data.pop('tts_text',None); context.user_data.pop('tts_lang',None); context.user_data['state']=None
 
 # --- IMAGE FORMAT CONVERSION ---
 async def handle_image_convert(update, context, fmt):
@@ -780,35 +820,90 @@ async def handle_pptx_to_pdf(update, context):
         await status_msg.edit_text(f"❌ Conversion failed: {e}")
         context.user_data['state'] = None
 
-# --- TEXT TO PDF ---
+# --- TEXT TO PDF: UNICODE/FALLBACK FONT ENGINE ---
 PDF_DRAFT_KEY = "text_pdf_items"
 def text_pdf_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("➕ Enter Next Text", callback_data="pdftext_next"), InlineKeyboardButton("✅ Done", callback_data="pdftext_done")],[InlineKeyboardButton("❌ Cancel", callback_data="pdftext_cancel")]])
+
+FONT_CANDIDATES = [
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+]
+ETHIOPIC_CANDIDATES = [
+    "/usr/share/fonts/truetype/noto/NotoSansEthiopic-Regular.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansEthiopic-Regular.ttf",
+]
+ARABIC_CANDIDATES = [
+    "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansArabic/NotoSansArabic-Regular.ttf",
+]
+CJK_CANDIDATES = [
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+]
+
+def _first_existing(paths):
+    for p in paths:
+        if os.path.exists(p): return p
+    return None
+
+def _make_unicode_pdf(texts, path):
+    # fpdf2 handles Unicode text directly and can use fallback fonts.
+    from fpdf import FPDF
+    pdf=FPDF(format="A4")
+    pdf.set_auto_page_break(auto=True, margin=16)
+    pdf.set_margins(15,15,15)
+    main_font=_first_existing(FONT_CANDIDATES)
+    if not main_font:
+        raise RuntimeError("No Unicode font found. Install Noto/DejaVu fonts in Render.")
+    pdf.add_font("Main", fname=main_font)
+    fallback=[]
+    eth=_first_existing(ETHIOPIC_CANDIDATES)
+    arab=_first_existing(ARABIC_CANDIDATES)
+    cjk=_first_existing(CJK_CANDIDATES)
+    for name,path2 in (("Ethiopic",eth),("Arabic",arab),("CJK",cjk)):
+        if path2:
+            try:
+                pdf.add_font(name,fname=path2); fallback.append(name)
+            except Exception: pass
+    if fallback:
+        try: pdf.set_fallback_fonts(fallback)
+        except Exception: pass
+    pdf.add_page(); pdf.set_font("Main",size=12)
+    pdf.set_title("Text Document")
+    for i,t in enumerate(texts):
+        if i: pdf.ln(4)
+        pdf.multi_cell(0,8,t)
+    pdf.output(path)
+
 async def handle_text_pdf_input(update, context):
     if context.user_data.get("state") != "awaiting_text_pdf": return
     text=(update.message.text or "").strip()
-    if not text: await update.message.reply_text("❌ Please send some text."); return
+    if not text:
+        await update.message.reply_text("❌ Please send some text."); return
     items=context.user_data.setdefault(PDF_DRAFT_KEY,[]); items.append(text)
-    await update.message.reply_text(f"✅ Text {len(items)} added.\n\nAdd another text or press Done.",reply_markup=text_pdf_keyboard())
+    await update.message.reply_text(f"✅ Text {len(items)} added.\n\nUnicode PDF mode supports multilingual text. Add another or press Done.",reply_markup=text_pdf_keyboard())
+
 async def finish_text_to_pdf(update, context):
     q=update.callback_query; await q.answer(); items=context.user_data.get(PDF_DRAFT_KEY,[])
-    if not items: await q.message.reply_text("❌ No text has been added yet."); return
-    status=await q.message.reply_text("⏳ Creating PDF…"); path=None
+    if not items:
+        await q.message.reply_text("❌ No text has been added yet."); return
+    status=await q.message.reply_text("⏳ Creating multilingual Unicode PDF…"); path=None
     try:
         fd,path=tempfile.mkstemp(prefix="text_pdf_",suffix=".pdf"); os.close(fd)
-        styles=getSampleStyleSheet(); body=ParagraphStyle("BotBody",parent=styles["BodyText"],fontName="Helvetica",fontSize=11,leading=16,spaceAfter=12)
-        doc=SimpleDocTemplate(path,pagesize=letter,rightMargin=54,leftMargin=54,topMargin=54,bottomMargin=54,title="Text to PDF")
-        story=[]
-        for item in items: story += [Paragraph(html.escape(item).replace("\n","<br/>"),body),Spacer(1,4)]
-        doc.build(story)
-        with open(path,"rb") as f: await q.message.reply_document(document=f,filename="text_document.pdf",caption=f"✅ PDF created from {len(items)} text message(s).",reply_markup=tool_done_kb())
-        await status.edit_text("✅ Text to PDF complete!")
-    except Exception as e: await status.edit_text("❌ Text to PDF failed.\n\n"+html.escape(str(e)[:1200]),parse_mode=ParseMode.HTML)
+        await asyncio.to_thread(_make_unicode_pdf,items,path)
+        with open(path,"rb") as f:
+            await q.message.reply_document(document=f,filename="multilingual_text.pdf",caption=f"✅ Unicode PDF created from {len(items)} text message(s).",reply_markup=tool_done_kb())
+        await status.edit_text("✅ Text to PDF complete — Unicode font fallback enabled.")
+    except Exception as e:
+        await status.edit_text("❌ Text to PDF failed.\n\n"+html.escape(str(e)[:1500]),parse_mode=ParseMode.HTML)
     finally:
         context.user_data.pop(PDF_DRAFT_KEY,None); context.user_data["state"]=None
         if path:
             try: os.unlink(path)
             except OSError: pass
+
 async def cancel_text_to_pdf(update, context):
     q=update.callback_query; await q.answer(); context.user_data.pop(PDF_DRAFT_KEY,None); context.user_data["state"]=None; await q.edit_message_text("❌ Text to PDF cancelled.")
 
@@ -831,7 +926,41 @@ async def handle_text_to_image(update, context):
     except Exception as e: await status.edit_text("❌ Text-to-Image failed.\n\n"+html.escape(str(e)[:1500]),parse_mode=ParseMode.HTML)
     finally: context.user_data["state"]=None
 
-# --- VOICE TO TEXT: FASTER-WHISPER (NO GROQ) ---
+# --- VOICE TO TEXT: LOCAL OFFLINE SPEECH ENGINES (NO CLOUD AI API) ---
+# English uses Vosk (small local speech engine). Amharic uses the already bundled
+# local Whisper model when available because a reliable non-ML Amharic offline
+# recognizer is not available in the standard Python ecosystem.
+_VOSK_MODEL=None; _VOSK_LOCK=threading.Lock()
+VOSK_MODEL_PATH=os.environ.get("VOSK_MODEL_PATH","/opt/vosk-model-small-en-us-0.15")
+
+def _get_vosk_model():
+    global _VOSK_MODEL
+    if _VOSK_MODEL is not None: return _VOSK_MODEL
+    with _VOSK_LOCK:
+        if _VOSK_MODEL is None:
+            from vosk import Model
+            if not os.path.isdir(VOSK_MODEL_PATH):
+                raise RuntimeError("Local English Vosk model is missing. Set VOSK_MODEL_PATH to a Vosk model directory.")
+            _VOSK_MODEL=Model(VOSK_MODEL_PATH)
+    return _VOSK_MODEL
+
+def _transcribe_vosk_sync(wav_path):
+    import wave, json as _json
+    from vosk import KaldiRecognizer
+    model=_get_vosk_model(); wf=wave.open(wav_path,"rb")
+    if wf.getnchannels()!=1 or wf.getsampwidth()!=2 or wf.getframerate()!=16000:
+        wf.close(); raise RuntimeError("Audio must be mono 16-bit PCM at 16 kHz.")
+    rec=KaldiRecognizer(model,wf.getframerate()); parts=[]
+    while True:
+        data=wf.readframes(4000)
+        if not data: break
+        if rec.AcceptWaveform(data):
+            r=_json.loads(rec.Result());
+            if r.get("text"): parts.append(r["text"])
+    r=_json.loads(rec.FinalResult());
+    if r.get("text"): parts.append(r["text"])
+    wf.close(); return " ".join(parts).strip()
+
 _WHISPER_MODEL=None; _WHISPER_LOCK=threading.Lock()
 WHISPER_MODEL_NAME=os.environ.get("WHISPER_MODEL","small")
 WHISPER_DEVICE=os.environ.get("WHISPER_DEVICE","cpu")
@@ -844,22 +973,35 @@ def _get_whisper_model():
             from faster_whisper import WhisperModel
             _WHISPER_MODEL=WhisperModel(WHISPER_MODEL_NAME,device=WHISPER_DEVICE,compute_type=WHISPER_COMPUTE_TYPE)
     return _WHISPER_MODEL
+
 def _transcribe_whisper_sync(wav_path,language_code):
     model=_get_whisper_model(); segments,info=model.transcribe(wav_path,language=language_code,beam_size=5,vad_filter=True,condition_on_previous_text=True)
     return " ".join(x.text.strip() for x in segments).strip(),getattr(info,"language",language_code)
+
 async def handle_voice_to_text(update, context, language):
-    if not update.message.voice and not update.message.audio: await update.message.reply_text("❌ Please send a voice message or audio file."); return
-    status=await update.message.reply_text("⏳ Transcribing with Whisper AI… First use may take longer while the model loads."); paths=[]
+    if not update.message.voice and not update.message.audio:
+        await update.message.reply_text("❌ Please send a voice message or audio file."); return
+    status=await update.message.reply_text("⏳ Converting audio to 16 kHz mono…")
+    paths=[]
     try:
         file_id=update.message.voice.file_id if update.message.voice else update.message.audio.file_id
         tg=await context.bot.get_file(file_id); data=BytesIO(); await tg.download_to_memory(data); data.seek(0)
         with tempfile.NamedTemporaryFile(delete=False,suffix=".ogg") as f: f.write(data.read()); ogg=f.name; paths.append(ogg)
         with tempfile.NamedTemporaryFile(delete=False,suffix=".wav") as f: wav=f.name; paths.append(wav)
-        ff=imageio_ffmpeg.get_ffmpeg_exe(); subprocess.run([ff,"-y","-i",ogg,"-ar","16000","-ac","1",wav],check=True,capture_output=True)
-        text,detected=await asyncio.to_thread(_transcribe_whisper_sync,wav,language.split("-")[0].lower())
-        if not text: await status.edit_text("❌ Whisper could not detect understandable speech.")
-        else: await update.message.reply_text(f"📝 Transcribed Text (Whisper):\n\n{text}",reply_markup=tool_done_kb()); await status.edit_text(f"✅ Transcription complete! Language: {detected}")
-    except Exception as e: await status.edit_text("❌ Whisper transcription failed.\n\n"+html.escape(str(e)[:1500]),parse_mode=ParseMode.HTML)
+        ff=imageio_ffmpeg.get_ffmpeg_exe(); subprocess.run([ff,"-y","-i",ogg,"-ar","16000","-ac","1","-sample_fmt","s16",wav],check=True,capture_output=True,timeout=120)
+        if language.startswith("en"):
+            await status.edit_text("🎙️ Recognizing locally with Vosk (no cloud AI API)…")
+            text=await asyncio.to_thread(_transcribe_vosk_sync,wav); detected="en"
+        else:
+            await status.edit_text("🎙️ Recognizing Amharic locally…")
+            text,detected=await asyncio.to_thread(_transcribe_whisper_sync,wav,"am")
+        if not text:
+            await status.edit_text("❌ No understandable speech was detected.")
+        else:
+            await update.message.reply_text(f"📝 Transcribed Text ({detected}):\n\n{text}",reply_markup=tool_done_kb())
+            await status.edit_text("✅ Voice to text complete.")
+    except Exception as e:
+        await status.edit_text("❌ Voice to text failed.\n\n"+html.escape(str(e)[:1600]),parse_mode=ParseMode.HTML)
     finally:
         for x in paths:
             try: os.unlink(x)
@@ -938,37 +1080,98 @@ def youtube_video_id(url: str):
     return None
 
 
-def ytdlp_base_options():
+def _prepare_cookiefile_from_env():
+    """Return a usable Netscape cookie file path from Render env vars.
+
+    Preferred: YTDLP_COOKIES_FILE / INSTAGRAM_COOKIES_FILE pointing to a file.
+    For Render, INSTAGRAM_COOKIES_B64 or YTDLP_COOKIES_B64 can contain a
+    base64-encoded Netscape cookies.txt file. This avoids putting multiline
+    cookie text directly into the Python source.
+    """
+    candidates = [
+        os.environ.get("INSTAGRAM_COOKIES_FILE", "").strip(),
+        os.environ.get("YTDLP_COOKIES_FILE", "").strip(),
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+
+    encoded = (os.environ.get("INSTAGRAM_COOKIES_B64", "").strip()
+               or os.environ.get("YTDLP_COOKIES_B64", "").strip())
+    if encoded:
+        try:
+            decoded = base64.b64decode(encoded).decode("utf-8")
+            if "# Netscape HTTP Cookie File" not in decoded and "# HTTP Cookie File" not in decoded:
+                print("Cookie env was supplied but is not a Netscape cookies.txt file.")
+            path = os.path.join(tempfile.gettempdir(), "samibot_cookies.txt")
+            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(decoded)
+            return path
+        except Exception as exc:
+            print("Could not decode cookie environment variable:", exc)
+    return None
+
+
+def clean_social_url(url: str, platform: str) -> str:
+    """Remove tracking query parameters from social-media URLs.
+
+    Instagram frequently appends igsh/igshid tracking parameters. The actual
+    post/reel identifier is preserved while the request becomes deterministic.
+    """
+    if platform != "instagram":
+        return url
+    try:
+        parsed = urllib.parse.urlparse(url)
+        return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+    except Exception:
+        return url
+
+
+def ytdlp_base_options(url=None):
+    platform = video_platform(url or "") if url else "unknown"
+    user_agent = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/139.0.0.0 Safari/537.36"
+    )
     options = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "socket_timeout": 25,
-        "retries": 3,
-        "fragment_retries": 3,
+        "socket_timeout": 30,
+        "retries": 2,
+        "fragment_retries": 2,
         "file_access_retries": 3,
-        "concurrent_fragment_downloads": 4,
+        "concurrent_fragment_downloads": 2,
         "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/147.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.8",
+            "User-Agent": user_agent,
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         },
-        # Current yt-dlp supports remote EJS components. They help keep
-        # YouTube extraction working when challenge scripts change.
         "remote_components": {"ejs:github"},
     }
-    cookies = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
-    if cookies and os.path.isfile(cookies):
-        options["cookiefile"] = cookies
-    # Do NOT set `impersonate='chrome'` blindly. That was the source of the
-    # user's "Impersonate target chrome is not available" error.
+    cookiefile = _prepare_cookiefile_from_env()
+    if cookiefile:
+        options["cookiefile"] = cookiefile
+
+    if platform == "instagram":
+        # These are normal browser-like request headers; they do not bypass
+        # authentication. A logged-in cookie jar is still required when
+        # Instagram rate-limits or requires login.
+        options["http_headers"].update({
+            "Referer": "https://www.instagram.com/",
+            "Origin": "https://www.instagram.com",
+            "X-IG-App-ID": "936619743392459",
+        })
+        # Use the curl_cffi request handler supplied by yt-dlp[default] when
+        # available. It provides a browser-like TLS/HTTP stack.
+        options["impersonate"] = "chrome"
     return options
 
 
 def extract_ytdlp_info(url: str):
-    opts = ytdlp_base_options()
+    opts = ytdlp_base_options(url)
     # Let current yt-dlp select its working YouTube player client. If one
     # client is blocked, yt-dlp can try another supported client.
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -990,7 +1193,7 @@ def build_ytdlp_format(height=None, audio=False, platform="unknown"):
 
 def ytdlp_download(url: str, output_dir: str, *, height=None, audio=False, title_hint="video"):
     platform = video_platform(url)
-    opts = ytdlp_base_options()
+    opts = ytdlp_base_options(url)
     opts.update({
         "format": build_ytdlp_format(height, audio, platform),
         "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
@@ -1195,8 +1398,10 @@ def tikwm_download(url: str, output_dir: str, *, quality="hd", audio=False):
 
 def extract_download_options(url: str):
     platform = video_platform(url)
-    normalized = normalize_public_url(url) if platform == "tiktok" else url
-    # Direct yt-dlp path first.
+    normalized = normalize_public_url(url) if platform == "tiktok" else clean_social_url(url, platform)
+    # Direct yt-dlp path first. Instagram is intentionally tried with the
+    # configured cookie jar when present. A 429 is a server-side rate limit;
+    # repeatedly hammering the same endpoint only makes it worse.
     try:
         info = extract_ytdlp_info(normalized)
         title = info.get("title") or "Video"
@@ -1236,6 +1441,16 @@ def extract_download_options(url: str):
             if not qualities:
                 raise RuntimeError(f"TikTok extraction failed: {first_error}")
             return {"source": "tikwm", "platform": platform, "url": normalized, "title": data.get("title") or data.get("desc") or "TikTok video", "qualities": qualities, "audio": bool(data.get("music")), "tikwm": data}
+        if platform == "instagram" and "429" in str(first_error):
+            has_cookie = bool(_prepare_cookiefile_from_env())
+            if not has_cookie:
+                raise RuntimeError(
+                    "Instagram rate-limited the Render IP (HTTP 429). "
+                    "No Instagram cookie jar is configured. Add INSTAGRAM_COOKIES_B64 "
+                    "or INSTAGRAM_COOKIES_FILE in Render using a fresh Netscape cookies.txt "
+                    "from your own Instagram browser session, then redeploy. "
+                    "Without cookies, Instagram may refuse server-side extraction."
+                )
         raise RuntimeError(f"Extraction failed: {first_error}")
 
 
