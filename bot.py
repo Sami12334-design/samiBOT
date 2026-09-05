@@ -1886,43 +1886,73 @@ async def handle_pdf_to_word(update, context):
         context.user_data['state'] = None
     except Exception as e:
         await status_msg.edit_text(f"❌ Conversion failed: {e}"); context.user_data['state'] = None
-
 async def handle_image_to_text(update, context):
-    if context.user_data.get('state') != 'awaiting_image_to_text': return
+    if context.user_data.get('state') != 'awaiting_image_to_text':
+        return
     if not update.message.photo:
-        await update.message.reply_text("❌ Please upload an image."); return
-    status_msg = await update.message.reply_text("⏳ Extracting text from image...")
-    try:
-        from rapidocr_onnxruntime import RapidOCR
-        ocr = RapidOCR()
-        photo = update.message.photo[-1]; file = await context.bot.get_file(photo.file_id)
-        img_bytes = BytesIO(); await file.download_to_memory(img_bytes); img_bytes.seek(0)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_img:
-            tmp_img.write(img_bytes.read()); tmp_img_path = tmp_img.name
-        result, elapse = ocr(tmp_img_path); os.unlink(tmp_img_path)
-        if not result:
-            await status_msg.edit_text("❌ No text found in the image."); return
-        extracted_text = "\n".join([line[1] for line in result])
-        await update.message.reply_text(f"📝 **Extracted Text:**\n\n{extracted_text}", reply_markup=tool_done_kb())
-        await status_msg.edit_text("✅ Text extraction complete!"); context.user_data['state'] = None
-    except Exception as e:
-        await status_msg.edit_text(f"❌ OCR failed: {e}"); context.user_data['state'] = None
+        await update.message.reply_text("❌ Please upload an image.")
+        return
 
-async def handle_image_collect(update, context):
-    if context.user_data.get('state') != 'awaiting_image_to_pdf': return
-    if not update.message.photo:
-        await update.message.reply_text("❌ Please upload an image or click Done to finish."); return
-    if 'pdf_images' not in context.user_data:
-        context.user_data['pdf_images'] = []
-    photo = update.message.photo[-1]
-    file = await context.bot.get_file(photo.file_id)
-    img_bytes = BytesIO(); await file.download_to_memory(img_bytes); img_bytes.seek(0)
-    context.user_data['pdf_images'].append(img_bytes)
-    count = len(context.user_data['pdf_images'])
-    if count >= 10:
-        await process_image_pdf(update, context)
-    else:
-        await update.message.reply_text(f"✅ Image {count}/10 added.\nSend another image, or click Done.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done", callback_data="img_pdf_done")]]))
+    status_msg = await update.message.reply_text("⏳ Extracting text from image...")
+
+    try:
+        # 1. Get the photo
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        img_bytes = BytesIO()
+        await file.download_to_memory(img_bytes)
+        img_bytes.seek(0)
+
+        # 2. Convert directly to a NumPy array (no temp files!)
+        img_array = np.frombuffer(img_bytes.getvalue(), np.uint8)
+        img_cv = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+
+        if img_cv is None:
+            await status_msg.edit_text("❌ Could not read the image. Please try another one.")
+            context.user_data['state'] = None
+            return
+
+        # 3. Run OCR in a separate thread to prevent the bot from freezing
+        def do_ocr():
+            from rapidocr_onnxruntime import RapidOCR
+            ocr = RapidOCR()
+            result, elapse = ocr(img_cv)  # Feed numpy array directly
+            return result
+
+        result = await asyncio.to_thread(do_ocr)
+
+        if not result:
+            await status_msg.edit_text("❌ No text found in the image.")
+            context.user_data['state'] = None
+            return
+
+        extracted_text = "\n".join([line[1] for line in result])
+
+        await update.message.reply_text(
+            f"📝 **Extracted Text:**\n\n{extracted_text}",
+            reply_markup=tool_done_kb()
+        )
+        await status_msg.edit_text("✅ Text extraction complete!")
+        context.user_data['state'] = None
+
+    except ImportError:
+        await status_msg.edit_text(
+            "❌ OCR module not found!\n\n"
+            "Please add `rapidocr_onnxruntime` to your `requirements.txt` and redeploy."
+        )
+        context.user_data['state'] = None
+
+    except MemoryError:
+        await status_msg.edit_text(
+            "❌ Out of memory (RAM) while running OCR!\n\n"
+            "The free Render instance has only 512MB. "
+            "Please upgrade to a paid plan or try a smaller image."
+        )
+        context.user_data['state'] = None
+
+    except Exception as e:
+        await status_msg.edit_text(f"❌ OCR failed: {e}")
+        context.user_data['state'] = None
 
 async def process_image_pdf(update, context):
     query = update.callback_query
