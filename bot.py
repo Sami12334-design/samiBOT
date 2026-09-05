@@ -1208,218 +1208,81 @@ async def handle_text_to_image(update, context):
         await update.message.reply_photo(photo=out,caption=f"🎨 Generated image\n\nPrompt: {prompt[:900]}",reply_markup=tool_done_kb()); await status.edit_text("✅ Image generated successfully!")
     except Exception as e: await status.edit_text("❌ Text-to-Image failed.\n\n"+html.escape(str(e)[:1500]),parse_mode=ParseMode.HTML)
     finally: context.user_data["state"]=None
-
-# --- VOICE TO TEXT: LOCAL OFFLINE WHISPER ONLY (FAST, ERRORLESS) ---
-# Uses faster-whisper with the "tiny" model for maximum speed.
-# Automatically downloads the model if missing; preloaded at startup to avoid delays.
-# No external API keys required. 100% local and free.
-
-import os
-import wave
-import json as _json
-import shutil
-import threading
-import tempfile
-import asyncio
-import subprocess
-import html
-import urllib.request
-from io import BytesIO
-
-# ============================================================
-# CONFIG (Timeouts set to 1 minute maximum)
-# ============================================================
-WHISPER_MODEL_NAME = os.environ.get("WHISPER_MODEL", "tiny")  # "tiny" = super fast
-WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")
-WHISPER_COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE_TYPE", "int8")
-
-# Timeouts (Dynamic, capped at 1 minute)
-FFMPEG_BASE_TIMEOUT = 30
-FFMPEG_TIMEOUT_PER_MB = 5
-MAX_AUDIO_MB = 40
-
-# --- FIX: 1 Minute Cap ---
-WHISPER_BASE_TIMEOUT = 30  # Base 30 seconds
-WHISPER_TIMEOUT_PER_SEC_AUDIO = 2  # Extra 2 seconds per audio second
-MAX_WHISPER_TIMEOUT = 60  # Hard cap at 60 seconds (1 minute)
-
-# ============================================================
-# FFMPEG CHECK
-# ============================================================
-_ffmpeg_path_cache = None
-_ffmpeg_lock = threading.Lock()
-
-def _get_ffmpeg_path():
-    global _ffmpeg_path_cache
-    with _ffmpeg_lock:
-        if _ffmpeg_path_cache:
-            return _ffmpeg_path_cache
-        sys_ffmpeg = shutil.which("ffmpeg")
-        if sys_ffmpeg:
-            _ffmpeg_path_cache = sys_ffmpeg
-            return _ffmpeg_path_cache
-        try:
-            import imageio_ffmpeg
-            _ffmpeg_path_cache = imageio_ffmpeg.get_ffmpeg_exe()
-            return _ffmpeg_path_cache
-        except Exception as e:
-            raise RuntimeError(f"FFmpeg not found. Install it or add 'imageio-ffmpeg' to requirements.txt. Error: {e}")
-
-# ============================================================
-# WHISPER MODEL (Singleton, preload at startup)
-# ============================================================
-_WHISPER_MODEL = None
-_WHISPER_LOCK = threading.Lock()
-
-def _get_whisper_model():
-    global _WHISPER_MODEL
-    if _WHISPER_MODEL is not None:
-        return _WHISPER_MODEL
-    with _WHISPER_LOCK:
-        if _WHISPER_MODEL is None:
-            try:
-                from faster_whisper import WhisperModel
-            except ImportError:
-                raise RuntimeError("faster-whisper is not installed. Run: pip install faster-whisper")
-            print(f"🔄 Loading Whisper model '{WHISPER_MODEL_NAME}' (first time may take a few seconds)...")
-            _WHISPER_MODEL = WhisperModel(WHISPER_MODEL_NAME, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE)
-            print("✅ Whisper model loaded!")
-    return _WHISPER_MODEL
-
-def _transcribe_whisper_sync(wav_path, language_code):
-    model = _get_whisper_model()
-    segments, info = model.transcribe(wav_path, language=language_code, beam_size=5, vad_filter=True)
-    text = " ".join(seg.text.strip() for seg in segments).strip()
-    detected = getattr(info, "language", language_code)
-    return text, detected
-
-# ============================================================
-# SAFE STATUS EDIT
-# ============================================================
-async def _safe_edit(status_msg, text, **kwargs):
-    try:
-        await status_msg.edit_text(text, **kwargs)
-    except Exception:
-        pass
-
-# ============================================================
-# MAIN HANDLER (1 Minute Cap)
-# ============================================================
+# --- VOICE TO TEXT (GROQ + GOOGLE FALLBACK) ---
 async def handle_voice_to_text(update, context, language):
     if not update.message.voice and not update.message.audio:
-        await update.message.reply_text("❌ Please send a voice message or audio file.")
+        await update.message.reply_text("❌ Please send a voice message OR an audio file.")
         return
 
-    status = await update.message.reply_text("⏳ Downloading audio…")
-    paths = []
+    status_msg = await update.message.reply_text("⏳ Transcribing voice/audio...")
+
     try:
-        # Download audio
-        voice_or_audio = update.message.voice or update.message.audio
-        file_id = voice_or_audio.file_id
-        tg_file = await context.bot.get_file(file_id)
-
-        src_ext = ".ogg"
-        candidate_name = getattr(tg_file, "file_path", None) or getattr(voice_or_audio, "file_name", None)
-        if candidate_name and "." in candidate_name:
-            ext = "." + candidate_name.rsplit(".", 1)[-1].lower()
-            if 1 < len(ext) <= 6:
-                src_ext = ext
-
-        data = BytesIO()
-        await tg_file.download_to_memory(data)
-        data.seek(0)
-        raw_bytes = data.read()
-
-        size_mb = len(raw_bytes) / (1024 * 1024)
-        if size_mb > MAX_AUDIO_MB:
-            await _safe_edit(status, f"❌ Audio is too large ({size_mb:.1f} MB). Max is {MAX_AUDIO_MB} MB.")
-            return
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=src_ext) as f:
-            f.write(raw_bytes)
-            src_path = f.name
-            paths.append(src_path)
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
-            wav_path = f.name
-            paths.append(wav_path)
-
-        # Convert to WAV
-        await _safe_edit(status, "⏳ Converting audio to 16 kHz mono…")
-        ffmpeg_path = _get_ffmpeg_path()
-        ffmpeg_timeout = int(FFMPEG_BASE_TIMEOUT + size_mb * FFMPEG_TIMEOUT_PER_MB)
-        try:
-            subprocess.run(
-                [ffmpeg_path, "-y", "-i", src_path, "-ar", "16000", "-ac", "1", "-sample_fmt", "s16", wav_path],
-                check=True, capture_output=True, timeout=ffmpeg_timeout, text=True,
-            )
-        except subprocess.TimeoutExpired:
-            await _safe_edit(status, f"❌ Audio conversion timed out after {ffmpeg_timeout}s.")
-            return
-        except subprocess.CalledProcessError as e:
-            stderr = (e.stderr or "").strip()[-500:]
-            await _safe_edit(status, "❌ Could not convert this audio format.\n\n" + html.escape(stderr), parse_mode="HTML")
-            return
-
-        if not os.path.exists(wav_path) or os.path.getsize(wav_path) < 100:
-            await _safe_edit(status, "❌ Audio conversion produced no output. The file may be corrupted.")
-            return
-
-        # Estimate duration for dynamic timeout
-        try:
-            with wave.open(wav_path, "rb") as wf:
-                duration_sec = wf.getnframes() / float(wf.getframerate())
-        except Exception:
-            duration_sec = 30.0
-
-        # Calculate dynamic timeout (capped at 60 seconds)
-        dynamic_timeout = min(MAX_WHISPER_TIMEOUT, int(WHISPER_BASE_TIMEOUT + duration_sec * WHISPER_TIMEOUT_PER_SEC_AUDIO))
-
-        # Get language code (handle "en-US" -> "en", "am-ET" -> "am")
-        lang_key = (language or "en").split("-")[0].lower()
-        if lang_key not in {"en", "am", "es", "fr", "ar", "sw", "om", "ti", "de", "it", "pt", "ru", "zh", "ja", "ko", "hi", "tr", "nl", "pl", "uk", "vi", "th", "id", "he", "fa", "ur", "bn", "ta", "te", "ml", "so"}:
-            lang_key = "en"
-
-        # Recognize with Whisper
-        await _safe_edit(status, f"🎙️ Recognizing '{lang_key}' locally with Whisper (tiny model, max {dynamic_timeout}s)…")
-        try:
-            text, detected = await asyncio.wait_for(
-                asyncio.to_thread(_transcribe_whisper_sync, wav_path, lang_key),
-                timeout=dynamic_timeout
-            )
-        except asyncio.TimeoutError:
-            await _safe_edit(status, f"❌ Transcription timed out after {dynamic_timeout}s (1 min cap). Try a shorter clip.")
-            return
-
-        if not text:
-            await _safe_edit(status, "❌ No understandable speech was detected. Try speaking clearly.")
+        if update.message.voice:
+            file_id = update.message.voice.file_id
         else:
-            await update.message.reply_text(f"📝 Transcribed Text ({detected}):\n\n{text}", reply_markup=tool_done_kb())
-            await _safe_edit(status, "✅ Voice to text complete.")
+            file_id = update.message.audio.file_id
 
-    except Exception as e:
-        await _safe_edit(status, "❌ Voice to text failed.\n\n" + html.escape(str(e)[:1600]), parse_mode="HTML")
-    finally:
-        for p in paths:
+        file = await context.bot.get_file(file_id)
+        voice_bytes = BytesIO()
+        await file.download_to_memory(voice_bytes)
+        voice_bytes.seek(0)
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as tmp_ogg:
+            tmp_ogg.write(voice_bytes.read())
+            tmp_ogg_path = tmp_ogg.name
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav:
+            tmp_wav_path = tmp_wav.name
+
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        cmd = [ffmpeg_exe, "-i", tmp_ogg_path, "-ar", "16000", "-ac", "1", tmp_wav_path, "-y"]
+        subprocess.run(cmd, check=True, capture_output=True)
+
+        # 1. TRY GROQ (Best for Amharic, Fastest, Free)
+        if GROQ_API_KEY:
             try:
-                os.unlink(p)
-            except OSError:
-                pass
-        context.user_data["state"] = None
+                client = Groq(api_key=GROQ_API_KEY)
+                with open(tmp_wav_path, "rb") as f:
+                    transcription = client.audio.transcriptions.create(
+                        file=(tmp_wav_path, f),
+                        model="whisper-large-v3",
+                        language=language.split('-')[0],
+                        response_format="text"
+                    )
+                await update.message.reply_text(
+                    f"📝 **Transcribed Text (Groq Whisper v3):**\n\n{transcription}",
+                    reply_markup=tool_done_kb()
+                )
+                await status_msg.edit_text("✅ Transcription complete!")
+                os.unlink(tmp_ogg_path); os.unlink(tmp_wav_path)
+                context.user_data['state'] = None
+                return
+            except Exception:
+                pass  # If Groq fails, fall back to Google
 
-# ============================================================
-# PRELOAD MODEL AT STARTUP (Call this inside main())
-# ============================================================
-def preload_whisper_model():
-    """
-    Call this once at bot startup (in main()) so the model is loaded
-    before any user sends a voice message. This eliminates the initial delay.
-    """
-    try:
-        _get_whisper_model()
+        # 2. FALLBACK TO GOOGLE (Free, but weak for Amharic)
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(tmp_wav_path) as source:
+            audio_data = recognizer.record(source)
+
+        try:
+            text = recognizer.recognize_google(audio_data, language=language)
+            await update.message.reply_text(
+                f"📝 **Transcribed Text (Google):**\n\n{text}",
+                reply_markup=tool_done_kb()
+            )
+            await status_msg.edit_text("✅ Transcription complete!")
+        except sr.UnknownValueError:
+            await status_msg.edit_text("❌ Could not understand the audio.")
+        except sr.RequestError:
+            await status_msg.edit_text("❌ Speech recognition service is unavailable.")
+
+        os.unlink(tmp_ogg_path); os.unlink(tmp_wav_path)
+        context.user_data['state'] = None
+
     except Exception as e:
-        print(f"⚠️ Could not preload Whisper model: {e}")
-        
+        await status_msg.edit_text(f"❌ Transcription failed: {e}")
+        context.user_data['state'] = None
 
 # --- POWERFUL MULTI-SOURCE VIDEO DOWNLOADER ---
 # Supported input: YouTube, TikTok, Instagram, Facebook.
