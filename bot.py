@@ -2980,13 +2980,14 @@ async def inbox_listener(event):
             await process_message_manager_incoming(event)
         except Exception as e:
             print(f"Message Manager Error: {e}")
+
 # ========================= MESSAGE MANAGER =========================
 # The manager is a gatekeeper for private messages received by the connected
 # Telethon user account. It does not change Telegram's native block list.
 PTB_BOT = None
 MM_DB_ID = 1
 
-# --- FIX 1: Guarantee the table + default row exist before anything reads/writes it. ---
+# --- FIX 1: Guarantee the table + default row exist. ---
 def mm_init_db():
     conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
@@ -3021,7 +3022,7 @@ def mm_get_rules():
     except Exception: keywords = {}
     return {'messaging': int(row[0] or 0), 'block_everyone_until': float(row[1] or 0), 'blocked_users': blocked if isinstance(blocked, dict) else {}, 'filter_links_until': float(row[3] or 0), 'filter_videos_until': float(row[4] or 0), 'keyword_rules': keywords if isinstance(keywords, dict) else {}}
 
-# --- FIX 2: Use INSERT OR REPLACE so the row always exists. ---
+# --- FIX 2: Use INSERT OR REPLACE (solves "Block Everyone doesn't persist"). ---
 def mm_save(r):
     conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
@@ -3095,7 +3096,7 @@ async def mm_block_menu(update, context):
         [InlineKeyboardButton('📋 Blocked Users', callback_data='mm_blocked')],
         [InlineKeyboardButton('⬅️ Back', callback_data='message_manager')]
     ])
-    await update.callback_query.edit_message_text('🚫 BLOCK MESSAGES\n\n'+status+'\n\nBlock rules stop forwarding and send a polite refusal.', reply_markup=kb)
+    await update.callback_query.edit_message_text('🚫 BLOCK MESSAGES\n\n'+status+'\n\nBlock rules stop forwarding and silently delete incoming messages.', reply_markup=kb)
 
 async def mm_filter_menu(update, context):
     r=mm_get_rules()
@@ -3114,12 +3115,12 @@ def mm_has_link(text):
 def mm_is_video(event):
     return bool(getattr(event,'video',None)) or (getattr(event,'document',None) is not None and str(getattr(getattr(event,'document',None),'mime_type','')).startswith('video/'))
 
-# --- FIX 3: Ensure bot's own ID is never blocked (prevents loop and self-block). ---
+# --- FIX 3: Never block the bot itself. ---
 def mm_reason(event, user_id, text):
     r=mm_get_rules(); now=time.time()
     # Owner/admins are never blocked by manager rules.
     if user_id in ADMIN_IDS: return None
-    # Never block the bot itself
+    # Never block the bot itself (prevents loop)
     try:
         me = telethon_client.loop.run_until_complete(telethon_client.get_me())
         if user_id == me.id:
@@ -3143,15 +3144,13 @@ def mm_reason(event, user_id, text):
     if not r.get('messaging',1): return 'Messaging is OFF'
     return None
 
+# --- FIX 4: Silently delete the message, NO REPLY at all. ---
 async def mm_refuse(event, reason):
-    try:
-        await event.respond('👋 Thanks for your message. The owner is not accepting this message right now. Please try again later.')
-    except Exception as e:
-        print('Manager refusal response error:', e)
     try:
         await event.delete(revoke=True)
     except Exception as e:
         print('Manager revoke error:', e)
+    # NOTE: No response message is sent.
 
 def mm_message_preview(event):
     text=(getattr(event,'raw_text','') or '').strip()
@@ -3163,17 +3162,16 @@ def mm_message_preview(event):
     if getattr(event,'document',None): return '📄 Document'
     return '📎 Media message'
 
-# --- FIX 4: Forward without duplicate admins and without sending to the bot itself ---
+# --- FIX 5: Exclude bot's own ID from forwarding and deduplicate admin list. ---
 async def mm_forward(event):
     if not ADMIN_IDS: print('Message Manager: ADMIN_IDS is empty; forwarding skipped.'); return
-    # Get bot's own ID to exclude it from recipients (prevents infinite loop).
     try:
         bot_me = await telethon_client.get_me()
         bot_id = bot_me.id
     except Exception:
         bot_id = None
 
-    admin_list = list(set(ADMIN_IDS))  # deduplicate
+    admin_list = list(set(ADMIN_IDS))
     if bot_id:
         admin_list = [aid for aid in admin_list if aid != bot_id]
     if not admin_list:
@@ -3197,7 +3195,7 @@ async def mm_forward(event):
         except Exception as e:
             print(f'Message Manager forwarding error to {admin_id}: {e}')
 
-# --- FIX 5: Ignore events originating from the bot itself (kills the infinite loop). ---
+# --- FIX 6: Ignore events sent by the bot itself (kills infinite loops). ---
 async def process_message_manager_incoming(event):
     if not event.is_private or event.out: return False
     try:
