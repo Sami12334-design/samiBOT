@@ -15,6 +15,8 @@ import json
 import hashlib
 import base64
 import speech_recognition as sr
+import numpy as np
+import cv2
 from datetime import datetime, timedelta
 from flask import Flask
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageChops
