@@ -2,7 +2,6 @@ import re
 import asyncio
 import os
 import sys
-import json
 import time
 import threading
 import sqlite3
@@ -19,7 +18,6 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
 from telethon import TelegramClient, events, functions, types
 from telethon.sessions import StringSession
-from telethon.utils import get_peer_id
 from telethon.errors import (FloodWaitError, ChannelPrivateError, UsernameNotOccupiedError, MessageIdInvalidError)
 import pymupdf
 import img2pdf
@@ -28,17 +26,11 @@ from pptx import Presentation
 from pptx.util import Inches
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
 import yt_dlp
+import speech_recognition as sr
 import imageio_ffmpeg
 from groq import Groq
 import edge_tts
-import qrcode
-import cv2
-import numpy as np
 
 try:
     from telethon.tl.functions.stories import GetPeerStoriesRequest, GetStoriesByIDRequest
@@ -181,48 +173,30 @@ def tool_done_kb():
     ])
 
 async def safe_send(chat_id, bot, msg, from_chat_id, message_id):
-    """Copy a Telegram message to the bot chat while preserving media + caption."""
-    text = (getattr(msg, "message", None) or "").strip()
+    text = msg.message
     try:
-        # Telegram Bot API captions are shorter than normal messages. If a caption
-        # is too long, send the media first and then the full text separately.
-        caption = text if len(text) <= 1024 else None
-
         if msg.photo or msg.video or msg.document or msg.voice or msg.audio or msg.gif:
             media_bytes = BytesIO()
             await telethon_client.download_media(msg, file=media_bytes)
             media_bytes.seek(0)
-            if msg.photo:
-                sent = await bot.send_photo(chat_id, photo=media_bytes, caption=caption)
-            elif msg.video:
-                sent = await bot.send_video(chat_id, video=media_bytes, caption=caption)
-            elif msg.gif:
-                sent = await bot.send_animation(chat_id, animation=media_bytes, caption=caption)
-            elif msg.voice:
-                sent = await bot.send_voice(chat_id, voice=media_bytes, caption=caption)
-            elif msg.audio:
-                sent = await bot.send_audio(chat_id, audio=media_bytes, caption=caption)
-            else:
-                sent = await bot.send_document(chat_id, document=media_bytes, caption=caption)
-            if text and caption is None:
-                await bot.send_message(chat_id, text=text)
-            return sent
-
-        if msg.sticker:
+            if msg.photo: await bot.send_photo(chat_id, photo=media_bytes, caption=text)
+            elif msg.video: await bot.send_video(chat_id, video=media_bytes, caption=text)
+            elif msg.document: await bot.send_document(chat_id, document=media_bytes, caption=text)
+            elif msg.voice: await bot.send_voice(chat_id, voice=media_bytes, caption=text)
+            elif msg.audio: await bot.send_audio(chat_id, audio=media_bytes, caption=text)
+            elif msg.gif: await bot.send_animation(chat_id, animation=media_bytes, caption=text)
+        elif msg.sticker:
             sticker_bytes = BytesIO()
             await telethon_client.download_media(msg, file=sticker_bytes)
             sticker_bytes.seek(0)
-            return await bot.send_sticker(chat_id, sticker=sticker_bytes)
-
-        if text:
-            return await bot.send_message(chat_id, text=text)
-
-        return await bot.send_message(chat_id, text="📎 Unsupported/empty Telegram message.")
+            await bot.send_sticker(chat_id, sticker=sticker_bytes)
+        elif text: await bot.send_message(chat_id, text=text)
+        else: await bot.send_message(chat_id, "Unsupported message type.")
     except Exception as e:
-        if "must forward even restricted" in str(e).lower() or "protected" in str(e).lower():
-            await bot.send_message(chat_id, "🔒 This Telegram message has protected media and cannot be copied.")
+        if "must forward even restricted" in str(e).lower():
+            await bot.send_message(chat_id, "🔒 Restricted media.")
         else:
-            await bot.send_message(chat_id, f"⚠️ Could not display one message: {type(e).__name__}: {e}")
+            await bot.send_message(chat_id, f"Failed to send media: {e}")
 
 async def handle_telethon_error(update, error):
     if isinstance(error, FloodWaitError):
@@ -334,194 +308,6 @@ async def restart_command(update, context):
         pass
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
-
-# ============================================================
-# QR CODE TOOLS
-# ============================================================
-
-def create_qr_image_sync(text):
-    qr = qrcode.QRCode(
-        version=None,
-        error_correction=qrcode.constants.ERROR_CORRECT_M,
-        box_size=12,
-        border=4,
-    )
-    qr.add_data(text)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
-    output = BytesIO()
-    img.save(output, format="PNG")
-    output.seek(0)
-    return output
-
-
-def scan_qr_image_sync(image_bytes):
-    arr = np.frombuffer(image_bytes, dtype=np.uint8)
-    image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if image is None:
-        raise ValueError("Could not open the image.")
-
-    detector = cv2.QRCodeDetector()
-    results = []
-
-    try:
-        ok, decoded_info, _, _ = detector.detectAndDecodeMulti(image)
-        if ok and decoded_info:
-            for value in decoded_info:
-                if value and value.strip() and value.strip() not in results:
-                    results.append(value.strip())
-    except Exception as e:
-        print(f"Multi QR detection error: {e}")
-
-    if not results:
-        try:
-            data, _, _ = detector.detectAndDecode(image)
-            if data and data.strip():
-                results.append(data.strip())
-        except Exception as e:
-            print(f"Single QR detection error: {e}")
-
-    return results
-
-
-def qr_menu_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📷 Scan QR", callback_data="qr_scan"),
-            InlineKeyboardButton("🎨 Create QR", callback_data="qr_create"),
-        ],
-        [InlineKeyboardButton("⬅️ Back", callback_data="converter")],
-    ])
-
-
-async def show_qr_menu(update, context):
-    query = update.callback_query
-    await query.answer()
-    context.user_data["state"] = None
-    await query.message.reply_text(
-        "📱 QR CODE TOOLS\n\n"
-        "📷 Scan QR — send a QR image and I will read it.\n\n"
-        "🎨 Create QR — send text or a link and I will create a QR image.",
-        reply_markup=qr_menu_keyboard(),
-    )
-
-
-async def start_qr_scan(update, context):
-    query = update.callback_query
-    await query.answer()
-    context.user_data["state"] = "qr_scan"
-    await query.message.reply_text(
-        "📷 SCAN QR CODE\n\n"
-        "Send a photo containing a QR code."
-    )
-
-
-async def start_qr_create(update, context):
-    query = update.callback_query
-    await query.answer()
-    context.user_data["state"] = "qr_create"
-    await query.message.reply_text(
-        "🎨 CREATE QR CODE\n\n"
-        "Send the text or link you want to encode."
-    )
-
-
-async def handle_qr_photo(update, context):
-    if context.user_data.get("state") != "qr_scan":
-        return False
-
-    if not update.message or not update.message.photo:
-        await update.message.reply_text("❌ Please send a QR-code image.")
-        return True
-
-    status = await update.message.reply_text("🔍 Scanning QR code...")
-    temp_path = None
-
-    try:
-        photo = update.message.photo[-1]
-        tg_file = await context.bot.get_file(photo.file_id)
-
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp:
-            temp_path = temp.name
-
-        await tg_file.download_to_drive(custom_path=temp_path)
-
-        with open(temp_path, "rb") as f:
-            image_bytes = f.read()
-
-        results = await asyncio.to_thread(scan_qr_image_sync, image_bytes)
-
-        if not results:
-            await status.edit_text(
-                "❌ No readable QR code was found.\n\n"
-                "Try a clearer image with the complete QR code visible."
-            )
-            return True
-
-        parts = ["✅ QR CODE FOUND!", ""]
-        for i, value in enumerate(results, 1):
-            parts.extend([f"📌 QR #{i}", value, ""])
-
-        result = "\n".join(parts)
-        await status.edit_text(result[:4000])
-
-    except Exception as e:
-        print(f"QR scan error: {e}")
-        await status.edit_text(
-            "❌ QR scanning failed.\n\n"
-            f"Error: {str(e)[:1000]}"
-        )
-    finally:
-        if temp_path:
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
-
-    return True
-
-
-async def handle_qr_create(update, context):
-    if context.user_data.get("state") != "qr_create":
-        return False
-
-    text = (
-        (update.message.text or update.message.caption or "").strip()
-        if update.message else ""
-    )
-
-    if not text:
-        await update.message.reply_text("❌ Please send text or a link.")
-        return True
-
-    if len(text) > 4000:
-        await update.message.reply_text(
-            "❌ Please use 4000 characters or less."
-        )
-        return True
-
-    status = await update.message.reply_text("🎨 Creating QR code...")
-
-    try:
-        qr_image = await asyncio.to_thread(create_qr_image_sync, text)
-        await status.delete()
-        await update.message.reply_photo(
-            photo=qr_image,
-            caption="✅ QR code created successfully!",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📱 QR Code Menu", callback_data="qr_menu")]
-            ]),
-        )
-    except Exception as e:
-        print(f"QR creation error: {e}")
-        await status.edit_text(
-            "❌ Could not create QR code.\n\n"
-            f"Error: {str(e)[:1000]}"
-        )
-
-    return True
-
-
 async def menu_callback(update, context):
     query = update.callback_query
     await query.answer()
@@ -531,49 +317,9 @@ async def menu_callback(update, context):
         return
 
     data = query.data
-
-    if data == "qr_menu":
-        await show_qr_menu(update, context)
-        return
-    if data == "qr_scan":
-        await start_qr_scan(update, context)
-        return
-    if data == "qr_create":
-        await start_qr_create(update, context)
-        return
     if data.startswith("vd_"):
         await handle_video_callback(update, context, data)
         return
-
-    # Dynamic search filter buttons. They are created from the actual result
-    # types, so a filter is shown only when it has matching results.
-    if data.startswith("sf_"):
-        filter_type = data.removeprefix("sf_")
-        context.user_data["search_filter"] = filter_type
-        context.user_data["search_page"] = 1
-        await display_search_page(update, context, 1, filter_type)
-        return
-
-    if data.startswith("search_page_"):
-        try:
-            page = int(data.removeprefix("search_page_"))
-        except ValueError:
-            page = 1
-        filter_type = context.user_data.get("search_filter", "all")
-        await display_search_page(update, context, page, filter_type)
-        return
-
-    if data == "inbox":
-        await show_inbox(update, context)
-        return
-    if data.startswith("inbox_open_"):
-        try:
-            index = int(data.removeprefix("inbox_open_"))
-        except ValueError:
-            index = -1
-        await open_inbox_chat(update, context, index)
-        return
-
     if data == "main_menu":
         keyboard = [[InlineKeyboardButton("📥 Inbox", callback_data="inbox"), InlineKeyboardButton("👤 Profile", callback_data="profile")], [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")], [InlineKeyboardButton("➕ More Commands", callback_data="more")]]
         await query.message.reply_text("🤖 TELEGRAM ASSISTANT", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -585,7 +331,7 @@ async def menu_callback(update, context):
         kb.append([InlineKeyboardButton("⬅️ Back", callback_data="main_menu")])
         await query.message.reply_text("➕ MORE COMMANDS", reply_markup=InlineKeyboardMarkup(kb))
     elif data == "converter":
-        kb = [[InlineKeyboardButton("📄 PDF to Word", callback_data="pdf_to_word"), InlineKeyboardButton("🖼️ Image to Text", callback_data="image_to_text")], [InlineKeyboardButton("📄 Text to PDF", callback_data="text_to_pdf"), InlineKeyboardButton("🎨 Text to Image", callback_data="text_to_image")], [InlineKeyboardButton("🖼️ Image to PDF", callback_data="image_to_pdf"), InlineKeyboardButton("🖼️ Edit Photo", callback_data="image_edit")], [InlineKeyboardButton("🗣️ Text to Voice (ENG)", callback_data="tts_en"), InlineKeyboardButton("🗣️ Text to Voice (AM)", callback_data="tts_am")], [InlineKeyboardButton("📷 Image Format", callback_data="img_fmt_menu"), InlineKeyboardButton("📚 Document Format", callback_data="doc_fmt_menu")], [InlineKeyboardButton("🎙️ Voice to Text (ENG)", callback_data="voice_en"), InlineKeyboardButton("🎙️ Voice to Text (AM)", callback_data="voice_am")], [InlineKeyboardButton("⬅️ Back", callback_data="more")]]
+        kb = [[InlineKeyboardButton("📄 PDF to Word", callback_data="pdf_to_word"), InlineKeyboardButton("🖼️ Image to Text", callback_data="image_to_text")], [InlineKeyboardButton("🖼️ Image to PDF", callback_data="image_to_pdf"), InlineKeyboardButton("🖼️ Edit Photo", callback_data="image_edit")], [InlineKeyboardButton("🗣️ Text to Voice (ENG)", callback_data="tts_en"), InlineKeyboardButton("🗣️ Text to Voice (AM)", callback_data="tts_am")], [InlineKeyboardButton("📷 Image Format", callback_data="img_fmt_menu"), InlineKeyboardButton("📚 Document Format", callback_data="doc_fmt_menu")], [InlineKeyboardButton("🎙️ Voice to Text (ENG)", callback_data="voice_en"), InlineKeyboardButton("🎙️ Voice to Text (AM)", callback_data="voice_am")], [InlineKeyboardButton("⬅️ Back", callback_data="more")]]
         await query.message.reply_text("🔄 MEDIA CONVERTER & AI TOOLS\n\nChoose an option:", reply_markup=InlineKeyboardMarkup(kb))
     elif data == "img_fmt_menu":
         kb = [[InlineKeyboardButton("PNG to JPG", callback_data="img_png_jpg"), InlineKeyboardButton("JPG to PNG", callback_data="img_jpg_png")], [InlineKeyboardButton("Image to GIF", callback_data="img_gif"), InlineKeyboardButton("⬅️ Back", callback_data="converter")]]
@@ -598,17 +344,6 @@ async def menu_callback(update, context):
         context.user_data['state'] = 'awaiting_edit_photo'
     elif data.startswith("edit_"):
         await handle_photo_edit_selection(update, context, data)
-    elif data == "text_to_pdf":
-        context.user_data[PDF_DRAFT_KEY]=[]; context.user_data["state"]="awaiting_text_pdf"
-        await query.message.reply_text("📄 TEXT TO PDF\n\nSend your first text. Add more or press Done.",reply_markup=text_pdf_keyboard())
-    elif data == "pdftext_next":
-        context.user_data["state"]="awaiting_text_pdf"; await query.message.reply_text("➕ Send the next text.")
-    elif data == "pdftext_done":
-        await finish_text_to_pdf(update,context)
-    elif data == "pdftext_cancel":
-        await cancel_text_to_pdf(update,context)
-    elif data == "text_to_image":
-        context.user_data["state"]="awaiting_text_to_image"; await query.message.reply_text("🎨 TEXT TO IMAGE\n\nDescribe the image you want. Example:\nA realistic lion on a mountain at sunset")
     elif data == "pdf_to_word":
         await query.message.reply_text("📄 PDF to Word\n\nPlease upload the PDF file.")
         context.user_data['state'] = 'awaiting_pdf_to_word'
@@ -662,19 +397,41 @@ async def menu_callback(update, context):
         await query.message.reply_text("🔗 Fetch Telegram\n\nSend me a link (e.g., t.me/channel/123 or t.me/channel/123-130):")
         context.user_data['state'] = 'fetch_link'
     elif data == "search":
-        await query.message.reply_text("🔎 SEARCH\n\nEnter a keyword to search Telegram globally.\n\nI will prioritize public results outside the chats/channels you already joined.\nExample: Logic mid")
+        await query.message.reply_text("🔎 SEARCH\n\nEnter any keyword to search across your chats:\nExample: Logic mid")
         context.user_data['state'] = 'search_query'
     elif data == "pdf_fetch":
         await query.message.reply_text("📄 PDF FETCH\n\nPlease upload the PDF file directly to this chat.")
         context.user_data['state'] = 'awaiting_pdf'
     elif data.startswith("posts_"):
-        await query.answer("Profile posts have been removed.", show_alert=True)
-        return
+        page = int(data.split("_")[1])
+        await handle_posts_pagination(update, context, page)
     elif data.startswith("story_"):
-        # Stories were intentionally removed from Profile. This also safely
-        # handles old/stale Telegram buttons created by an older bot version.
-        await query.answer("Stories have been removed from Profile.", show_alert=True)
-        return
+        if data == "story_start":
+            context.user_data["story_index"] = 0
+            entity = context.user_data.get("story_entity") or context.user_data.get("profile_entity")
+            if not entity:
+                await query.message.reply_text("❌ No profile selected.")
+                return
+            await query.answer("Fetching Stories…")
+            try:
+                if not GetPeerStoriesRequest:
+                    await query.message.reply_text("❌ Telethon does not support stories in this installation.")
+                    return
+                response = await telethon_client(GetPeerStoriesRequest(peer=entity))
+                stories = list(getattr(response, "stories", []) or [])
+                if not stories:
+                    await query.message.reply_text("❌ No active Stories are available.")
+                    return
+                context.user_data["stories_list"] = stories
+                await display_story(update, context)
+            except Exception as e:
+                await query.message.reply_text(f"❌ Could not retrieve Stories: {e}")
+        elif data == "story_next":
+            context.user_data["story_index"] = context.user_data.get("story_index", 0) + 1
+            await display_story(update, context)
+        elif data == "story_prev":
+            context.user_data["story_index"] = context.user_data.get("story_index", 0) - 1
+            await display_story(update, context)
 
 # --- PHOTO EDITING ---
 async def handle_photo_edit_selection(update, context, data):
@@ -684,10 +441,6 @@ async def handle_photo_edit_selection(update, context, data):
         await query.message.reply_text("❌ No image found. Please send a photo first.")
         return
     img = context.user_data['edit_image']
-    if data == "edit_clear":
-        context.user_data.pop("edit_image",None); context.user_data.pop("bg_image",None); context.user_data["state"]=None
-        await query.message.reply_text("🗑️ Current photo removed. Send another photo to edit."); return
-
     if data == "edit_remove_bg":
         async def run_bg_removal():
             def do_work():
@@ -766,7 +519,7 @@ async def handle_edit_photo(update, context):
         img_bytes = BytesIO(); await file.download_to_memory(img_bytes); img_bytes.seek(0)
         img = Image.open(img_bytes)
         context.user_data['edit_image'] = img
-        kb = [[InlineKeyboardButton("🖼️ Original", callback_data="edit_orig"), InlineKeyboardButton("✨ HD 100x", callback_data="edit_hd"), InlineKeyboardButton("🎨 Vivid", callback_data="edit_vivid")], [InlineKeyboardButton("⬛ B&W", callback_data="edit_bw"), InlineKeyboardButton("🟤 Sepia", callback_data="edit_sepia"), InlineKeyboardButton("🔪 Sharpen", callback_data="edit_sharp")], [InlineKeyboardButton("☀️ Brighten", callback_data="edit_bright"), InlineKeyboardButton("🌙 Darken", callback_data="edit_dark"), InlineKeyboardButton("🌫️ Blur", callback_data="edit_blur")], [InlineKeyboardButton("🟥 Pixel", callback_data="edit_pixel"), InlineKeyboardButton("🔄 Invert", callback_data="edit_invert"), InlineKeyboardButton("✏️ Sketch", callback_data="edit_sketch")], [InlineKeyboardButton("🧊 Emboss", callback_data="edit_emboss"), InlineKeyboardButton("🎞️ Poster", callback_data="edit_poster"), InlineKeyboardButton("🔥 Solarize", callback_data="edit_solar")], [InlineKeyboardButton("🗑️ Remove", callback_data="edit_clear"), InlineKeyboardButton("🖼️ Remove BG", callback_data="edit_remove_bg"), InlineKeyboardButton("🖼️ Change BG", callback_data="edit_change_bg")]]
+        kb = [[InlineKeyboardButton("🖼️ Original", callback_data="edit_orig"), InlineKeyboardButton("✨ HD 100x", callback_data="edit_hd"), InlineKeyboardButton("🎨 Vivid", callback_data="edit_vivid")], [InlineKeyboardButton("⬛ B&W", callback_data="edit_bw"), InlineKeyboardButton("🟤 Sepia", callback_data="edit_sepia"), InlineKeyboardButton("🔪 Sharpen", callback_data="edit_sharp")], [InlineKeyboardButton("☀️ Brighten", callback_data="edit_bright"), InlineKeyboardButton("🌙 Darken", callback_data="edit_dark"), InlineKeyboardButton("🌫️ Blur", callback_data="edit_blur")], [InlineKeyboardButton("🟥 Pixel", callback_data="edit_pixel"), InlineKeyboardButton("🔄 Invert", callback_data="edit_invert"), InlineKeyboardButton("✏️ Sketch", callback_data="edit_sketch")], [InlineKeyboardButton("🧊 Emboss", callback_data="edit_emboss"), InlineKeyboardButton("🎞️ Poster", callback_data="edit_poster"), InlineKeyboardButton("🔥 Solarize", callback_data="edit_solar")], [InlineKeyboardButton("🖼️ Remove BG", callback_data="edit_remove_bg"), InlineKeyboardButton("🖼️ Change BG", callback_data="edit_change_bg")]]
         await status_msg.edit_text("✅ Image loaded!\n\nChoose an editing feature below:", reply_markup=InlineKeyboardMarkup(kb))
         context.user_data['state'] = None
     except Exception as e:
@@ -950,568 +703,51 @@ async def handle_pptx_to_pdf(update, context):
         await status_msg.edit_text(f"❌ Conversion failed: {e}")
         context.user_data['state'] = None
 
-# --- TEXT TO PDF ---
-# ============================================================
-# TEXT TO PDF
-# Unicode / Amharic / English supported
-# ============================================================
-
-PDF_DRAFT_KEY = "text_pdf_items"
-
-
-def text_pdf_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "➕ Enter Next Text",
-                callback_data="pdftext_next"
-            ),
-            InlineKeyboardButton(
-                "✅ Done",
-                callback_data="pdftext_done"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "❌ Cancel",
-                callback_data="pdftext_cancel"
-            )
-        ]
-    ])
-
-
-# ------------------------------------------------------------
-# Find a Unicode font
-# ------------------------------------------------------------
-
-def get_pdf_unicode_font():
-    """
-    Find and register a Unicode font that supports
-    English + Amharic/Ethiopic characters.
-    """
-
-    font_name = "BotUnicodeFont"
-
-    # If already registered, use it.
-    try:
-        pdfmetrics.getFont(font_name)
-        return font_name
-    except KeyError:
-        pass
-
-    # Common locations on Render/Linux
-    font_candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-        "/usr/local/share/fonts/DejaVuSans.ttf",
-
-        # Other possible Linux locations
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-    ]
-
-    for font_path in font_candidates:
-        if os.path.exists(font_path):
-            try:
-                pdfmetrics.registerFont(
-                    TTFont(font_name, font_path)
-                )
-
-                print(
-                    f"[Text to PDF] Unicode font loaded: {font_path}"
-                )
-
-                return font_name
-
-            except Exception as font_error:
-                print(
-                    f"[Text to PDF] Could not load font "
-                    f"{font_path}: {font_error}"
-                )
-
-    raise RuntimeError(
-        "No Unicode font was found on the server. "
-        "Please install DejaVu Sans in Render."
-    )
-
-
-# ------------------------------------------------------------
-# Receive text
-# ------------------------------------------------------------
-
-async def handle_text_pdf_input(update, context):
-
-    if context.user_data.get("state") != "awaiting_text_pdf":
-        return
-
-    text = (update.message.text or "").strip()
-
-    if not text:
-        await update.message.reply_text(
-            "❌ Please send some text."
-        )
-        return
-
-    items = context.user_data.setdefault(
-        PDF_DRAFT_KEY,
-        []
-    )
-
-    items.append(text)
-
-    await update.message.reply_text(
-        f"✅ Text {len(items)} added.\n\n"
-        "➕ Press **Enter Next Text** to add another text.\n"
-        "✅ Press **Done** when you are finished.",
-        reply_markup=text_pdf_keyboard(),
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-
-# ------------------------------------------------------------
-# Create PDF
-# ------------------------------------------------------------
-
-async def finish_text_to_pdf(update, context):
-
-    query = update.callback_query
-
-    try:
-        await query.answer()
-    except Exception:
-        pass
-
-    items = context.user_data.get(
-        PDF_DRAFT_KEY,
-        []
-    )
-
-    if not items:
-        await query.message.reply_text(
-            "❌ No text has been added yet."
-        )
-        return
-
-    status = await query.message.reply_text(
-        "⏳ Creating PDF...\n\n"
-        "Please wait."
-    )
-
-    path = None
-
-    try:
-
-        # =====================================================
-        # 1. Create temporary PDF file
-        # =====================================================
-
-        fd, path = tempfile.mkstemp(
-            prefix="text_pdf_",
-            suffix=".pdf"
-        )
-
-        os.close(fd)
-
-        # =====================================================
-        # 2. Load Unicode font
-        # =====================================================
-
-        font_name = get_pdf_unicode_font()
-
-        # =====================================================
-        # 3. Create PDF styles
-        # =====================================================
-
-        styles = getSampleStyleSheet()
-
-        body = ParagraphStyle(
-            "UnicodeBody",
-
-            parent=styles["BodyText"],
-
-            fontName=font_name,
-
-            fontSize=12,
-
-            leading=19,
-
-            spaceAfter=14,
-
-            leftIndent=0,
-
-            rightIndent=0,
-
-            firstLineIndent=0,
-
-            alignment=0,
-
-            wordWrap="LTR",
-
-        )
-
-        # =====================================================
-        # 4. Create PDF document
-        # =====================================================
-
-        doc = SimpleDocTemplate(
-            path,
-
-            pagesize=letter,
-
-            rightMargin=54,
-
-            leftMargin=54,
-
-            topMargin=54,
-
-            bottomMargin=54,
-
-            title="Text to PDF",
-
-            author="Telegram Bot"
-        )
-
-        story = []
-
-        # =====================================================
-        # 5. Add every text message
-        # =====================================================
-
-        for index, item in enumerate(items):
-
-            if not item:
-                continue
-
-            # Escape HTML characters.
-            # This prevents user text from breaking
-            # ReportLab's Paragraph parser.
-            safe_text = html.escape(item)
-
-            # Preserve line breaks.
-            safe_text = safe_text.replace(
-                "\r\n",
-                "\n"
-            )
-
-            safe_text = safe_text.replace(
-                "\r",
-                "\n"
-            )
-
-            safe_text = safe_text.replace(
-                "\n",
-                "<br/>"
-            )
-
-            paragraph = Paragraph(
-                safe_text,
-                body
-            )
-
-            story.append(paragraph)
-
-            # Space between separate Telegram messages
-            if index < len(items) - 1:
-                story.append(
-                    Spacer(1, 8)
-                )
-
-        # =====================================================
-        # 6. Build PDF
-        # =====================================================
-
-        doc.build(story)
-
-        # =====================================================
-        # 7. Send PDF to Telegram
-        # =====================================================
-
-        with open(path, "rb") as pdf_file:
-
-            await query.message.reply_document(
-                document=pdf_file,
-
-                filename="text_document.pdf",
-
-                caption=(
-                    "✅ **PDF created successfully!**\n\n"
-                    f"📝 Text messages: {len(items)}\n"
-                    "🌍 English + Amharic supported."
-                ),
-
-                reply_markup=tool_done_kb(),
-
-                parse_mode=ParseMode.MARKDOWN
-            )
-
-        # =====================================================
-        # 8. Success message
-        # =====================================================
-
-        await status.edit_text(
-            "✅ Text → PDF completed successfully!"
-        )
-
-    except Exception as e:
-
-        print(
-            "[Text to PDF ERROR]",
-            type(e).__name__,
-            str(e)
-        )
-
-        try:
-
-            await status.edit_text(
-                "❌ **Text → PDF failed.**\n\n"
-                "Error:\n"
-                + html.escape(
-                    str(e)[:1500]
-                ),
-                parse_mode=ParseMode.HTML
-            )
-
-        except Exception:
-            pass
-
-    finally:
-
-        # =====================================================
-        # 9. Clear PDF session
-        # =====================================================
-
-        context.user_data.pop(
-            PDF_DRAFT_KEY,
-            None
-        )
-
-        context.user_data["state"] = None
-
-        # =====================================================
-        # 10. Delete temporary PDF
-        # =====================================================
-
-        if path:
-
-            try:
-                os.unlink(path)
-
-            except OSError:
-                pass
-
-
-# ------------------------------------------------------------
-# Cancel PDF
-# ------------------------------------------------------------
-
-async def cancel_text_to_pdf(update, context):
-
-    query = update.callback_query
-
-    try:
-        await query.answer()
-    except Exception:
-        pass
-
-    context.user_data.pop(
-        PDF_DRAFT_KEY,
-        None
-    )
-
-    context.user_data["state"] = None
-
-    await query.edit_message_text(
-        "❌ Text to PDF cancelled."
-    )
-# --- TEXT TO IMAGE ---
-HF_TOKEN=os.environ.get("HF_TOKEN","")
-TEXT_TO_IMAGE_MODEL=os.environ.get("TEXT_TO_IMAGE_MODEL","black-forest-labs/FLUX.1-schnell")
-async def handle_text_to_image(update, context):
-    if context.user_data.get("state") != "awaiting_text_to_image": return
-    prompt=(update.message.text or "").strip()
-    if not prompt: await update.message.reply_text("❌ Please describe the image you want."); return
-    if len(prompt)>2000: await update.message.reply_text("❌ Prompt is too long. Keep it under 2000 characters."); return
-    status=await update.message.reply_text("🎨 Generating your image…")
-    try:
-        if not HF_TOKEN: await status.edit_text("❌ Text-to-Image needs HF_TOKEN in Render Environment Variables."); return
-        def generate():
-            from huggingface_hub import InferenceClient
-            return InferenceClient(provider="auto",api_key=HF_TOKEN).text_to_image(prompt=prompt,model=TEXT_TO_IMAGE_MODEL)
-        image=await asyncio.to_thread(generate); out=BytesIO(); image.save(out,format="PNG"); out.seek(0)
-        await update.message.reply_photo(photo=out,caption=f"🎨 Generated image\n\nPrompt: {prompt[:900]}",reply_markup=tool_done_kb()); await status.edit_text("✅ Image generated successfully!")
-    except Exception as e: await status.edit_text("❌ Text-to-Image failed.\n\n"+html.escape(str(e)[:1500]),parse_mode=ParseMode.HTML)
-    finally: context.user_data["state"]=None
-
-# --- VOICE TO TEXT: FASTER-WHISPER (NO GROQ) ---
-_WHISPER_MODEL=None; _WHISPER_LOCK=threading.Lock()
-WHISPER_MODEL_NAME=os.environ.get("WHISPER_MODEL","small")
-WHISPER_DEVICE=os.environ.get("WHISPER_DEVICE","cpu")
-WHISPER_COMPUTE_TYPE=os.environ.get("WHISPER_COMPUTE_TYPE","int8")
-def _get_whisper_model():
-    global _WHISPER_MODEL
-    if _WHISPER_MODEL is not None: return _WHISPER_MODEL
-    with _WHISPER_LOCK:
-        if _WHISPER_MODEL is None:
-            from faster_whisper import WhisperModel
-            _WHISPER_MODEL=WhisperModel(WHISPER_MODEL_NAME,device=WHISPER_DEVICE,compute_type=WHISPER_COMPUTE_TYPE)
-    return _WHISPER_MODEL
-def _transcribe_whisper_sync(wav_path,language_code):
-    model=_get_whisper_model(); segments,info=model.transcribe(wav_path,language=language_code,beam_size=5,vad_filter=True,condition_on_previous_text=True)
-    return " ".join(x.text.strip() for x in segments).strip(),getattr(info,"language",language_code)
-# ============================================================
-# VOICE -> TEXT — FASTER-WHISPER
-# ============================================================
-
-_WHISPER_MODEL = None
-_WHISPER_LOCK = threading.Lock()
-WHISPER_MODEL_NAME = os.environ.get("WHISPER_MODEL", "small")
-WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")
-WHISPER_COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE_TYPE", "int8")
-
-
-def _get_whisper_model():
-    global _WHISPER_MODEL
-
-    if _WHISPER_MODEL is not None:
-        return _WHISPER_MODEL
-
-    with _WHISPER_LOCK:
-        if _WHISPER_MODEL is None:
-            from faster_whisper import WhisperModel
-
-            _WHISPER_MODEL = WhisperModel(
-                WHISPER_MODEL_NAME,
-                device=WHISPER_DEVICE,
-                compute_type=WHISPER_COMPUTE_TYPE,
-            )
-
-    return _WHISPER_MODEL
-
-
-def _transcribe_whisper_sync(audio_path, language_code=None):
-    model = _get_whisper_model()
-
-    kwargs = {
-        "beam_size": 5,
-        "vad_filter": True,
-        "condition_on_previous_text": True,
-    }
-
-    if language_code:
-        kwargs["language"] = language_code
-
-    segments, info = model.transcribe(audio_path, **kwargs)
-
-    text_parts = []
-    for segment in segments:
-        value = (segment.text or "").strip()
-        if value:
-            text_parts.append(value)
-
-    return " ".join(text_parts).strip(), getattr(info, "language", language_code)
-
-
+# --- VOICE TO TEXT ---
 async def handle_voice_to_text(update, context, language):
-    if not update.message:
+    if not update.message.voice and not update.message.audio:
+        await update.message.reply_text("❌ Please send a voice message OR an audio file.")
         return
-
-    voice = update.message.voice or update.message.audio
-
-    if not voice:
-        await update.message.reply_text(
-            "❌ Please send a voice message or audio file."
-        )
-        return
-
-    status = await update.message.reply_text(
-        "🎤 Downloading audio...\n\n"
-        "Then I will transcribe it with Faster-Whisper."
-    )
-
-    temp_dir = tempfile.mkdtemp(prefix="voice_text_")
-    input_path = os.path.join(temp_dir, "input_audio")
-    wav_path = os.path.join(temp_dir, "audio.wav")
-
+    status_msg = await update.message.reply_text("⏳ Transcribing voice/audio...")
     try:
-        tg_file = await context.bot.get_file(voice.file_id)
-        await tg_file.download_to_drive(custom_path=input_path)
-
-        await status.edit_text(
-            "🎤 Transcribing...\n\n"
-            "⏳ The first request may take longer while the model loads."
-        )
-
-        # imageio-ffmpeg supplies a portable ffmpeg binary.
-        import imageio_ffmpeg
-
-        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-
-        process = await asyncio.create_subprocess_exec(
-            ffmpeg,
-            "-y",
-            "-i",
-            input_path,
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            wav_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-        _, stderr = await process.communicate()
-
-        if process.returncode != 0:
-            raise RuntimeError(
-                "Audio conversion failed: "
-                + stderr.decode(errors="ignore")[-1000:]
-            )
-
-        language_code = None
-        if language == "am":
-            language_code = "am"
-        elif language == "en":
-            language_code = "en"
-
-        transcript, detected = await asyncio.to_thread(
-            _transcribe_whisper_sync,
-            wav_path,
-            language_code,
-        )
-
-        if not transcript:
-            await status.edit_text(
-                "❌ I could not understand any speech in that audio."
-            )
-            return
-
-        detected_text = (
-            f"\n🌐 Detected language: {detected}"
-            if detected
-            else ""
-        )
-
-        result = (
-            "✅ VOICE TO TEXT\n\n"
-            f"{transcript}"
-            f"{detected_text}"
-        )
-
-        if len(result) > 4000:
-            result = result[:3980] + "\n..."
-
-        await status.edit_text(result)
-
+        if update.message.voice: file_id = update.message.voice.file_id
+        else: file_id = update.message.audio.file_id
+        file = await context.bot.get_file(file_id)
+        voice_bytes = BytesIO(); await file.download_to_memory(voice_bytes); voice_bytes.seek(0)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as tmp_ogg:
+            tmp_ogg.write(voice_bytes.read()); tmp_ogg_path = tmp_ogg.name
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav:
+            tmp_wav_path = tmp_wav.name
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        cmd = [ffmpeg_exe, "-i", tmp_ogg_path, "-ar", "16000", "-ac", "1", tmp_wav_path, "-y"]
+        subprocess.run(cmd, check=True, capture_output=True)
+        if GROQ_API_KEY:
+            try:
+                client = Groq(api_key=GROQ_API_KEY)
+                with open(tmp_wav_path, "rb") as f:
+                    transcription = client.audio.transcriptions.create(file=(tmp_wav_path, f), model="whisper-large-v3", language=language.split('-')[0], response_format="text")
+                await update.message.reply_text(f"📝 **Transcribed Text (Groq):**\n\n{transcription}", reply_markup=tool_done_kb())
+                await status_msg.edit_text("✅ Transcription complete!")
+                os.unlink(tmp_ogg_path); os.unlink(tmp_wav_path)
+                context.user_data['state'] = None
+                return
+            except Exception: pass
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(tmp_wav_path) as source:
+            audio_data = recognizer.record(source)
+        try:
+            text = recognizer.recognize_google(audio_data, language=language)
+            await update.message.reply_text(f"📝 **Transcribed Text (Google):**\n\n{text}", reply_markup=tool_done_kb())
+            await status_msg.edit_text("✅ Transcription complete!")
+        except sr.UnknownValueError:
+            await status_msg.edit_text("❌ Could not understand the audio.")
+        except sr.RequestError:
+            await status_msg.edit_text("❌ Speech recognition service is unavailable.")
+        os.unlink(tmp_ogg_path); os.unlink(tmp_wav_path)
+        context.user_data['state'] = None
     except Exception as e:
-        print(f"Voice-to-text error: {e}")
-        await status.edit_text(
-            "❌ Voice-to-text failed.\n\n"
-            f"{str(e)[:1200]}"
-        )
-
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        await status_msg.edit_text(f"❌ Transcription failed: {e}")
+        context.user_data['state'] = None
 
 # --- POWERFUL MULTI-SOURCE VIDEO DOWNLOADER ---
 # Supported input: YouTube, TikTok, Instagram, Facebook.
@@ -2172,138 +1408,6 @@ async def process_image_pdf(update, context):
         context.user_data['state'] = None; context.user_data['pdf_images'] = []
 
 # --- OTHER FEATURES (Profile, Search, etc.) ---
-async def _inbox_title(entity):
-    return (
-        getattr(entity, "title", None)
-        or " ".join(x for x in [getattr(entity, "first_name", ""), getattr(entity, "last_name", "")] if x).strip()
-        or getattr(entity, "username", None)
-        or "Telegram chat"
-    )
-
-
-def _inbox_preview(message):
-    if not message:
-        return "No messages yet."
-    text = (getattr(message, "message", None) or "").strip().replace("\n", " ")
-    if message.photo:
-        return "🖼️ Photo" + (f": {text[:55]}" if text else "")
-    if message.video:
-        return "🎬 Video" + (f": {text[:55]}" if text else "")
-    if message.voice:
-        return "🎤 Voice message"
-    if message.audio:
-        return "🎵 Audio" + (f": {text[:55]}" if text else "")
-    if message.document:
-        return "📄 File" + (f": {text[:55]}" if text else "")
-    if message.gif:
-        return "🎞️ GIF" + (f": {text[:55]}" if text else "")
-    if message.sticker:
-        return "🧩 Sticker"
-    return text[:90] if text else "💬 Message"
-
-
-async def show_inbox(update, context):
-    """Build the inbox directly from Telegram, not from the SQLite listener cache."""
-    query = update.callback_query
-    if query:
-        await query.answer("Loading inbox…")
-        chat_id = query.message.chat_id
-        sender_message = query.message
-    else:
-        chat_id = update.effective_chat.id
-        sender_message = update.message
-
-    try:
-        dialogs = []
-        async for dialog in telethon_client.iter_dialogs(limit=50):
-            entity = dialog.entity
-            # Inbox = private one-to-one conversations and bots.
-            if getattr(entity, "bot", False) or entity.__class__.__name__ in ("User",):
-                if not getattr(entity, "deleted", False):
-                    dialogs.append(dialog)
-
-        context.user_data["inbox_entities"] = {}
-        rows = []
-        for idx, dialog in enumerate(dialogs[:30]):
-            entity = dialog.entity
-            context.user_data["inbox_entities"][str(idx)] = entity
-            title = await _inbox_title(entity)
-            last = dialog.message
-            rows.append((idx, title, _inbox_preview(last), dialog.unread_count or 0))
-
-        if not rows:
-            kb = [[InlineKeyboardButton("🔄 Refresh", callback_data="inbox")],
-                  [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]
-            text = "📥 INBOX\n\nNo private conversations were found."
-        else:
-            lines = ["📥 INBOX", "", "Your latest Telegram private conversations:", ""]
-            kb = []
-            for idx, title, preview, unread in rows:
-                badge = f" • {unread} unread" if unread else ""
-                lines.append(f"{idx + 1}. <b>{html.escape(title)}</b>{badge}\n   {html.escape(preview)}")
-                kb.append([InlineKeyboardButton(f"💬 {title[:28]}", callback_data=f"inbox_open_{idx}")])
-            kb.append([InlineKeyboardButton("🔄 Refresh", callback_data="inbox"), InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")])
-            text = "\n".join(lines)
-
-        if query:
-            try:
-                await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
-            except Exception:
-                await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
-        else:
-            await sender_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
-    except Exception as e:
-        msg = f"❌ Could not load Inbox: {type(e).__name__}: {e}"
-        if query:
-            await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]))
-        else:
-            await sender_message.reply_text(msg)
-
-
-async def open_inbox_chat(update, context, index):
-    query = update.callback_query
-    await query.answer()
-    entity = context.user_data.get("inbox_entities", {}).get(str(index))
-    if not entity:
-        await query.edit_message_text("❌ This inbox item expired. Please refresh the Inbox.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Inbox", callback_data="inbox")]]))
-        return
-
-    try:
-        title = await _inbox_title(entity)
-        messages = await telethon_client.get_messages(entity, limit=10)
-        messages = list(reversed([m for m in messages if m]))
-        if not messages:
-            await query.edit_message_text(
-                f"💬 <b>{html.escape(title)}</b>\n\nNo messages found.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Inbox", callback_data="inbox")]])
-            )
-            return
-
-        # Replace the button message with a compact header, then send each real
-        # Telegram message. This preserves text, photo+caption, photo, video,
-        # documents, audio and voice instead of reducing everything to a preview.
-        await query.edit_message_text(
-            f"💬 <b>{html.escape(title)}</b>\n\nShowing the latest {len(messages)} messages…",
-            parse_mode=ParseMode.HTML
-        )
-        for msg in messages:
-            await safe_send(query.message.chat_id, context.bot, msg, entity, msg.id)
-
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text=f"📥 <b>{html.escape(title)}</b>\n\nEnd of inbox conversation.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Inbox", callback_data="inbox"), InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
-            ])
-        )
-    except FloodWaitError as e:
-        await query.message.reply_text(f"⏳ Telegram asks us to wait {e.seconds} seconds before loading this conversation.")
-    except Exception as e:
-        await query.message.reply_text(f"❌ Could not open conversation: {type(e).__name__}: {e}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Inbox", callback_data="inbox")]]))
-
-
 async def fetch_profile(update, context, target):
     try:
         entity = await telethon_client.get_entity(target)
@@ -2359,508 +1463,62 @@ async def handle_posts_pagination(update, context, page):
     kb.append([InlineKeyboardButton("⬅️ Back to Profile", callback_data="profile")])
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
 
-# --- FAST GLOBAL TELEGRAM SEARCH ---
-#
-# IMPORTANT:
-#   The old implementation opened up to 200 dialogs and then searched each
-#   dialog separately. That is why searches could take 1-5 minutes.
-#
-#   This version uses Telegram's server-side global search once, then filters
-#   out chats/groups/channels that are already in the user's joined dialogs.
-#   The result is therefore much faster and is not limited to the user's
-#   joined-chat list.
-#
-#   NOTE: Telegram still requires an authenticated user session for this API.
-#   "Not from my account" here means "do not search only my joined chats".
-#   The server-side global search is used, and joined peers are removed from
-#   the displayed results.
-
-SEARCH_PAGE_SIZE = 8
-SEARCH_GLOBAL_LIMIT = 100
-SEARCH_JOINED_CACHE_SECONDS = 600
-
-
-def _search_peer_marked_id(entity):
-    """Return Telegram's marked peer ID without making a network request."""
-    try:
-        return int(get_peer_id(entity))
-    except Exception:
-        value = getattr(entity, "id", None)
-        return int(value) if value is not None else None
-
-
-def _search_peer_kind(entity):
-    """Classify a Telegram peer as channel/group/user/bot."""
-    if entity is None:
-        return "unknown"
-    if getattr(entity, "bot", False):
-        return "bot"
-    # Telethon Channel represents both broadcast channels and supergroups.
-    if hasattr(entity, "broadcast"):
-        return "channel" if getattr(entity, "broadcast", False) else "group"
-    # Basic Telegram groups are represented by Chat.
-    if entity.__class__.__name__ == "Chat":
-        return "group"
-    if hasattr(entity, "first_name") or hasattr(entity, "username"):
-        return "user"
-    return "unknown"
-
-
-def _search_peer_name(entity):
-    if entity is None:
-        return "Unknown"
-    title = getattr(entity, "title", None)
-    if title:
-        return str(title).strip()
-    first = (getattr(entity, "first_name", None) or "").strip()
-    last = (getattr(entity, "last_name", None) or "").strip()
-    name = f"{first} {last}".strip()
-    return name or "Unknown"
-
-
-def _search_peer_link(entity):
-    username = getattr(entity, "username", None)
-    if username:
-        return f"https://t.me/{username}"
-    return None
-
-
-def _search_message_link(entity, message_id):
-    username = getattr(entity, "username", None)
-    if username:
-        return f"https://t.me/{username}/{message_id}"
-
-    # For public channels/groups without a username Telegram may not expose a
-    # normal clickable public URL. We keep the result but omit a fake link.
-    marked_id = _search_peer_marked_id(entity)
-    if marked_id is not None and marked_id < -1000000000000:
-        internal_id = str(abs(marked_id))[3:]
-        return f"https://t.me/c/{internal_id}/{message_id}"
-    return None
-
-
-def _search_message_type(message):
-    if getattr(message, "photo", None):
-        return "photo"
-    if getattr(message, "video", None):
-        return "video"
-    if getattr(message, "voice", None):
-        return "voice"
-    if getattr(message, "audio", None):
-        return "audio"
-    if getattr(message, "gif", None):
-        return "gif"
-    if getattr(message, "document", None):
-        return "document"
-
-    # Detect URLs without doing another network request.
-    text = (getattr(message, "message", None) or "").strip()
-    if re.search(r"https?://|t\.me/|www\.", text, re.I):
-        return "link"
-    return "text"
-
-
-def _search_content(message):
-    text = (getattr(message, "message", None) or "").strip()
-    if text:
-        return re.sub(r"\s+", " ", text)[:180]
-    media_type = _search_message_type(message)
-    labels = {
-        "photo": "📷 Photo",
-        "video": "🎬 Video",
-        "voice": "🎤 Voice message",
-        "audio": "🎵 Audio",
-        "gif": "🎞️ GIF",
-        "document": "📄 Document",
-        "link": "🔗 Link",
-        "text": "💬 Message",
-    }
-    return labels.get(media_type, "💬 Message")
-
-
-async def _get_joined_peer_ids(context):
-    """Cache joined peer IDs so every search does not call get_dialogs()."""
-    now = time.monotonic()
-    cached_at = context.application.bot_data.get("search_joined_cache_at", 0.0)
-    cached_ids = context.application.bot_data.get("search_joined_ids")
-    if cached_ids is not None and now - cached_at < SEARCH_JOINED_CACHE_SECONDS:
-        return set(cached_ids)
-
-    joined = set()
-    try:
-        # This call is only for the exclusion list. The actual search below is
-        # still one server-side global search request.
-        async for dialog in telethon_client.iter_dialogs(limit=500):
-            entity = getattr(dialog, "entity", None)
-            if entity is None:
-                continue
-            kind = _search_peer_kind(entity)
-            if kind in {"group", "channel"}:
-                marked = _search_peer_marked_id(entity)
-                if marked is not None:
-                    joined.add(marked)
-    except Exception as exc:
-        # If the cache cannot be refreshed, keep the previous cache rather than
-        # failing the whole global search.
-        print(f"[Search] joined-peer cache refresh failed: {exc}")
-        if cached_ids is not None:
-            return set(cached_ids)
-
-    context.application.bot_data["search_joined_ids"] = joined
-    context.application.bot_data["search_joined_cache_at"] = now
-    return joined
-
-
-def _search_peer_from_result(peer_id, peer_map):
-    if peer_id is None:
-        return None
-    try:
-        return peer_map.get(int(peer_id))
-    except Exception:
-        return None
-
-
 async def fetch_search(update, context, query):
-    query = (query or "").strip()
-    if not query:
-        await update.message.reply_text("🔎 Please enter a keyword, for example: Logic mid")
-        return
-
-    status_msg = await update.message.reply_text(
-        f"🔎 Searching Telegram globally for: <b>{html.escape(query)}</b>\n"
-        "⚡ Server-side search • excluding your joined groups/channels",
-        parse_mode=ParseMode.HTML,
-    )
-
-    started = time.monotonic()
+    status_msg = await update.message.reply_text(f"🔎 Searching accessible chats and public Telegram chats for: {query}")
     try:
-        # Refresh the exclusion cache and run the global request concurrently.
-        joined_task = asyncio.create_task(_get_joined_peer_ids(context))
-
-        # Telegram's messages.searchGlobal is the server-side global search.
-        # It is NOT the old "get_dialogs -> search every dialog" approach.
-        global_result = await telethon_client(
-            functions.messages.SearchGlobalRequest(
-                q=query,
-                filter=types.InputMessagesFilterEmpty(),
-                min_date=0,
-                max_date=0,
-                offset_rate=0,
-                offset_peer=types.InputPeerEmpty(),
-                offset_id=0,
-                limit=SEARCH_GLOBAL_LIMIT,
-            )
-        )
-        joined_ids = await joined_task
-
-        # Build the peer map from Telegram's returned auxiliary objects.
-        peer_map = {}
-        for entity in list(getattr(global_result, "chats", []) or []) + list(getattr(global_result, "users", []) or []):
-            marked = _search_peer_marked_id(entity)
-            if marked is not None:
-                peer_map[marked] = entity
-
-        results = []
+        dialogs = await telethon_client.get_dialogs(limit=200)
+        peers = []
         seen = set()
-        joined_hidden = 0
-
-        for message in list(getattr(global_result, "messages", []) or []):
-            marked_peer = None
-            try:
-                marked_peer = _search_peer_marked_id(message.peer_id)
-            except Exception:
-                marked_peer = None
-
-            entity = _search_peer_from_result(marked_peer, peer_map)
-
-            # Some result constructors expose chat_id more conveniently.
-            if entity is None:
-                chat_id = getattr(message, "chat_id", None)
-                if chat_id is not None:
-                    for candidate_id, candidate in peer_map.items():
-                        if candidate_id == int(chat_id):
-                            entity = candidate
-                            marked_peer = candidate_id
-                            break
-
-            if entity is None:
-                # Do not make one get_entity() request per result. That was one
-                # of the major causes of the old slow search.
-                continue
-
-            peer_kind = _search_peer_kind(entity)
-
-            # Main requirement: hide messages belonging to groups/channels the
-            # logged-in Telegram account has already joined.
-            if marked_peer in joined_ids and peer_kind in {"group", "channel"}:
-                joined_hidden += 1
-                continue
-
-            # Do not turn this into a private-chat/message search. The search is
-            # intended as public discovery. Bots are kept because they are a
-            # requested search category.
-            if peer_kind == "user":
-                continue
-
-            message_id = getattr(message, "id", None)
-            if not message_id:
-                continue
-
-            key = (marked_peer, int(message_id))
-            if key in seen:
-                continue
-            seen.add(key)
-
-            media_type = _search_message_type(message)
-            link = _search_message_link(entity, message_id)
-            results.append({
-                "kind": "message",
-                "type": media_type,
-                "peer_type": peer_kind,
-                "peer_id": marked_peer,
-                "entity": entity,
-                "message": message,
-                "link": link,
-                "content": _search_content(message),
-                "title": _search_peer_name(entity),
-                "username": getattr(entity, "username", None),
-                "date": getattr(message, "date", None),
-                "score": 1000 - len(results),
-            })
-
-        # Also expose public peers returned by the global search. This gives
-        # users a useful "channel/group/bot" result even when the message list
-        # itself is short.
-        for entity in list(getattr(global_result, "chats", []) or []) + list(getattr(global_result, "users", []) or []):
-            kind = _search_peer_kind(entity)
-            marked = _search_peer_marked_id(entity)
-            if kind in {"group", "channel"} and marked in joined_ids:
-                continue
-            if kind not in {"group", "channel", "bot"}:
-                continue
-
-            name = _search_peer_name(entity)
-            username = getattr(entity, "username", None)
-            searchable = f"{name} @{username or ''}".lower()
-            if query.lower() not in searchable and not any(
-                r["peer_id"] == marked for r in results
-            ):
-                continue
-
-            peer_link = _search_peer_link(entity)
-            peer_key = ("peer", marked)
-            if peer_key in seen:
-                continue
-            seen.add(peer_key)
-            results.append({
-                "kind": "peer",
-                "type": kind,
-                "peer_type": kind,
-                "peer_id": marked,
-                "entity": entity,
-                "message": None,
-                "link": peer_link,
-                "content": f"{('🤖' if kind == 'bot' else '📢' if kind == 'channel' else '👥')} {name}"
-                            + (f"  @{username}" if username else ""),
-                "title": name,
-                "username": username,
-                "date": None,
-                "score": 2000 - len(results),
-            })
-
-        if not results:
-            await status_msg.edit_text(
-                f"❌ No public results found for <b>{html.escape(query)}</b>.\n\n"
-                "The search intentionally hides results from groups/channels you already joined.",
-                parse_mode=ParseMode.HTML,
-            )
+        for dialog in dialogs:
+            entity = getattr(dialog, "entity", None)
+            if not entity: continue
+            key = (getattr(entity, "id", None), getattr(entity, "access_hash", None))
+            if key[0] not in seen:
+                seen.add(key[0]); peers.append(entity)
+        all_results = []
+        sem = asyncio.Semaphore(8)
+        async def worker(entity):
+            async with sem:
+                try:
+                    messages = await telethon_client.get_messages(entity, search=query, limit=3)
+                    return [{"entity": entity, "message": m, "link": f"https://t.me/{getattr(entity, 'username', entity.id)}/{m.id}", "content": (m.message or "[Media]")[:80]} for m in messages]
+                except Exception:
+                    return []
+        batches = await asyncio.gather(*(worker(e) for e in peers))
+        for batch in batches:
+            all_results.extend(batch)
+        if not all_results:
+            await status_msg.edit_text(f"❌ No results found for '{query}'.")
             return
-
-        # Put actual messages first, then peer cards, preserving Telegram's
-        # relevance ordering as much as possible.
-        results.sort(key=lambda item: item.get("score", 0), reverse=True)
-
-        context.user_data["search_results"] = results
-        context.user_data["search_query"] = query
-        context.user_data["search_filter"] = "all"
+        context.user_data["search_results"] = all_results
         context.user_data["search_page"] = 1
-        context.user_data["search_joined_hidden"] = joined_hidden
-        context.user_data["search_elapsed"] = round(time.monotonic() - started, 2)
-
         await status_msg.delete()
-        await display_search_page(update, context, 1, "all")
-
-    except FloodWaitError as e:
-        await status_msg.edit_text(
-            f"⏳ Telegram rate limit. Please wait {e.seconds} seconds and try again."
-        )
+        await display_search_page(update, context, 1)
     except Exception as e:
-        print(f"[Search] Global search failed: {type(e).__name__}: {e}")
-        await status_msg.edit_text(
-            f"❌ Search failed: <code>{html.escape(type(e).__name__)}</code>\n\n"
-            f"{html.escape(str(e)[:700])}",
-            parse_mode=ParseMode.HTML,
-        )
+        await status_msg.edit_text(f"❌ Search failed: {e}")
 
-
-def _search_filter_match(item, filter_type):
-    if filter_type == "all":
-        return True
-    if filter_type == "messages":
-        return item.get("kind") == "message"
-    if filter_type == "photos":
-        return item.get("type") == "photo"
-    if filter_type == "videos":
-        return item.get("type") == "video"
-    if filter_type == "files":
-        return item.get("type") in {"document", "gif"}
-    if filter_type == "audio":
-        return item.get("type") in {"audio", "voice"}
-    if filter_type == "links":
-        return item.get("type") == "link"
-    if filter_type == "channels":
-        return item.get("peer_type") == "channel"
-    if filter_type == "groups":
-        return item.get("peer_type") == "group"
-    if filter_type == "bots":
-        return item.get("peer_type") == "bot"
-    return True
-
-
-def _search_filter_buttons(results, active):
-    """Create only filters that actually have results. This is dynamic."""
-    definitions = [
-        ("all", "🔎 All"),
-        ("messages", "💬 Messages"),
-        ("photos", "📷 Photos"),
-        ("videos", "🎬 Videos"),
-        ("files", "📄 Files"),
-        ("audio", "🎵 Audio"),
-        ("links", "🔗 Links"),
-        ("channels", "📢 Channels"),
-        ("groups", "👥 Groups"),
-        ("bots", "🤖 Bots"),
-    ]
-
-    counts = {}
-    for filter_type, _ in definitions:
-        counts[filter_type] = sum(1 for item in results if _search_filter_match(item, filter_type))
-
-    available = []
-    for filter_type, label in definitions:
-        if filter_type == "all" or counts[filter_type] > 0:
-            shown = f"{label} ({counts[filter_type]})"
-            if filter_type == active:
-                shown = f"✅ {shown}"
-            available.append((filter_type, shown))
-
-    rows = []
-    # Five compact buttons per row; Telegram clients can render this cleanly.
-    for i in range(0, len(available), 3):
-        rows.append([
-            InlineKeyboardButton(label, callback_data=f"sf_{filter_type}")
-            for filter_type, label in available[i:i + 3]
-        ])
-    return rows, counts
-
-
-async def display_search_page(update, context, page, filter_type=None):
-    callback = update.callback_query
-    if callback:
-        await callback.answer()
-
+async def display_search_page(update, context, page):
+    query = update.callback_query
+    if query: await query.answer()
     results = context.user_data.get("search_results", [])
-    search_query = context.user_data.get("search_query", "")
-    active = filter_type or context.user_data.get("search_filter", "all")
-
-    filtered = [item for item in results if _search_filter_match(item, active)]
-    per_page = SEARCH_PAGE_SIZE
-    total_results = len(filtered)
-    total_pages = max(1, (total_results + per_page - 1) // per_page)
-    page = max(1, min(int(page), total_pages))
-    context.user_data["search_page"] = page
-    context.user_data["search_filter"] = active
-
+    query_text = " "
+    per_page = 10
+    total_pages = max(1, (len(results) + per_page - 1) // per_page)
+    page = max(1, min(page, total_pages))
     start = (page - 1) * per_page
-    page_items = filtered[start:start + per_page]
-
-    elapsed = context.user_data.get("search_elapsed", 0)
-    joined_hidden = context.user_data.get("search_joined_hidden", 0)
-
-    lines = [
-        "<blockquote>",
-        "<b>🌐 GLOBAL TELEGRAM SEARCH</b>",
-        f"🔎 <b>{html.escape(search_query)}</b>",
-        f"⚡ {elapsed}s • hidden joined results: {joined_hidden}",
-        "",
-    ]
-
-    if not page_items:
-        lines.append("<i>No results in this filter.</i>")
-    else:
-        for index, item in enumerate(page_items, start=start + 1):
-            peer_name = html.escape(item.get("title") or "Unknown")
-            username = item.get("username")
-            username_text = f" @{html.escape(username)}" if username else ""
-            icon = {
-                "photo": "📷", "video": "🎬", "document": "📄", "gif": "🎞️",
-                "audio": "🎵", "voice": "🎤", "link": "🔗", "bot": "🤖",
-                "channel": "📢", "group": "👥", "text": "💬",
-            }.get(item.get("type"), "🔹")
-
-            content = html.escape(item.get("content") or "")
-            if len(content) > 180:
-                content = content[:177] + "..."
-
-            if item.get("link"):
-                lines.append(
-                    f"<b>{index}.</b> {icon} <a href=\"{html.escape(item['link'], quote=True)}\">"
-                    f"{peer_name}{username_text}</a>\n{content}\n"
-                )
-            else:
-                lines.append(
-                    f"<b>{index}.</b> {icon} <b>{peer_name}{username_text}</b>\n{content}\n"
-                )
-
-    lines.append(f"Page {page}/{total_pages} • {total_results} results")
-    lines.append("</blockquote>")
-    text = "\n".join(lines)
-
-    kb, counts = _search_filter_buttons(results, active)
-
-    nav = []
-    if page > 1:
-        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"search_page_{page - 1}"))
-    if page < total_pages:
-        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"search_page_{page + 1}"))
-    if nav:
-        kb.append(nav)
-
-    kb.append([
-        InlineKeyboardButton("🔄 New Search", callback_data="search"),
-        InlineKeyboardButton("⬅️ Back", callback_data="more"),
-    ])
-    markup = InlineKeyboardMarkup(kb)
-
-    if callback:
-        try:
-            await callback.edit_message_text(
-                text,
-                reply_markup=markup,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
-        except Exception as exc:
-            # Telegram may reject an edit if the content is unchanged.
-            if "message is not modified" not in str(exc).lower():
-                raise
-    else:
-        await update.message.reply_text(
-            text,
-            reply_markup=markup,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+    page_items = results[start:start + per_page]
+    text = f"<blockquote><b>Telegram Search</b>\n{query_text}\n\n"
+    for item in page_items:
+        text += f"🔗 <a href='{item['link']}'>{item['content']}</a>\n\n"
+    text += f"Page {page}/{total_pages}\nSort by relevance and activity</blockquote>"
+    kb = []
+    nav_row = []
+    if page > 1: nav_row.append(InlineKeyboardButton("⬅️ Previous", callback_data="search_prev"))
+    if page < total_pages: nav_row.append(InlineKeyboardButton("Next ➡️", callback_data="search_next"))
+    if nav_row: kb.append(nav_row)
+    kb.append([InlineKeyboardButton("🔄 New Search", callback_data="search"), InlineKeyboardButton("⬅️ Back", callback_data="more")])
+    if query: await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+    else: await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
 
 async def fetch_words(update, context, target):
     try:
@@ -2931,6 +1589,34 @@ async def fetch_names(update, context, target):
         await update.message.reply_text(text, parse_mode=ParseMode.HTML)
     except Exception as e: await update.message.reply_text(f"❌ Error: {e}")
 
+async def display_story(update, context):
+    query = update.callback_query
+    await query.answer()
+    stories = context.user_data.get("stories_list", [])
+    index = context.user_data.get("story_index", 0)
+    if not stories:
+        await query.edit_message_text("❌ No accessible active Stories found.")
+        return
+    index = max(0, min(index, len(stories) - 1))
+    context.user_data["story_index"] = index
+    story = stories[index]
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Previous", callback_data="story_prev"), InlineKeyboardButton("Next ➡️", callback_data="story_next")], [InlineKeyboardButton("⬅️ Back to Profile", callback_data="profile")]])
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg" if story.media.photo else ".mp4") as tmp:
+            await telethon_client.download_media(story, file=tmp.name)
+            tmp_path = tmp.name
+        caption = getattr(story, "caption", None) or ""
+        caption = f"{caption}\n\n📖 Story {index + 1}/{len(stories)}".strip()
+        with open(tmp_path, "rb") as f:
+            if hasattr(story.media, 'photo') and story.media.photo:
+                media = InputMediaPhoto(media=InputFile(f), caption=caption)
+            else:
+                media = InputMediaVideo(media=InputFile(f), caption=caption)
+            await query.edit_message_media(media=media, reply_markup=kb)
+        os.unlink(tmp_path)
+    except Exception as e:
+        await query.edit_message_text(f"❌ Could not fetch story: {e}", reply_markup=kb)
+
 @telethon_client.on(events.NewMessage(incoming=True))
 async def inbox_listener(event):
     if event.is_private and not event.out:
@@ -2943,20 +1629,8 @@ async def inbox_listener(event):
 # --- MAIN HANDLER ---
 async def handle_link(update, context):
     user_id = update.effective_user.id
-
-    if context.user_data.get("state") == "qr_scan" and update.message and update.message.photo:
-        if await handle_qr_photo(update, context):
-            return
-
-    if context.user_data.get("state") == "qr_create" and update.message and (
-        update.message.text or update.message.caption
-    ):
-        if await handle_qr_create(update, context):
-            return
     text = update.message.text if update.message.text else ""
     self_ping()
-    if context.user_data.get('state') == 'awaiting_text_pdf': await handle_text_pdf_input(update, context); return
-    if context.user_data.get('state') == 'awaiting_text_to_image': await handle_text_to_image(update, context); return
     if context.user_data.get('state') == 'awaiting_image_to_pdf': await handle_image_collect(update, context); return
     if context.user_data.get('state') == 'awaiting_pdf': await handle_pdf_upload(update, context); return
     if context.user_data.get('state') == 'awaiting_pdf_to_word': await handle_pdf_to_word(update, context); return
