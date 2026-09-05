@@ -1622,98 +1622,37 @@ def youtube_video_id(url: str):
     return None
 
 
-def _prepare_cookiefile_from_env():
-    """Return a usable Netscape cookie file path from Render env vars.
-
-    Preferred: YTDLP_COOKIES_FILE / INSTAGRAM_COOKIES_FILE pointing to a file.
-    For Render, INSTAGRAM_COOKIES_B64 or YTDLP_COOKIES_B64 can contain a
-    base64-encoded Netscape cookies.txt file. This avoids putting multiline
-    cookie text directly into the Python source.
-    """
-    candidates = [
-        os.environ.get("INSTAGRAM_COOKIES_FILE", "").strip(),
-        os.environ.get("YTDLP_COOKIES_FILE", "").strip(),
-    ]
-    for path in candidates:
-        if path and os.path.isfile(path):
-            return path
-
-    encoded = (os.environ.get("INSTAGRAM_COOKIES_B64", "").strip()
-               or os.environ.get("YTDLP_COOKIES_B64", "").strip())
-    if encoded:
-        try:
-            decoded = base64.b64decode(encoded).decode("utf-8")
-            if "# Netscape HTTP Cookie File" not in decoded and "# HTTP Cookie File" not in decoded:
-                print("Cookie env was supplied but is not a Netscape cookies.txt file.")
-            path = os.path.join(tempfile.gettempdir(), "samibot_cookies.txt")
-            with open(path, "w", encoding="utf-8", newline="\n") as fh:
-                fh.write(decoded)
-            return path
-        except Exception as exc:
-            print("Could not decode cookie environment variable:", exc)
-    return None
-
-
-def clean_social_url(url: str, platform: str) -> str:
-    """Remove tracking query parameters from social-media URLs.
-
-    Instagram frequently appends igsh/igshid tracking parameters. The actual
-    post/reel identifier is preserved while the request becomes deterministic.
-    """
-    if platform != "instagram":
-        return url
-    try:
-        parsed = urllib.parse.urlparse(url)
-        return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
-    except Exception:
-        return url
-
-
-def ytdlp_base_options(url=None):
-    platform = video_platform(url or "") if url else "unknown"
-    user_agent = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/139.0.0.0 Safari/537.36"
-    )
+def ytdlp_base_options():
     options = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "socket_timeout": 30,
-        "retries": 2,
-        "fragment_retries": 2,
+        "socket_timeout": 25,
+        "retries": 3,
+        "fragment_retries": 3,
         "file_access_retries": 3,
-        "concurrent_fragment_downloads": 2,
+        "concurrent_fragment_downloads": 4,
         "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
         "http_headers": {
-            "User-Agent": user_agent,
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/147.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.8",
         },
+        # Current yt-dlp supports remote EJS components. They help keep
+        # YouTube extraction working when challenge scripts change.
         "remote_components": {"ejs:github"},
     }
-    cookiefile = _prepare_cookiefile_from_env()
-    if cookiefile:
-        options["cookiefile"] = cookiefile
-
-    if platform == "instagram":
-        # These are normal browser-like request headers; they do not bypass
-        # authentication. A logged-in cookie jar is still required when
-        # Instagram rate-limits or requires login.
-        options["http_headers"].update({
-            "Referer": "https://www.instagram.com/",
-            "Origin": "https://www.instagram.com",
-            "X-IG-App-ID": "936619743392459",
-        })
-        # Use the curl_cffi request handler supplied by yt-dlp[default] when
-        # available. It provides a browser-like TLS/HTTP stack.
-        options["impersonate"] = "chrome"
+    cookies = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
+    if cookies and os.path.isfile(cookies):
+        options["cookiefile"] = cookies
+    # Do NOT set `impersonate='chrome'` blindly. That was the source of the
+    # user's "Impersonate target chrome is not available" error.
     return options
 
 
 def extract_ytdlp_info(url: str):
-    opts = ytdlp_base_options(url)
+    opts = ytdlp_base_options()
     # Let current yt-dlp select its working YouTube player client. If one
     # client is blocked, yt-dlp can try another supported client.
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -1735,7 +1674,7 @@ def build_ytdlp_format(height=None, audio=False, platform="unknown"):
 
 def ytdlp_download(url: str, output_dir: str, *, height=None, audio=False, title_hint="video"):
     platform = video_platform(url)
-    opts = ytdlp_base_options(url)
+    opts = ytdlp_base_options()
     opts.update({
         "format": build_ytdlp_format(height, audio, platform),
         "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
@@ -1940,10 +1879,8 @@ def tikwm_download(url: str, output_dir: str, *, quality="hd", audio=False):
 
 def extract_download_options(url: str):
     platform = video_platform(url)
-    normalized = normalize_public_url(url) if platform == "tiktok" else clean_social_url(url, platform)
-    # Direct yt-dlp path first. Instagram is intentionally tried with the
-    # configured cookie jar when present. A 429 is a server-side rate limit;
-    # repeatedly hammering the same endpoint only makes it worse.
+    normalized = normalize_public_url(url) if platform == "tiktok" else url
+    # Direct yt-dlp path first.
     try:
         info = extract_ytdlp_info(normalized)
         title = info.get("title") or "Video"
@@ -1983,16 +1920,6 @@ def extract_download_options(url: str):
             if not qualities:
                 raise RuntimeError(f"TikTok extraction failed: {first_error}")
             return {"source": "tikwm", "platform": platform, "url": normalized, "title": data.get("title") or data.get("desc") or "TikTok video", "qualities": qualities, "audio": bool(data.get("music")), "tikwm": data}
-        if platform == "instagram" and "429" in str(first_error):
-            has_cookie = bool(_prepare_cookiefile_from_env())
-            if not has_cookie:
-                raise RuntimeError(
-                    "Instagram rate-limited the Render IP (HTTP 429). "
-                    "No Instagram cookie jar is configured. Add INSTAGRAM_COOKIES_B64 "
-                    "or INSTAGRAM_COOKIES_FILE in Render using a fresh Netscape cookies.txt "
-                    "from your own Instagram browser session, then redeploy. "
-                    "Without cookies, Instagram may refuse server-side extraction."
-                )
         raise RuntimeError(f"Extraction failed: {first_error}")
 
 
@@ -2157,7 +2084,7 @@ def do_download_for_quality(job, output_dir, quality):
     if job["source"] == "tikwm":
         return tikwm_download(job["url"], output_dir, quality="hd" if quality >= 720 else "sd", audio=False)
     raise RuntimeError("Unknown download source")
-
+    
 # --- PDF, WORD, IMAGE COLLECT ---
 async def handle_pdf_upload(update, context):
     if context.user_data.get('state') != 'awaiting_pdf': return
