@@ -2986,12 +2986,7 @@ async def inbox_listener(event):
 PTB_BOT = None
 MM_DB_ID = 1
 
-# --- FIX: Guarantee the table + default row exist before anything reads/writes it. ---
-# This is the actual root cause of "Block Everyone doesn't persist": if the
-# table was missing or had no row with id=1, mm_save()'s UPDATE silently
-# matched 0 rows (UPDATE never creates rows), so nothing was ever saved, and
-# mm_get_rules() kept returning hardcoded defaults (block_everyone_until=0)
-# on every subsequent call — making the block look like it "doesn't work".
+# --- FIX 1: Guarantee the table + default row exist before anything reads/writes it. ---
 def mm_init_db():
     conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
@@ -3004,18 +2999,12 @@ def mm_init_db():
         filter_videos_until REAL NOT NULL DEFAULT 0,
         keyword_rules TEXT NOT NULL DEFAULT '{}'
     )''')
-    # Insert the default row only if id=1 doesn't already exist — never
-    # overwrites existing saved rules on every restart.
     c.execute('''INSERT OR IGNORE INTO message_manager_rules
         (id, messaging, block_everyone_until, blocked_users, filter_links_until, filter_videos_until, keyword_rules)
         VALUES (1, 1, 0, '{}', 0, 0, '{}')''')
     conn.commit()
     conn.close()
 
-# Call this once at bot startup, right after your other DB init code, e.g.:
-#   mm_init_db()
-# Placing it here as a safety net too, so mm_save/mm_get_rules work correctly
-# even if startup wiring is ever changed or this module is imported standalone.
 mm_init_db()
 
 def mm_get_rules():
@@ -3025,8 +3014,6 @@ def mm_get_rules():
     row = c.fetchone()
     conn.close()
     if not row:
-        # This should no longer happen now that mm_init_db() guarantees the
-        # row exists, but kept as a defensive fallback.
         return {'messaging': 1, 'block_everyone_until': 0, 'blocked_users': {}, 'filter_links_until': 0, 'filter_videos_until': 0, 'keyword_rules': {}}
     try: blocked = json.loads(row[2] or '{}')
     except Exception: blocked = {}
@@ -3034,23 +3021,16 @@ def mm_get_rules():
     except Exception: keywords = {}
     return {'messaging': int(row[0] or 0), 'block_everyone_until': float(row[1] or 0), 'blocked_users': blocked if isinstance(blocked, dict) else {}, 'filter_links_until': float(row[3] or 0), 'filter_videos_until': float(row[4] or 0), 'keyword_rules': keywords if isinstance(keywords, dict) else {}}
 
+# --- FIX 2: Use INSERT OR REPLACE so the row always exists. ---
 def mm_save(r):
     conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
-    # --- FIX: INSERT OR REPLACE instead of a bare UPDATE. ---
-    # An UPDATE on a missing row is a silent no-op in SQLite (0 rows
-    # affected, no error raised) — that was the exact mechanism causing
-    # saved settings to vanish. INSERT OR REPLACE guarantees a row with
-    # id=1 always exists after this call, regardless of prior DB state.
     c.execute('''INSERT OR REPLACE INTO message_manager_rules
         (id, messaging, block_everyone_until, blocked_users, filter_links_until, filter_videos_until, keyword_rules)
         VALUES (1, ?, ?, ?, ?, ?, ?)''',
         (int(r.get('messaging',1)), float(r.get('block_everyone_until',0)), json.dumps(r.get('blocked_users',{}), ensure_ascii=False), float(r.get('filter_links_until',0)), float(r.get('filter_videos_until',0)), json.dumps(r.get('keyword_rules',{}), ensure_ascii=False)))
     conn.commit()
     conn.close()
-    # --- FIX: verify the write actually landed, so a future silent DB issue
-    # (e.g. disk full, permissions) surfaces immediately instead of quietly
-    # reverting to defaults again. ---
     check = mm_get_rules()
     if mm_active(check['block_everyone_until']) != mm_active(float(r.get('block_everyone_until', 0))):
         print(f"⚠️ mm_save verification mismatch: wrote block_everyone_until={r.get('block_everyone_until')} but read back {check['block_everyone_until']}")
@@ -3134,10 +3114,18 @@ def mm_has_link(text):
 def mm_is_video(event):
     return bool(getattr(event,'video',None)) or (getattr(event,'document',None) is not None and str(getattr(getattr(event,'document',None),'mime_type','')).startswith('video/'))
 
+# --- FIX 3: Ensure bot's own ID is never blocked (prevents loop and self-block). ---
 def mm_reason(event, user_id, text):
     r=mm_get_rules(); now=time.time()
     # Owner/admins are never blocked by manager rules.
     if user_id in ADMIN_IDS: return None
+    # Never block the bot itself
+    try:
+        me = telethon_client.loop.run_until_complete(telethon_client.get_me())
+        if user_id == me.id:
+            return None
+    except Exception:
+        pass
     until=float(r.get('block_everyone_until',0))
     if mm_active(until): return f'Block everyone ({mm_left(until)})'
     item=r.get('blocked_users',{}).get(str(user_id))
@@ -3156,11 +3144,6 @@ def mm_reason(event, user_id, text):
     return None
 
 async def mm_refuse(event, reason):
-    # Telegram has already delivered the incoming message to the connected
-    # account by the time Telethon receives the update. We cannot prevent the
-    # sender-side "delivered" state, but we can immediately revoke the message
-    # from the private chat and leave a polite automated response. Telethon
-    # supports deleting incoming private messages for everyone with revoke=True.
     try:
         await event.respond('👋 Thanks for your message. The owner is not accepting this message right now. Please try again later.')
     except Exception as e:
@@ -3180,10 +3163,23 @@ def mm_message_preview(event):
     if getattr(event,'document',None): return '📄 Document'
     return '📎 Media message'
 
+# --- FIX 4: Forward without duplicate admins and without sending to the bot itself ---
 async def mm_forward(event):
     if not ADMIN_IDS: print('Message Manager: ADMIN_IDS is empty; forwarding skipped.'); return
-    # --- FIX: Deduplicate ADMIN_IDS to avoid multiple notifications to same admin. ---
-    admin_list = list(set(ADMIN_IDS))  # remove duplicates
+    # Get bot's own ID to exclude it from recipients (prevents infinite loop).
+    try:
+        bot_me = await telethon_client.get_me()
+        bot_id = bot_me.id
+    except Exception:
+        bot_id = None
+
+    admin_list = list(set(ADMIN_IDS))  # deduplicate
+    if bot_id:
+        admin_list = [aid for aid in admin_list if aid != bot_id]
+    if not admin_list:
+        print('Message Manager: No valid admin recipients after filtering.')
+        return
+
     sender=await event.get_sender()
     name=' '.join(x for x in [getattr(sender,'first_name',''),getattr(sender,'last_name','')] if x).strip() or 'Unknown'
     username=getattr(sender,'username',None)
@@ -3191,21 +3187,25 @@ async def mm_forward(event):
     preview=mm_message_preview(event)
     for admin_id in admin_list:
         try:
-            # --- FIX: Send only ONE notification per admin via PTB_BOT (if available),
-            # otherwise fallback to telethon. This avoids duplicate messages. ---
             if PTB_BOT:
                 kb=InlineKeyboardMarkup([[InlineKeyboardButton('💬 Reply',callback_data=f'mm_reply|{sender.id}'), InlineKeyboardButton('🚫 Block User',callback_data=f'mm_block_from_message|{sender.id}')]])
                 await PTB_BOT.send_message(admin_id, header+'\n\n'+preview[:3500], reply_markup=kb)
             else:
                 await telethon_client.send_message(admin_id, header+'\n\n👇 Original message:\n'+preview)
-            # Also copy media when possible. This is separate so the admin sees the actual file.
             if getattr(event,'media',None):
                 await telethon_client.send_file(admin_id, event.media, caption='📎 Original media')
         except Exception as e:
             print(f'Message Manager forwarding error to {admin_id}: {e}')
 
+# --- FIX 5: Ignore events originating from the bot itself (kills the infinite loop). ---
 async def process_message_manager_incoming(event):
     if not event.is_private or event.out: return False
+    try:
+        me = await telethon_client.get_me()
+        if event.sender_id == me.id:
+            return False
+    except Exception:
+        pass
     try:
         sender=await event.get_sender(); uid=sender.id; text=event.raw_text or ''
         reason=mm_reason(event,uid,text)
@@ -3343,7 +3343,6 @@ async def handle_mm_input(update, context):
     if mode=='duration':
         kind=context.user_data.get('mm_duration_kind'); until=mm_duration(text)
         if until is None: await update.message.reply_text('❌ Invalid duration. Example: `30 seconds` or `2 hours` or `permanent`.'); return True
-        # save directly for text custom duration
         r=mm_get_rules()
         if kind=='everyone': r['block_everyone_until']=until
         elif kind=='links': r['filter_links_until']=until
@@ -3363,7 +3362,7 @@ async def handle_mm_input(update, context):
         except Exception as e: await update.message.reply_text(f'❌ Reply failed: {e}')
         context.user_data.pop('mm_input',None); context.user_data.pop('mm_reply_to',None); return True
     return False
-
+    
 # =============================== QR CODE ===============================
 def create_qr_image_sync(text):
     qr=qrcode.QRCode(version=None,error_correction=qrcode.constants.ERROR_CORRECT_M,box_size=10,border=4)
