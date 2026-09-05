@@ -15,6 +15,7 @@ quickjs>=1.19.4
 yt-dlp[default,curl-ffmpeg]
 faster-whisper>=1.2
 huggingface_hub>=0.34
+rapidocr_onnxruntime>=1.4
 qrcode[pil]>=8.2
 opencv-python-headless>=4.10
 numpy>=2.0
