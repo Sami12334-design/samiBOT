@@ -6,7 +6,6 @@ pdf2docx>=0.5
 img2pdf>=0.6
 Pillow>=11
 imageio-ffmpeg>=0.6
-groq>=0.30
 edge-tts>=7
 python-pptx>=1.0
 reportlab>=4
