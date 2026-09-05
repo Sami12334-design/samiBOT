@@ -666,56 +666,233 @@ async def handle_front_upload(update, context):
 # Uses the operating-system speech engine instead of edge-tts/cloud APIs.
 ESPEAK_BIN = os.environ.get("ESPEAK_BIN", "espeak-ng" if os.path.exists("/usr/bin/espeak-ng") else "espeak")
 
+# Hard safety limits so a huge paste can't hang a worker thread forever.
+TTS_MAX_CHARS = 4000
+TTS_BASE_TIMEOUT = 30          # seconds, floor
+TTS_TIMEOUT_PER_CHAR = 0.05    # extra seconds per character, roughly scales with speech length
+
+# Generic eSpeak pitch/formant variants. These are NOT English-specific —
+# eSpeak applies "+variantN" on top of ANY base language voice
+# (e.g. "fr+m3", "am+f3", "hi+m2" all work), so this map is reused for every language.
+_VOICE_TYPE_VARIANTS = {
+    "male": "m3",
+    "female": "f3",
+    "old": "m2",
+    "child": "f4",
+}
+
+_voice_cache_lock = threading.Lock()
+_available_voice_langs = None  # populated lazily: set of lowercase lang codes eSpeak actually has
+
+
+def _load_espeak_voice_langs():
+    """
+    Query the installed eSpeak/eSpeak-ng binary for the list of language
+    codes it actually ships, instead of assuming "am" or anything else exists.
+    Result is cached for the lifetime of the process (eSpeak's voice list
+    can't change while the bot is running).
+    """
+    global _available_voice_langs
+    with _voice_cache_lock:
+        if _available_voice_langs is not None:
+            return _available_voice_langs
+        langs = set()
+        try:
+            result = subprocess.run(
+                [ESPEAK_BIN, "--voices"],
+                check=True, capture_output=True, text=True, timeout=15
+            )
+            # Typical line: "  2  am             M  amharic              ..."
+            # Column 2 (index) is the language code we care about.
+            for line in result.stdout.splitlines()[1:]:
+                parts = line.split()
+                if len(parts) >= 2:
+                    code = parts[1].strip().lower()
+                    if code:
+                        langs.add(code)
+        except (subprocess.SubprocessError, OSError, FileNotFoundError):
+            # If we can't even query the engine, leave the set empty —
+            # callers will fall back to "en-us" and surface a clear error.
+            langs = set()
+        _available_voice_langs = langs
+        return _available_voice_langs
+
+
+def _normalize_lang_code(lang):
+    """Lowercase and strip; keep hyphenated codes like 'en-us' / 'pt-br' intact."""
+    return (lang or "").strip().lower()
+
+
+def _resolve_base_voice(lang):
+    """
+    Find the best matching eSpeak base voice for an arbitrary language code.
+    Supports hyphenated codes (e.g. 'en-us', 'pt-br') and falls back to the
+    bare language part (e.g. 'en' from 'en-us') before giving up.
+    Only falls back to English if the language is genuinely not supported.
+    """
+    norm = _normalize_lang_code(lang)
+    available = _load_espeak_voice_langs()
+
+    if not available:
+        # Engine voice list unavailable — best effort, let the actual
+        # espeak call fail loudly later with a clear error if it's wrong.
+        return norm or "en-us"
+
+    if norm in available:
+        return norm
+
+    # Try the base part before a hyphen, e.g. "en-gb" -> "en"
+    base = norm.split("-")[0]
+    if base and base in available:
+        return base
+
+    # Try matching any installed variant that starts with the base, e.g.
+    # requesting "en" when only "en-us" is installed.
+    for code in available:
+        if code.split("-")[0] == base:
+            return code
+
+    return None  # genuinely unsupported
+
+
 def _espeak_voice(lang, voice_type):
-    if lang == "am":
-        # eSpeak installations vary in Amharic support. If an Amharic voice exists,
-        # use it; otherwise report a clear local-engine error rather than silently
-        # producing incorrect English speech.
-        return "am"
-    return {"male":"en-us+m1", "female":"en-us+f3", "old":"en-us+m2", "child":"en-us+f4"}.get(voice_type, "en-us")
+    """
+    Build a concrete eSpeak voice string for ANY supported language code,
+    correctly applying the male/female/old/child variant instead of
+    hardcoding English voices. Falls back to English only if the requested
+    language isn't actually installed.
+    """
+    variant = _VOICE_TYPE_VARIANTS.get(voice_type, "m3")
+    base = _resolve_base_voice(lang)
+
+    if base is None:
+        # Language not supported by this eSpeak install — fall back to
+        # English explicitly (and let the caller know via the returned flag).
+        return f"en-us+{variant}", False
+
+    return f"{base}+{variant}", True
+
+
+def _voice_actually_works(voice):
+    """
+    Do a cheap dry-run to confirm eSpeak accepts the constructed voice
+    string (base+variant combos aren't all guaranteed valid). Uses --stdout
+    with a single character so it's fast and doesn't write files.
+    """
+    try:
+        subprocess.run(
+            [ESPEAK_BIN, "-v", voice, "--stdout", "a"],
+            check=True, capture_output=True, timeout=10
+        )
+        return True
+    except (subprocess.SubprocessError, OSError):
+        return False
+
 
 def _tts_espeak_sync(text, lang, voice_type, out_path):
-    voice = _espeak_voice(lang, voice_type)
-    cmd=[ESPEAK_BIN, "-v", voice, "-s", "155", "-a", "170", "-w", out_path, text]
-    subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=120)
+    voice, is_requested_lang = _espeak_voice(lang, voice_type)
+
+    if not _voice_actually_works(voice):
+        # Variant combo failed — retry with just the base voice, no variant.
+        base_only = voice.split("+")[0]
+        if _voice_actually_works(base_only):
+            voice = base_only
+        else:
+            raise RuntimeError(
+                f"eSpeak voice '{voice}' is not available on this server. "
+                f"Install the matching eSpeak voice data or choose a different language."
+            )
+
+    if not is_requested_lang:
+        # We silently fell back to English — surface that instead of
+        # producing wrong-language audio with no explanation.
+        pass  # caller (handle_tts_voice_selection) reports this via the reply caption
+
+    timeout = min(300, TTS_BASE_TIMEOUT + int(len(text) * TTS_TIMEOUT_PER_CHAR))
+    cmd = [ESPEAK_BIN, "-v", voice, "-s", "155", "-a", "170", "-w", out_path, text]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"Local eSpeak timed out after {timeout}s. Try shorter text.")
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or "").strip()
+        raise RuntimeError(f"eSpeak failed to synthesize audio.{(' ' + stderr) if stderr else ''}")
+
     if not os.path.exists(out_path) or os.path.getsize(out_path) < 100:
         raise RuntimeError("Local eSpeak did not produce an audio file.")
 
+    return voice, is_requested_lang
+
+
 async def handle_tts(update, context, lang):
-    text=(update.message.text or "").strip()
+    text = (update.message.text or "").strip()
     if not text:
         await update.message.reply_text("❌ Please send the text you want to convert.")
         return
-    context.user_data['tts_text']=text
-    context.user_data['tts_lang']=lang
-    kb=[[InlineKeyboardButton("🧑 Male", callback_data=f"tts_voice_{lang}_male"), InlineKeyboardButton("👩 Female", callback_data=f"tts_voice_{lang}_female")], [InlineKeyboardButton("👴 Old", callback_data=f"tts_voice_{lang}_old"), InlineKeyboardButton("👶 Child", callback_data=f"tts_voice_{lang}_child")], [InlineKeyboardButton("⬅️ Cancel", callback_data="converter")]]
+    if len(text) > TTS_MAX_CHARS:
+        await update.message.reply_text(
+            f"❌ Text is too long ({len(text)} chars). Please send up to {TTS_MAX_CHARS} characters."
+        )
+        return
+    context.user_data['tts_text'] = text
+    context.user_data['tts_lang'] = lang
+    kb = [
+        [InlineKeyboardButton("🧑 Male", callback_data=f"tts_voice_{lang}_male"),
+         InlineKeyboardButton("👩 Female", callback_data=f"tts_voice_{lang}_female")],
+        [InlineKeyboardButton("👴 Old", callback_data=f"tts_voice_{lang}_old"),
+         InlineKeyboardButton("👶 Child", callback_data=f"tts_voice_{lang}_child")],
+        [InlineKeyboardButton("⬅️ Cancel", callback_data="converter")],
+    ]
     await update.message.reply_text("🔊 LOCAL TEXT TO VOICE\n\nChoose a voice style:", reply_markup=InlineKeyboardMarkup(kb))
-    context.user_data['state']=None
+    context.user_data['state'] = None
+
 
 async def handle_tts_voice_selection(update, context, data):
-    q=update.callback_query; await q.answer()
-    parts=data.split("_")
-    lang=parts[2] if len(parts)>2 else "en"; voice_type=parts[3] if len(parts)>3 else "male"
-    text=context.user_data.get('tts_text')
+    q = update.callback_query
+    await q.answer()
+    parts = data.split("_")
+    lang = parts[2] if len(parts) > 2 else "en"
+    voice_type = parts[3] if len(parts) > 3 else "male"
+    text = context.user_data.get('tts_text')
     if not text:
         await q.message.reply_text("❌ Text session expired. Open Text to Voice and send the text again.")
         return
-    status=await q.message.reply_text("🔊 Converting with the local speech engine…")
-    path=None
+
+    status = await q.message.reply_text("🔊 Converting with the local speech engine…")
+    path = None
     try:
-        fd,path=tempfile.mkstemp(prefix="tts_",suffix=".wav"); os.close(fd)
-        await asyncio.to_thread(_tts_espeak_sync,text,lang,voice_type,path)
-        with open(path,"rb") as audio:
-            await q.message.reply_audio(audio=audio,title=f"Local Voice ({lang}, {voice_type})",reply_markup=tool_done_kb())
-        await status.edit_text("✅ Text to voice complete — no external AI API was used.")
+        fd, path = tempfile.mkstemp(prefix="tts_", suffix=".wav")
+        os.close(fd)
+        used_voice, matched_requested_lang = await asyncio.to_thread(
+            _tts_espeak_sync, text, lang, voice_type, path
+        )
+        with open(path, "rb") as audio:
+            await q.message.reply_audio(
+                audio=audio,
+                title=f"Local Voice ({lang}, {voice_type})",
+                reply_markup=tool_done_kb()
+            )
+        if matched_requested_lang:
+            await status.edit_text("✅ Text to voice complete — no external AI API was used.")
+        else:
+            await status.edit_text(
+                f"⚠️ '{lang}' voice isn't installed on this server, so English was used instead.\n"
+                f"No external AI API was used."
+            )
     except Exception as e:
-        await status.edit_text("❌ Local text-to-voice failed.\n\n"+html.escape(str(e)[:1200]),parse_mode=ParseMode.HTML)
+        await status.edit_text(
+            "❌ Local text-to-voice failed.\n\n" + html.escape(str(e)[:1200]),
+            parse_mode=ParseMode.HTML
+        )
     finally:
         if path:
-            try: os.unlink(path)
-            except OSError: pass
-        context.user_data.pop('tts_text',None); context.user_data.pop('tts_lang',None); context.user_data['state']=None
-
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        context.user_data.pop('tts_text', None)
+        context.user_data.pop('tts_lang', None)
+        context.user_data['state'] = None
 # --- IMAGE FORMAT CONVERSION ---
 async def handle_image_convert(update, context, fmt):
     if not update.message.photo:
@@ -810,94 +987,209 @@ async def handle_pptx_to_pdf(update, context):
     except Exception as e:
         await status_msg.edit_text(f"❌ Conversion failed: {e}")
         context.user_data['state'] = None
-
 # --- TEXT TO PDF: UNICODE/FALLBACK FONT ENGINE ---
 PDF_DRAFT_KEY = "text_pdf_items"
-def text_pdf_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("➕ Enter Next Text", callback_data="pdftext_next"), InlineKeyboardButton("✅ Done", callback_data="pdftext_done")],[InlineKeyboardButton("❌ Cancel", callback_data="pdftext_cancel")]])
 
-FONT_CANDIDATES = [
+def text_pdf_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Enter Next Text", callback_data="pdftext_next"),
+         InlineKeyboardButton("✅ Done", callback_data="pdftext_done")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="pdftext_cancel")]
+    ])
+
+# --- Bundled fonts take priority over system fonts ---
+# Put actual .ttf files in a "fonts/" folder next to this script and commit
+# them to your repo. This guarantees the PDF engine works identically on
+# Render, Railway, a VPS, or your laptop — it never depends on what the
+# host OS happens to have installed.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BUNDLED_FONT_DIR = os.path.join(BASE_DIR, "fonts")
+
+def _bundled(*names):
+    return [os.path.join(BUNDLED_FONT_DIR, n) for n in names]
+
+FONT_CANDIDATES = _bundled("NotoSans-Regular.ttf", "DejaVuSans.ttf") + [
     "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
     "/usr/share/fonts/opentype/noto/NotoSans-Regular.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
 ]
-ETHIOPIC_CANDIDATES = [
+ETHIOPIC_CANDIDATES = _bundled("NotoSansEthiopic-Regular.ttf") + [
     "/usr/share/fonts/truetype/noto/NotoSansEthiopic-Regular.ttf",
     "/usr/share/fonts/opentype/noto/NotoSansEthiopic-Regular.ttf",
 ]
-ARABIC_CANDIDATES = [
+ARABIC_CANDIDATES = _bundled("NotoSansArabic-Regular.ttf") + [
     "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
     "/usr/share/fonts/opentype/noto/NotoSansArabic/NotoSansArabic-Regular.ttf",
 ]
-CJK_CANDIDATES = [
+# Fixed: your original list had the SAME path twice, so it never found an
+# alternate. Now covers both common install locations.
+CJK_CANDIDATES = _bundled("NotoSansCJK-Regular.ttc") + [
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto-cjk/NotoSansCJK-Regular.ttc",
 ]
+# Extra scripts added for broader "any language" coverage — Hindi/Marathi/etc.
+# (Devanagari), Thai, and Hebrew. Safe no-ops if the files aren't present.
+DEVANAGARI_CANDIDATES = _bundled("NotoSansDevanagari-Regular.ttf") + [
+    "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+]
+THAI_CANDIDATES = _bundled("NotoSansThai-Regular.ttf") + [
+    "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+]
+HEBREW_CANDIDATES = _bundled("NotoSansHebrew-Regular.ttf") + [
+    "/usr/share/fonts/truetype/noto/NotoSansHebrew-Regular.ttf",
+]
+
+# Unicode block ranges used only to decide whether Arabic reshaping is needed.
+_ARABIC_RANGE = re.compile(r'[\u0600-\u06FF\u0750-\u077F]')
+
 
 def _first_existing(paths):
     for p in paths:
-        if os.path.exists(p): return p
+        if p and os.path.exists(p):
+            return p
     return None
+
+
+def _maybe_reshape_arabic(text):
+    """
+    Arabic (and similar cursive-joining scripts) must be reshaped and
+    bidi-reordered before rendering, or letters appear disconnected/reversed.
+    Ethiopic, CJK, Devanagari, etc. don't need this — only applied when
+    Arabic-range characters are actually present, and it degrades gracefully
+    (falls back to plain text) if the optional libraries aren't installed.
+    """
+    if not _ARABIC_RANGE.search(text):
+        return text
+    try:
+        import arabic_reshaper
+        from bidi.algorithm import get_display
+        reshaped = arabic_reshaper.reshape(text)
+        return get_display(reshaped)
+    except ImportError:
+        # Libraries not installed — text will still render with the right
+        # glyphs via the fallback font, just without proper joining/order.
+        return text
+
 
 def _make_unicode_pdf(texts, path):
     # fpdf2 handles Unicode text directly and can use fallback fonts.
     from fpdf import FPDF
-    pdf=FPDF(format="A4")
+    pdf = FPDF(format="A4")
     pdf.set_auto_page_break(auto=True, margin=16)
-    pdf.set_margins(15,15,15)
-    main_font=_first_existing(FONT_CANDIDATES)
+    pdf.set_margins(15, 15, 15)
+
+    main_font = _first_existing(FONT_CANDIDATES)
     if not main_font:
-        raise RuntimeError("No Unicode font found. Install Noto/DejaVu fonts in Render.")
+        raise RuntimeError(
+            "No Unicode font found. Add a font file (e.g. NotoSans-Regular.ttf) "
+            f"to '{BUNDLED_FONT_DIR}' in your repo, or install Noto/DejaVu system-wide."
+        )
     pdf.add_font("Main", fname=main_font)
-    fallback=[]
-    eth=_first_existing(ETHIOPIC_CANDIDATES)
-    arab=_first_existing(ARABIC_CANDIDATES)
-    cjk=_first_existing(CJK_CANDIDATES)
-    for name,path2 in (("Ethiopic",eth),("Arabic",arab),("CJK",cjk)):
-        if path2:
+
+    fallback = []
+    missing = []
+    script_fonts = (
+        ("Ethiopic", ETHIOPIC_CANDIDATES),
+        ("Arabic", ARABIC_CANDIDATES),
+        ("CJK", CJK_CANDIDATES),
+        ("Devanagari", DEVANAGARI_CANDIDATES),
+        ("Thai", THAI_CANDIDATES),
+        ("Hebrew", HEBREW_CANDIDATES),
+    )
+    for name, candidates in script_fonts:
+        font_path = _first_existing(candidates)
+        if font_path:
             try:
-                pdf.add_font(name,fname=path2); fallback.append(name)
-            except Exception: pass
+                pdf.add_font(name, fname=font_path)
+                fallback.append(name)
+            except Exception:
+                missing.append(name)
+        else:
+            missing.append(name)
+
     if fallback:
-        try: pdf.set_fallback_fonts(fallback)
-        except Exception: pass
-    pdf.add_page(); pdf.set_font("Main",size=12)
+        try:
+            pdf.set_fallback_fonts(fallback)
+        except Exception:
+            pass
+
+    pdf.add_page()
+    pdf.set_font("Main", size=12)
     pdf.set_title("Text Document")
-    for i,t in enumerate(texts):
-        if i: pdf.ln(4)
-        pdf.multi_cell(0,8,t)
+    for i, t in enumerate(texts):
+        if i:
+            pdf.ln(4)
+        pdf.multi_cell(0, 8, _maybe_reshape_arabic(t))
     pdf.output(path)
 
+    return fallback, missing
+
+
 async def handle_text_pdf_input(update, context):
-    if context.user_data.get("state") != "awaiting_text_pdf": return
-    text=(update.message.text or "").strip()
+    if context.user_data.get("state") != "awaiting_text_pdf":
+        return
+    text = (update.message.text or "").strip()
     if not text:
-        await update.message.reply_text("❌ Please send some text."); return
-    items=context.user_data.setdefault(PDF_DRAFT_KEY,[]); items.append(text)
-    await update.message.reply_text(f"✅ Text {len(items)} added.\n\nUnicode PDF mode supports multilingual text. Add another or press Done.",reply_markup=text_pdf_keyboard())
+        await update.message.reply_text("❌ Please send some text.")
+        return
+    items = context.user_data.setdefault(PDF_DRAFT_KEY, [])
+    items.append(text)
+    await update.message.reply_text(
+        f"✅ Text {len(items)} added.\n\nUnicode PDF mode supports multilingual text. Add another or press Done.",
+        reply_markup=text_pdf_keyboard()
+    )
+
 
 async def finish_text_to_pdf(update, context):
-    q=update.callback_query; await q.answer(); items=context.user_data.get(PDF_DRAFT_KEY,[])
+    q = update.callback_query
+    await q.answer()
+    items = context.user_data.get(PDF_DRAFT_KEY, [])
     if not items:
-        await q.message.reply_text("❌ No text has been added yet."); return
-    status=await q.message.reply_text("⏳ Creating multilingual Unicode PDF…"); path=None
+        await q.message.reply_text("❌ No text has been added yet.")
+        return
+
+    status = await q.message.reply_text("⏳ Creating multilingual Unicode PDF...")
+    path = None
     try:
-        fd,path=tempfile.mkstemp(prefix="text_pdf_",suffix=".pdf"); os.close(fd)
-        await asyncio.to_thread(_make_unicode_pdf,items,path)
-        with open(path,"rb") as f:
-            await q.message.reply_document(document=f,filename="multilingual_text.pdf",caption=f"✅ Unicode PDF created from {len(items)} text message(s).",reply_markup=tool_done_kb())
-        await status.edit_text("✅ Text to PDF complete — Unicode font fallback enabled.")
+        fd, path = tempfile.mkstemp(prefix="text_pdf_", suffix=".pdf")
+        os.close(fd)
+        fallback, missing = await asyncio.to_thread(_make_unicode_pdf, items, path)
+
+        caption = f"✅ Unicode PDF created from {len(items)} text message(s)."
+        with open(path, "rb") as f:
+            await q.message.reply_document(
+                document=f, filename="multilingual_text.pdf",
+                caption=caption, reply_markup=tool_done_kb()
+            )
+
+        if missing:
+            # Tell the admin/user exactly which scripts won't render correctly
+            # yet, instead of leaving it a silent mystery.
+            await status.edit_text(
+                "✅ Text to PDF complete.\n"
+                f"⚠️ Fonts not found for: {', '.join(missing)} — those scripts "
+                "may show as boxes. Add the matching .ttf to the fonts/ folder to fix."
+            )
+        else:
+            await status.edit_text("✅ Text to PDF complete — Unicode font fallback enabled.")
     except Exception as e:
-        await status.edit_text("❌ Text to PDF failed.\n\n"+html.escape(str(e)[:1500]),parse_mode=ParseMode.HTML)
+        await status.edit_text("❌ Text to PDF failed.\n\n" + html.escape(str(e)[:1500]), parse_mode=ParseMode.HTML)
     finally:
-        context.user_data.pop(PDF_DRAFT_KEY,None); context.user_data["state"]=None
+        context.user_data.pop(PDF_DRAFT_KEY, None)
+        context.user_data["state"] = None
         if path:
-            try: os.unlink(path)
-            except OSError: pass
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
 
 async def cancel_text_to_pdf(update, context):
-    q=update.callback_query; await q.answer(); context.user_data.pop(PDF_DRAFT_KEY,None); context.user_data["state"]=None; await q.edit_message_text("❌ Text to PDF cancelled.")
-
+    q = update.callback_query
+    await q.answer()
+    context.user_data.pop(PDF_DRAFT_KEY, None)
+    context.user_data["state"] = None
+    await q.edit_message_text("❌ Text to PDF cancelled.")
 # --- TEXT TO IMAGE ---
 HF_TOKEN=os.environ.get("HF_TOKEN","")
 TEXT_TO_IMAGE_MODEL=os.environ.get("TEXT_TO_IMAGE_MODEL","black-forest-labs/FLUX.1-schnell")
