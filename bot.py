@@ -58,7 +58,7 @@ API_HASH = os.environ.get('API_HASH', '')
 STRING_SESSION = os.environ.get('STRING_SESSION', '')
 BOT_PASSWORD = os.environ.get("BOT_PASSWORD", "ptss25")
 RENDER_URL = os.environ.get('RENDER_URL', 'https://samibot-s1h6.onrender.com')
-
+GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
 ADMIN_IDS = []
 admin_ids_str = os.environ.get('ADMIN_IDS', '')
 if admin_ids_str:
@@ -1208,6 +1208,7 @@ async def handle_text_to_image(update, context):
         await update.message.reply_photo(photo=out,caption=f"🎨 Generated image\n\nPrompt: {prompt[:900]}",reply_markup=tool_done_kb()); await status.edit_text("✅ Image generated successfully!")
     except Exception as e: await status.edit_text("❌ Text-to-Image failed.\n\n"+html.escape(str(e)[:1500]),parse_mode=ParseMode.HTML)
     finally: context.user_data["state"]=None
+        
 # --- VOICE TO TEXT (GROQ + GOOGLE FALLBACK) ---
 async def handle_voice_to_text(update, context, language):
     if not update.message.voice and not update.message.audio:
@@ -1283,6 +1284,7 @@ async def handle_voice_to_text(update, context, language):
     except Exception as e:
         await status_msg.edit_text(f"❌ Transcription failed: {e}")
         context.user_data['state'] = None
+
 
 # --- POWERFUL MULTI-SOURCE VIDEO DOWNLOADER ---
 # Supported input: YouTube, TikTok, Instagram, Facebook.
