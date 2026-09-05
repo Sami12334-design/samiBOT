@@ -343,6 +343,11 @@ async def menu_callback(update, context):
         return
 
     data = query.data
+    # Manager text-entry state must never leak into unrelated buttons.
+    # Otherwise a later normal message is incorrectly interpreted as a user ID.
+    if not (data.startswith("mm_") or data == "message_manager"):
+        for _key in ("mm_input", "mm_duration_kind", "mm_reply_to", "mm_keyword_tokens"):
+            context.user_data.pop(_key, None)
     if data.startswith("mm_") or data in {"message_manager"}:
         if await handle_mm_callback(update, context, data): return
     if data.startswith("vd_"):
@@ -394,7 +399,23 @@ async def menu_callback(update, context):
     elif data == "qr_menu":
         kb=[[InlineKeyboardButton("📷 Scan / Read QR",callback_data="qr_scan"),InlineKeyboardButton("➕ Create QR",callback_data="qr_create")],[InlineKeyboardButton("⬅️ Back",callback_data="converter")]]
         await query.message.reply_text("📱 QR CODE\n\nScan any readable QR image, or create a QR code from text/link.",reply_markup=InlineKeyboardMarkup(kb))
+    elif data == "qr_scan":
+        # Explicit scan action was previously missing from the callback router.
+        # That made the button appear to do nothing.
+        context.user_data.pop("mm_input", None)
+        context.user_data.pop("mm_duration_kind", None)
+        context.user_data.pop("mm_reply_to", None)
+        context.user_data['state']='qr_scan'
+        await query.answer("Send a QR image")
+        await query.message.reply_text(
+            "📷 SCAN / READ QR\n\n"
+            "Send a photo containing a QR code.\n"
+            "You can also send the QR image as an image document."
+        )
     elif data == "qr_create":
+        context.user_data.pop("mm_input", None)
+        context.user_data.pop("mm_duration_kind", None)
+        context.user_data.pop("mm_reply_to", None)
         context.user_data['state']='qr_create'; await query.message.reply_text("➕ CREATE QR\n\nSend any text or link to turn it into a QR code.")
         await query.message.reply_text("📷 **IMAGE FORMAT CONVERTER**\n\nChoose a conversion:", reply_markup=InlineKeyboardMarkup(kb))
     elif data == "doc_fmt_menu":
@@ -2404,9 +2425,19 @@ def mm_reason(event, user_id, text):
     return None
 
 async def mm_refuse(event, reason):
+    # Telegram has already delivered the incoming message to the connected
+    # account by the time Telethon receives the update. We cannot prevent the
+    # sender-side "delivered" state, but we can immediately revoke the message
+    # from the private chat and leave a polite automated response. Telethon
+    # supports deleting incoming private messages for everyone with revoke=True.
     try:
         await event.respond('👋 Thanks for your message. The owner is not accepting this message right now. Please try again later.')
-    except Exception as e: print('Manager refusal error:',e)
+    except Exception as e:
+        print('Manager refusal response error:', e)
+    try:
+        await event.delete(revoke=True)
+    except Exception as e:
+        print('Manager revoke error:', e)
 
 def mm_message_preview(event):
     text=(getattr(event,'raw_text','') or '').strip()
@@ -2509,7 +2540,9 @@ async def mm_set_rule_duration(update, context, kind, value):
                 if hashlib.sha1(k.encode('utf-8')).hexdigest()[:10]==token: keyword=k; break
         if keyword: r['keyword_rules'][keyword]=until
         else: await q.answer('Keyword no longer exists',show_alert=True); return
-    mm_save(r); await q.answer('Saved');
+    mm_save(r)
+    for _key in ('mm_input','mm_duration_kind','mm_reply_to'): context.user_data.pop(_key,None)
+    await q.answer('Saved')
     if kind=='everyone': await mm_block_menu(update,context)
     elif kind in {'links','videos'}: await mm_filter_menu(update,context)
     elif kind.startswith('user:'): await mm_show_blocked(update,context)
@@ -2518,7 +2551,9 @@ async def mm_set_rule_duration(update, context, kind, value):
 async def handle_mm_callback(update, context, data):
     q=update.callback_query; uid=update.effective_user.id
     if not is_authenticated(uid) or not is_admin(uid): await q.answer('Admin only',show_alert=True); return True
-    if data=='message_manager': await q.answer(); await mm_show(update,context); return True
+    if data=='message_manager':
+        for _key in ('mm_input','mm_duration_kind','mm_reply_to'): context.user_data.pop(_key,None)
+        await q.answer(); await mm_show(update,context); return True
     if data=='mm_toggle':
         r=mm_get_rules(); r['messaging']=0 if r['messaging'] else 1; mm_save(r); await q.answer('Messaging '+('ON' if r['messaging'] else 'OFF')); await mm_show(update,context); return True
     if data=='mm_block': await q.answer(); await mm_block_menu(update,context); return True
@@ -2602,31 +2637,88 @@ def create_qr_image_sync(text):
     return qr.make_image(fill_color='black',back_color='white').convert('RGB')
 
 def scan_qr_image_sync(data):
-    arr=np.frombuffer(data,dtype=np.uint8); img=cv2.imdecode(arr,cv2.IMREAD_COLOR)
-    if img is None: return []
-    detector=cv2.QRCodeDetector(); results=[]
-    try:
-        ok, decoded, points, _ = detector.detectAndDecodeMulti(img)
-        if ok and decoded:
-            results.extend([x for x in decoded if x])
-    except Exception: pass
-    if not results:
+    """Read one or multiple QR codes locally with OpenCV.
+    Uses several preprocessing passes because Telegram images can be
+    compressed, rotated, dark, or low-contrast.
+    """
+    arr=np.frombuffer(data,dtype=np.uint8)
+    original=cv2.imdecode(arr,cv2.IMREAD_COLOR)
+    if original is None:
+        return []
+
+    # Keep processing bounded on Render while improving small QR detection.
+    h,w=original.shape[:2]
+    scale=1.0
+    if max(h,w) < 1600:
+        scale=min(2.0,1600/max(h,w))
+    elif max(h,w) > 3000:
+        scale=3000/max(h,w)
+    if scale != 1.0:
+        base=cv2.resize(original,None,fx=scale,fy=scale,interpolation=cv2.INTER_CUBIC)
+    else:
+        base=original
+
+    detector=cv2.QRCodeDetector()
+    results=[]
+
+    def add(value):
+        value=(value or '').strip()
+        if value and value not in results:
+            results.append(value)
+
+    def scan(img):
         try:
-            value, points, _ = detector.detectAndDecode(img)
-            if value: results.append(value)
-        except Exception: pass
+            ok, decoded, _, _ = detector.detectAndDecodeMulti(img)
+            if ok and decoded:
+                for value in decoded:
+                    add(value)
+        except Exception as e:
+            print('QR multi pass:',e)
+        try:
+            value, _, _ = detector.detectAndDecode(img)
+            add(value)
+        except Exception as e:
+            print('QR single pass:',e)
+
+    gray=cv2.cvtColor(base,cv2.COLOR_BGR2GRAY)
+    variants=[base,gray]
+    try:
+        variants.append(cv2.equalizeHist(gray))
+    except Exception:
+        pass
+    try:
+        variants.append(cv2.adaptiveThreshold(gray,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY,31,5))
+    except Exception:
+        pass
+
+    for img in variants:
+        scan(img)
+        if results:
+            break
+
     return results
+
 
 async def handle_qr_photo(update, context):
     if context.user_data.get('state')!='qr_scan': return False
-    photo=update.message.photo[-1]; f=await context.bot.get_file(photo.file_id); b=BytesIO(); await f.download_to_memory(b); data=b.getvalue()
-    status=await update.message.reply_text('🔍 Scanning QR code…')
     try:
+        photo=update.message.photo[-1]
+        f=await context.bot.get_file(photo.file_id)
+        b=BytesIO()
+        await f.download_to_memory(b)
+        data=b.getvalue()
+        status=await update.message.reply_text('🔍 Scanning QR code…')
         vals=await asyncio.to_thread(scan_qr_image_sync,data)
-        if not vals: await status.edit_text('❌ No readable QR code was found in this image.')
-        else: await status.edit_text('✅ QR code detected:\n\n'+'\n\n'.join(vals),reply_markup=tool_done_kb())
-    except Exception as e: await status.edit_text('❌ QR scan failed: '+str(e)[:1000])
-    context.user_data['state']=None; return True
+        if vals:
+            await status.edit_text('✅ QR code detected:\n\n'+'\n\n'.join(vals),reply_markup=tool_done_kb())
+            context.user_data['state']=None
+        else:
+            await status.edit_text('❌ No readable QR code was found.\n\nTry a clearer, closer image with the whole QR code visible.')
+            # Keep scan mode active so the user can immediately send another image.
+    except Exception as e:
+        await update.message.reply_text('❌ QR scan failed: '+str(e)[:1000])
+    return True
+
 
 async def handle_qr_create(update, context):
     if context.user_data.get('state')!='qr_create': return False
