@@ -14,6 +14,7 @@ from io import BytesIO
 import json
 import hashlib
 import base64
+import speech_recognition as sr
 from datetime import datetime, timedelta
 from flask import Flask
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageChops
