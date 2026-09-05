@@ -1912,14 +1912,14 @@ async def handle_image_to_text(update, context):
             context.user_data['state'] = None
             return
 
-        # 3. Run OCR in a separate thread to prevent the bot from freezing
+        # 3. Run OCR in a separate thread with a timeout
         def do_ocr():
             from rapidocr_onnxruntime import RapidOCR
             ocr = RapidOCR()
-            result, elapse = ocr(img_cv)  # Feed numpy array directly
+            result, elapse = ocr(img_cv)
             return result
 
-        result = await asyncio.to_thread(do_ocr)
+        result = await asyncio.wait_for(asyncio.to_thread(do_ocr), timeout=90)
 
         if not result:
             await status_msg.edit_text("❌ No text found in the image.")
@@ -1927,33 +1927,25 @@ async def handle_image_to_text(update, context):
             return
 
         extracted_text = "\n".join([line[1] for line in result])
-
-        await update.message.reply_text(
-            f"📝 **Extracted Text:**\n\n{extracted_text}",
-            reply_markup=tool_done_kb()
-        )
+        await update.message.reply_text(f"📝 **Extracted Text:**\n\n{extracted_text}", reply_markup=tool_done_kb())
         await status_msg.edit_text("✅ Text extraction complete!")
         context.user_data['state'] = None
 
+    except asyncio.TimeoutError:
+        await status_msg.edit_text("❌ OCR timed out after 90 seconds. Try a smaller, clearer image.")
+        context.user_data['state'] = None
+
     except ImportError:
-        await status_msg.edit_text(
-            "❌ OCR module not found!\n\n"
-            "Please add `rapidocr_onnxruntime` to your `requirements.txt` and redeploy."
-        )
+        await status_msg.edit_text("❌ OCR module not found!\n\nPlease add `rapidocr_onnxruntime>=1.4` to your `requirements.txt` and redeploy.")
         context.user_data['state'] = None
 
     except MemoryError:
-        await status_msg.edit_text(
-            "❌ Out of memory (RAM) while running OCR!\n\n"
-            "The free Render instance has only 512MB. "
-            "Please upgrade to a paid plan or try a smaller image."
-        )
+        await status_msg.edit_text("❌ Out of memory (RAM)! Please upgrade to a paid Render plan or use a smaller image.")
         context.user_data['state'] = None
 
     except Exception as e:
-        await status_msg.edit_text(f"❌ OCR failed: {e}")
+        await status_msg.edit_text(f"❌ OCR failed: {type(e).__name__}: {str(e)[:500]}")
         context.user_data['state'] = None
-
 async def process_image_pdf(update, context):
     query = update.callback_query
     if query: await query.answer()
