@@ -555,7 +555,7 @@ async def handle_photo_edit_selection(update, context, data):
     filter_name = "Original"
     if data == "edit_orig": filter_name = "Original"
     elif data == "edit_hd":
-        # Professional local enhancement: 4x/2000px upscale + denoise + local contrast + natural color + crisp edges.
+             # Professional local enhancement: 4x/2000px upscale + denoise + local contrast + natural color + crisp edges.
         # No generative AI/API is used here.
         src = img.convert("RGB")
         target_min = 2000
@@ -568,48 +568,39 @@ async def handle_photo_edit_selection(update, context, data):
             ratio = max_dim / max(nw, nh)
             nw, nh = int(nw * ratio), int(nh * ratio)
         img = src.resize((nw, nh), Image.Resampling.LANCZOS)
+
         # Mild noise cleanup without destroying skin/texture.
         img = img.filter(ImageFilter.MedianFilter(size=3))
-        # Natural tonal lift and controlled micro-contrast.
-        img = ImageEnhance.Contrast(img).enhance(1.10)
-        img = ImageEnhance.Color(img).enhance(1.08)
-        img = ImageEnhance.Brightness(img).enhance(1.02)
-        img = ImageEnhance.Sharpness(img).enhance(1.65)
-        # Unsharp mask for crisp edges.
-        img = img.filter(ImageFilter.UnsharpMask(radius=1.6, percent=145, threshold=3))
-        filter_name = f"HD Pro • {nw}×{nh}"
-    elif data == "edit_bw":
-        img = ImageOps.grayscale(img); filter_name = "Black & White"
-    elif data == "edit_sepia":
-        sepia_matrix = (0.393, 0.769, 0.189, 0, 0.349, 0.686, 0.168, 0, 0.272, 0.534, 0.131, 0)
-        img = img.convert("RGB", sepia_matrix); filter_name = "Vintage Sepia"
-    elif data == "edit_vivid":
-        img = ImageEnhance.Color(img).enhance(1.5); img = ImageEnhance.Contrast(img).enhance(1.2); filter_name = "Vivid"
-    elif data == "edit_sharp":
-        img = img.filter(ImageFilter.SHARPEN); filter_name = "Sharpen"
-    elif data == "edit_bright":
-        img = ImageEnhance.Brightness(img).enhance(1.3); filter_name = "Brighten"
-    elif data == "edit_dark":
-        img = ImageEnhance.Brightness(img).enhance(0.7); filter_name = "Darken"
-    elif data == "edit_blur":
-        img = img.filter(ImageFilter.GaussianBlur(radius=2)); filter_name = "Soft Blur"
-    elif data == "edit_pixel":
-        small = img.resize((64, 64), Image.BILINEAR); img = small.resize((new_width, new_height), Image.NEAREST); filter_name = "Pixel Art"
-    elif data == "edit_invert":
-        img = ImageOps.invert(img.convert('RGB')); filter_name = "Invert"
-    elif data == "edit_sketch":
-        gray = img.convert('L'); invert = ImageOps.invert(gray); blur = invert.filter(ImageFilter.GaussianBlur(radius=5)); img = ImageChops.dodge(gray, blur); filter_name = "Sketch"
-    elif data == "edit_emboss":
-        img = img.filter(ImageFilter.EMBOSS); filter_name = "Emboss"
-    elif data == "edit_poster":
-        img = ImageOps.posterize(img.convert('RGB'), bits=3); filter_name = "Posterize"
-    elif data == "edit_solar":
-        img = ImageOps.solarize(img.convert('RGB'), threshold=128); filter_name = "Solarize"
-    out_bytes = BytesIO()
-    img.save(out_bytes, format='JPEG', quality=95)
-    out_bytes.seek(0)
-    await query.message.reply_photo(photo=out_bytes, caption=f"✅ Applied: **{filter_name}**", reply_markup=tool_done_kb())
 
+        # --- Local contrast boost (CLAHE-style) for real "pop" ---
+        try:
+            import numpy as np
+            import cv2
+            arr = np.array(img)
+            lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
+            l, a, b = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+            l = clahe.apply(l)
+            lab = cv2.merge((l, a, b))
+            arr = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+            img = Image.fromarray(arr)
+        except ImportError:
+            # Fallback if cv2/numpy aren't installed: gentle autocontrast per-channel
+            img = ImageOps.autocontrast(img, cutoff=1)
+
+        # Natural tonal lift and controlled micro-contrast.
+        img = ImageEnhance.Contrast(img).enhance(1.15)
+        img = ImageEnhance.Color(img).enhance(1.20)
+        img = ImageEnhance.Brightness(img).enhance(1.03)
+
+        # First pass: broad unsharp to rebuild macro detail lost in upscale.
+        img = img.filter(ImageFilter.UnsharpMask(radius=3.0, percent=120, threshold=2))
+        # Second pass: tight unsharp for crisp micro-edges (eyes, hair, text).
+        img = img.filter(ImageFilter.UnsharpMask(radius=1.2, percent=160, threshold=2))
+
+        img = ImageEnhance.Sharpness(img).enhance(1.3)
+
+        filter_name = f"HD Pro • {nw}×{nh}"
 async def handle_edit_photo(update, context):
     if context.user_data.get('state') != 'awaiting_edit_photo': return
     if not update.message.photo:
