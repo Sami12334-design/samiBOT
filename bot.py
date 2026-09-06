@@ -140,7 +140,7 @@ def save_user_history(user_id, username, first_name, last_name):
     c = conn.cursor()
     c.execute("INSERT INTO user_history (user_id, username, first_name, last_name, date) VALUES (?, ?, ?, ?, ?)", (user_id, username, first_name, last_name, str(__import__('datetime').datetime.now())))
     conn.commit()
-    conn.close()f
+    conn.close()
 
 def get_user_history(user_id):
     conn = sqlite3.connect('bot_data.db')
