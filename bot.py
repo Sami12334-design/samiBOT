@@ -1842,6 +1842,32 @@ def do_download_for_quality(job, output_dir, quality):
     raise RuntimeError("Unknown download source")
     
 # --- PDF, WORD, IMAGE COLLECT ---
+async def handle_pdf_upload(update, context):
+    if context.user_data.get('state') != 'awaiting_pdf':
+        return
+    if not update.message.document:
+        await update.message.reply_text("❌ Please upload a valid PDF document.")
+        return
+    if update.message.document.mime_type != "application/pdf":
+        await update.message.reply_text("❌ The file you uploaded is not a PDF.")
+        return
+
+    # Download and store PDF bytes for later processing
+    file = await context.bot.get_file(update.message.document.file_id)
+    pdf_bytes = BytesIO()
+    await file.download_to_memory(pdf_bytes)
+    pdf_bytes.seek(0)
+    context.user_data['pdf_bytes'] = pdf_bytes
+
+    # Ask user how to process the PDF
+    await update.message.reply_text(
+        "✅ PDF uploaded successfully!\n\n"
+        "How do you want to process it?\n"
+        "• Send a page number (e.g., `3`)\n"
+        "• Send a range (e.g., `1-5`)\n"
+        "• Send `all` to process the entire PDF"
+    )
+    context.user_data['state'] = 'awaiting_pdf_pages'
 async def handle_pdf_pages(update, context):
     if context.user_data.get('state') != 'awaiting_pdf_pages':
         return
@@ -2035,6 +2061,27 @@ async def handle_image_to_text(update, context):
         await status_msg.edit_text(f"❌ OCR failed: {type(e).__name__}: {str(e)[:500]}")
         context.user_data['state'] = None
 async def process_image_pdf(update, context):
+    async def handle_image_collect(update, context):
+    if context.user_data.get('state') != 'awaiting_image_to_pdf':
+        return
+    if not update.message.photo:
+        await update.message.reply_text("❌ Please send a photo.")
+        return
+    try:
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        img_bytes = BytesIO()
+        await file.download_to_memory(img_bytes)
+        img_bytes.seek(0)
+        context.user_data.setdefault('pdf_images', []).append(img_bytes)
+        count = len(context.user_data['pdf_images'])
+        if count >= 10:
+            await update.message.reply_text("✅ Maximum 10 images reached. Click 'Done' to create PDF.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done", callback_data="img_pdf_done")]]))
+        else:
+            await update.message.reply_text(f"✅ Image {count}/10 added. Send more or click 'Done'.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done", callback_data="img_pdf_done")]]))
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error saving image: {e}")
+        
     query = update.callback_query
     if query: await query.answer()
     if not context.user_data.get('pdf_images'):
