@@ -2059,8 +2059,7 @@ async def handle_image_to_text(update, context):
     except Exception as e:
         await status_msg.edit_text(f"❌ OCR failed: {type(e).__name__}: {str(e)[:500]}")
         context.user_data['state'] = None
-async def process_image_pdf(update, context):
-    async def handle_image_collect(update, context):
+async def handle_image_collect(update, context):
     if context.user_data.get('state') != 'awaiting_image_to_pdf':
         return
     if not update.message.photo:
@@ -2080,7 +2079,8 @@ async def process_image_pdf(update, context):
             await update.message.reply_text(f"✅ Image {count}/10 added. Send more or click 'Done'.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done", callback_data="img_pdf_done")]]))
     except Exception as e:
         await update.message.reply_text(f"❌ Error saving image: {e}")
-        
+
+async def process_image_pdf(update, context):
     query = update.callback_query
     if query: await query.answer()
     if not context.user_data.get('pdf_images'):
@@ -2100,7 +2100,6 @@ async def process_image_pdf(update, context):
         if query: await query.edit_message_text(error_msg)
         else: await update.message.reply_text(error_msg)
         context.user_data['state'] = None; context.user_data['pdf_images'] = []
-
 # --- OTHER FEATURES (Profile, Search, etc.) ---
 async def _inbox_title(entity):
     return (
