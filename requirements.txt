@@ -17,3 +17,4 @@ fpdf2>=2.8.7
 uharfbuzz>=0.52
 fonttools>=4.55
 SpeechRecognition>=3.10
+huggingface_hub
