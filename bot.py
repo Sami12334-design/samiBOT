@@ -29,7 +29,6 @@ from telethon.sessions import StringSession
 from telethon.utils import get_peer_id
 from telethon.errors import (FloodWaitError, ChannelPrivateError, UsernameNotOccupiedError, MessageIdInvalidError)
 import pymupdf
-from groq import Groq
 import img2pdf
 from pdf2docx import Converter
 from pptx import Presentation
