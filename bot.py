@@ -1911,7 +1911,7 @@ async def handle_image_to_text(update, context):
         await update.message.reply_text("❌ Please upload an image.")
         return
 
-    status_msg = await update.message.reply_text("⏳ Sending image to OCR API...")
+    status_msg = await update.message.reply_text("⏳ please wait...")
 
     try:
         # 1. Get the photo
