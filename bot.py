@@ -37,6 +37,7 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from PIL import ImageDraw
 import yt_dlp
 import imageio_ffmpeg
 import qrcode
@@ -526,23 +527,59 @@ async def menu_callback(update, context):
         return
 
 # --- PHOTO EDITING ---
+def build_edit_keyboard(page=1):
+    """Returns an InlineKeyboardMarkup for the given page."""
+    if page == 1:
+        buttons = [
+            [("🖼️ Original", "edit_orig"), ("✨ HD Pro", "edit_hd"), ("🎨 Vivid", "edit_vivid")],
+            [("⬛ B&W", "edit_bw"), ("🟤 Sepia", "edit_sepia"), ("🔪 Sharpen", "edit_sharp")],
+            [("☀️ Brighten", "edit_bright"), ("🌙 Darken", "edit_dark"), ("🌫️ Blur", "edit_blur")],
+            [("🟥 Pixel", "edit_pixel"), ("🔄 Invert", "edit_invert"), ("✏️ Sketch", "edit_sketch")],
+            [("🧊 Emboss", "edit_emboss"), ("🎞️ Poster", "edit_poster"), ("🔥 Solarize", "edit_solar")],
+            [("➡️ More Effects", "edit_page2"), ("🗑️ Remove Photo", "edit_clear")],
+        ]
+    else:  # page 2
+        buttons = [
+            [("🎭 Cartoon", "edit_cartoon"), ("🖌️ Oil Paint", "edit_oil"), ("💧 Watercolor", "edit_watercolor")],
+            [("✨ Glow", "edit_glow"), ("💡 Neon", "edit_neon"), ("📻 Vintage", "edit_vintage")],
+            [("🪞 Mirror", "edit_mirror"), ("↕️ Flip", "edit_flip"), ("🔄 Rotate 90°", "edit_rotate")],
+            [("🌑 Vignette", "edit_vignette"), ("📈 High Contrast", "edit_contrast"), ("🎨 Desaturate", "edit_saturation")],
+            [("⬅️ Back", "edit_page1"), ("🗑️ Remove Photo", "edit_clear")],
+        ]
+    
+    keyboard = [
+        [InlineKeyboardButton(text, callback_data=cb) for text, cb in row]
+        for row in buttons
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
 async def handle_photo_edit_selection(update, context, data):
     query = update.callback_query
     await query.answer()
+
     if not context.user_data.get('edit_image'):
         await query.message.reply_text("❌ No image found. Please send a photo first.")
         return
+
     img = context.user_data['edit_image']
+
+    # Handle navigation and special actions
     if data == "edit_clear":
-        context.user_data.pop("edit_image",None); context.user_data.pop("bg_image",None); context.user_data["state"]=None
-        await query.message.reply_text("🗑️ Current photo removed. Send another photo to edit."); return
+        context.user_data.pop("edit_image", None)
+        context.user_data.pop("bg_image", None)
+        context.user_data["state"] = None
+        await query.message.reply_text("🗑️ Current photo removed. Send another photo to edit.")
+        return
 
     if data == "edit_remove_bg":
         await query.message.reply_text("ℹ️ Background removal is disabled in this version.")
         return
+
     if data == "edit_change_bg":
         await query.message.reply_text("ℹ️ Background changing is disabled in this version.")
         return
+
     if data == "edit_remove_bg_legacy":
         async def run_bg_removal():
             def do_work():
@@ -555,14 +592,24 @@ async def handle_photo_edit_selection(update, context, data):
             out_bytes = BytesIO()
             out_img.save(out_bytes, format='PNG')
             out_bytes.seek(0)
-            await query.message.reply_document(document=out_bytes, filename="no_bg.png", caption="✅ Background removed!", reply_markup=tool_done_kb())
+            await query.message.reply_document(
+                document=out_bytes,
+                filename="no_bg.png",
+                caption="✅ Background removed!",
+                reply_markup=tool_done_kb()
+            )
         except Exception as e:
             await query.message.reply_text(f"❌ Background removal failed: {e}")
         return
-    if data == "edit_change_bg":
-        await query.message.reply_text("🖼️ **CHANGE BACKGROUND**\n\nStep 1/2: Please upload the **background image** you want to use.")
-        context.user_data['state'] = 'awaiting_bg_upload'
+
+    # Page navigation
+    if data in ("edit_page1", "edit_page2"):
+        page = 1 if data == "edit_page1" else 2
+        kb = build_edit_keyboard(page=page)
+        await query.edit_message_text("🎨 Choose an editing effect:", reply_markup=kb)
         return
+
+    # Normalise image size
     max_side = 4096
     if img.width >= img.height:
         new_width = max_side
@@ -571,11 +618,16 @@ async def handle_photo_edit_selection(update, context, data):
         new_height = max_side
         new_width = int(img.width * (max_side / img.height))
     img = img.resize((new_width, new_height), Image.LANCZOS)
+
     filter_name = "Original"
-    if data == "edit_orig": filter_name = "Original"
+    description = ""
+
+    # ─── Apply selected effect ───
+    if data == "edit_orig":
+        filter_name = "Original"
+        description = "No changes applied."
     elif data == "edit_hd":
-             # Professional local enhancement: 4x/2000px upscale + denoise + local contrast + natural color + crisp edges.
-        # No generative AI/API is used here.
+        # HD Pro enhancement
         src = img.convert("RGB")
         target_min = 2000
         scale = max(4.0, target_min / max(1, min(src.size)))
@@ -587,14 +639,8 @@ async def handle_photo_edit_selection(update, context, data):
             ratio = max_dim / max(nw, nh)
             nw, nh = int(nw * ratio), int(nh * ratio)
         img = src.resize((nw, nh), Image.Resampling.LANCZOS)
-
-        # Mild noise cleanup without destroying skin/texture.
         img = img.filter(ImageFilter.MedianFilter(size=3))
-
-        # --- Local contrast boost (CLAHE-style) for real "pop" ---
         try:
-        
-    
             arr = np.array(img)
             lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
             l, a, b = cv2.split(lab)
@@ -604,63 +650,245 @@ async def handle_photo_edit_selection(update, context, data):
             arr = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
             img = Image.fromarray(arr)
         except ImportError:
-            # Fallback if cv2/numpy aren't installed: gentle autocontrast per-channel
             img = ImageOps.autocontrast(img, cutoff=1)
-
-        # Natural tonal lift and controlled micro-contrast.
         img = ImageEnhance.Contrast(img).enhance(1.15)
         img = ImageEnhance.Color(img).enhance(1.20)
         img = ImageEnhance.Brightness(img).enhance(1.03)
-
-        # First pass: broad unsharp to rebuild macro detail lost in upscale.
         img = img.filter(ImageFilter.UnsharpMask(radius=3.0, percent=120, threshold=2))
-        # Second pass: tight unsharp for crisp micro-edges (eyes, hair, text).
         img = img.filter(ImageFilter.UnsharpMask(radius=1.2, percent=160, threshold=2))
-
         img = ImageEnhance.Sharpness(img).enhance(1.3)
-
         filter_name = f"HD Pro • {nw}×{nh}"
+        description = "Upscaled, denoised, sharpened, and colour-boosted."
+
+    elif data == "edit_vivid":
+        img = ImageEnhance.Contrast(img).enhance(1.3)
+        img = ImageEnhance.Color(img).enhance(1.5)
+        filter_name = "Vivid"
+        description = "Colours pop with extra saturation."
+
+    elif data == "edit_bw":
+        img = ImageOps.grayscale(img).convert("RGB")
+        filter_name = "B&W"
+        description = "Classic black & white."
+
+    elif data == "edit_sepia":
+        sepia = ImageOps.colorize(ImageOps.grayscale(img), black="#704214", white="#C0A080")
+        img = sepia.convert("RGB")
+        filter_name = "Sepia"
+        description = "Warm, nostalgic tone."
+
+    elif data == "edit_sharp":
+        img = img.filter(ImageFilter.SHARPEN)
+        filter_name = "Sharpen"
+        description = "Crisp, defined edges."
+
+    elif data == "edit_bright":
+        img = ImageEnhance.Brightness(img).enhance(1.5)
+        filter_name = "Brighten"
+        description = "Luminous and airy."
+
+    elif data == "edit_dark":
+        img = ImageEnhance.Brightness(img).enhance(0.5)
+        filter_name = "Darken"
+        description = "Moody and dramatic."
+
+    elif data == "edit_blur":
+        img = img.filter(ImageFilter.GaussianBlur(radius=5))
+        filter_name = "Blur"
+        description = "Soft, dreamy focus."
+
+    elif data == "edit_pixel":
+        small = img.resize((max(1, img.width // 10), max(1, img.height // 10)), Image.NEAREST)
+        img = small.resize((img.width, img.height), Image.NEAREST)
+        filter_name = "Pixel"
+        description = "Retro 8‑bit look."
+
+    elif data == "edit_invert":
+        img = ImageChops.invert(img.convert("RGB"))
+        filter_name = "Invert"
+        description = "Negative colours."
+
+    elif data == "edit_sketch":
+        gray = ImageOps.grayscale(img)
+        edges = gray.filter(ImageFilter.FIND_EDGES)
+        img = edges.convert("RGB")
+        filter_name = "Sketch"
+        description = "Pencil outline effect."
+
+    elif data == "edit_emboss":
+        img = img.filter(ImageFilter.EMBOSS)
+        filter_name = "Emboss"
+        description = "Raised, 3D‑like texture."
+
+    elif data == "edit_poster":
+        img = img.filter(ImageFilter.CONTOUR)
+        filter_name = "Poster"
+        description = "Bold, graphic lines."
+
+    elif data == "edit_solar":
+        img = ImageOps.solarize(img, threshold=128)
+        filter_name = "Solarize"
+        description = "Surreal colour inversion."
+
+    # ─── NEW EFFECTS (added for 100× attraction) ───
+    elif data == "edit_cartoon":
+        try:
+            import cv2
+            arr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+            arr = cv2.bilateralFilter(arr, 9, 75, 75)
+            gray = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
+            edges = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                          cv2.THRESH_BINARY, 9, 10)
+            edges = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+            cartoon = cv2.bitwise_and(arr, edges)
+            img = Image.fromarray(cv2.cvtColor(cartoon, cv2.COLOR_BGR2RGB))
+            filter_name = "Cartoon"
+            description = "Flat colours with bold outlines."
+        except ImportError:
+            img = ImageOps.posterize(img, 4)
+            img = img.filter(ImageFilter.CONTOUR)
+            filter_name = "Cartoon (lite)"
+            description = "Simplified colour posterisation."
+
+    elif data == "edit_oil":
+        img = Image.effect_noise(img.size, 50).convert("RGB")
+        img = img.filter(ImageFilter.SMOOTH_MORE)
+        img = ImageChops.multiply(img, ImageEnhance.Contrast(img).enhance(1.2))
+        filter_name = "Oil Paint"
+        description = "Brush‑stroke aesthetic."
+
+    elif data == "edit_watercolor":
+        img = ImageOps.autocontrast(img, cutoff=2)
+        img = img.filter(ImageFilter.ModeFilter(size=5))
+        img = ImageEnhance.Color(img).enhance(0.8)
+        filter_name = "Watercolor"
+        description = "Soft, washed‑out artistic touch."
+
+    elif data == "edit_glow":
+        blurred = img.filter(ImageFilter.GaussianBlur(radius=8))
+        img = ImageChops.screen(img, blurred)
+        filter_name = "Glow"
+        description = "Ethereal halo effect."
+
+    elif data == "edit_neon":
+        img = ImageEnhance.Color(img).enhance(2.0)
+        img = ImageChops.invert(img)
+        img = ImageFilter.GaussianBlur(radius=2).filter(img)
+        filter_name = "Neon"
+        description = "Electric, glowing colours."
+
+    elif data == "edit_vintage":
+        img = ImageEnhance.Color(img).enhance(0.5)
+        img = ImageEnhance.Contrast(img).enhance(0.9)
+        img = ImageChops.overlay(img, Image.new("RGB", img.size, (255, 220, 180)))
+        filter_name = "Vintage"
+        description = "Retro film looks."
+
+    elif data == "edit_mirror":
+        img = img.transpose(Image.FLIP_LEFT_RIGHT)
+        filter_name = "Mirror"
+        description = "Horizontal reflection."
+
+    elif data == "edit_flip":
+        img = img.transpose(Image.FLIP_TOP_BOTTOM)
+        filter_name = "Flip"
+        description = "Vertical reflection."
+
+    elif data == "edit_rotate":
+        img = img.rotate(90, expand=True)
+        filter_name = "Rotate 90°"
+        description = "Turned sideways."
+
+    elif data == "edit_vignette":
+        width, height = img.size
+        mask = Image.new("L", (width, height), 0)
+        draw = ImageDraw.Draw(mask)
+        draw.ellipse((width/4, height/4, 3*width/4, 3*height/4), fill=255)
+        img = Image.composite(img, Image.new("RGB", (width, height), (0,0,0)), mask)
+        filter_name = "Vignette"
+        description = "Darkened corners."
+
+    elif data == "edit_contrast":
+        img = ImageEnhance.Contrast(img).enhance(1.5)
+        filter_name = "High Contrast"
+        description = "Punchy definition."
+
+    elif data == "edit_saturation":
+        img = ImageEnhance.Color(img).enhance(0.3)
+        filter_name = "Desaturate"
+        description = "Muted, subdued tones."
+
+    else:
+        await query.message.reply_text("❌ Unknown edit option.")
+        return
+
+    # Send the edited image
+    out_bytes = BytesIO()
+    img.save(out_bytes, format='JPEG', quality=95)
+    out_bytes.seek(0)
+    await query.message.reply_photo(
+        photo=out_bytes,
+        caption=f"✨ **{filter_name}**\n{description}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=tool_done_kb()
+    )
+
+
 async def handle_edit_photo(update, context):
-    if context.user_data.get('state') != 'awaiting_edit_photo': return
+    if context.user_data.get('state') != 'awaiting_edit_photo':
+        return
     if not update.message.photo:
         await update.message.reply_text("❌ Please upload an image.")
         return
     status_msg = await update.message.reply_text("⏳ Processing image...")
     try:
-        photo = update.message.photo[-1]; file = await context.bot.get_file(photo.file_id)
-        img_bytes = BytesIO(); await file.download_to_memory(img_bytes); img_bytes.seek(0)
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        img_bytes = BytesIO()
+        await file.download_to_memory(img_bytes)
+        img_bytes.seek(0)
         img = Image.open(img_bytes)
         context.user_data['edit_image'] = img
-        kb = [[InlineKeyboardButton("🖼️ Original", callback_data="edit_orig"), InlineKeyboardButton("✨ HD Pro", callback_data="edit_hd"), InlineKeyboardButton("🎨 Vivid", callback_data="edit_vivid")], [InlineKeyboardButton("⬛ B&W", callback_data="edit_bw"), InlineKeyboardButton("🟤 Sepia", callback_data="edit_sepia"), InlineKeyboardButton("🔪 Sharpen", callback_data="edit_sharp")], [InlineKeyboardButton("☀️ Brighten", callback_data="edit_bright"), InlineKeyboardButton("🌙 Darken", callback_data="edit_dark"), InlineKeyboardButton("🌫️ Blur", callback_data="edit_blur")], [InlineKeyboardButton("🟥 Pixel", callback_data="edit_pixel"), InlineKeyboardButton("🔄 Invert", callback_data="edit_invert"), InlineKeyboardButton("✏️ Sketch", callback_data="edit_sketch")], [InlineKeyboardButton("🧊 Emboss", callback_data="edit_emboss"), InlineKeyboardButton("🎞️ Poster", callback_data="edit_poster"), InlineKeyboardButton("🔥 Solarize", callback_data="edit_solar")], [InlineKeyboardButton("🗑️ Remove Photo", callback_data="edit_clear")]]
-        await status_msg.edit_text("✅ Image loaded!\n\nChoose an editing feature below:", reply_markup=InlineKeyboardMarkup(kb))
+        kb = build_edit_keyboard(page=1)
+        await status_msg.edit_text("✅ Image loaded!\n\nChoose an editing feature below:", reply_markup=kb)
         context.user_data['state'] = None
     except Exception as e:
         await status_msg.edit_text(f"❌ Processing failed: {e}")
         context.user_data['state'] = None
 
+
 async def handle_bg_upload(update, context):
-    if context.user_data.get('state') != 'awaiting_bg_upload': return
+    if context.user_data.get('state') != 'awaiting_bg_upload':
+        return
     if not update.message.photo:
         await update.message.reply_text("❌ Please upload the **background image**.")
         return
     try:
-        photo = update.message.photo[-1]; file = await context.bot.get_file(photo.file_id)
-        img_bytes = BytesIO(); await file.download_to_memory(img_bytes); img_bytes.seek(0)
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        img_bytes = BytesIO()
+        await file.download_to_memory(img_bytes)
+        img_bytes.seek(0)
         context.user_data['bg_image'] = Image.open(img_bytes)
         await update.message.reply_text("✅ Background image received!\n\nStep 2/2: Please upload the **front image**.")
         context.user_data['state'] = 'awaiting_front_upload'
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
+
 async def handle_front_upload(update, context):
-    if context.user_data.get('state') != 'awaiting_front_upload': return
+    if context.user_data.get('state') != 'awaiting_front_upload':
+        return
     if not update.message.photo:
         await update.message.reply_text("❌ Please upload the **front image**.")
         return
     status_msg = await update.message.reply_text("⏳ Changing background... (May take up to 30 seconds)")
     try:
-        photo = update.message.photo[-1]; file = await context.bot.get_file(photo.file_id)
-        img_bytes = BytesIO(); await file.download_to_memory(img_bytes); img_bytes.seek(0)
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        img_bytes = BytesIO()
+        await file.download_to_memory(img_bytes)
+        img_bytes.seek(0)
         front_img = Image.open(img_bytes)
         bg_img = context.user_data['bg_image']
         async def run_bg_change():
@@ -673,14 +901,18 @@ async def handle_front_upload(update, context):
                 return bg_img_resized
             return await asyncio.to_thread(do_work)
         new_img = await run_bg_change()
-        out_bytes = BytesIO(); new_img.save(out_bytes, format='JPEG', quality=95); out_bytes.seek(0)
+        out_bytes = BytesIO()
+        new_img.save(out_bytes, format='JPEG', quality=95)
+        out_bytes.seek(0)
         await update.message.reply_photo(photo=out_bytes, caption="✅ Background changed!", reply_markup=tool_done_kb())
         await status_msg.edit_text("✅ Background change complete!")
-        context.user_data.pop('bg_image', None); context.user_data['state'] = None
+        context.user_data.pop('bg_image', None)
+        context.user_data['state'] = None
     except Exception as e:
         await status_msg.edit_text(f"❌ Background change failed: {e}")
-        context.user_data.pop('bg_image', None); context.user_data['state'] = None
-
+        context.user_data.pop('bg_image', None)
+        context.user_data['state'] = None
+        
 # --- TEXT TO VOICE: LOCAL OFFLINE eSpeak (NO AI API) ---
 # Uses the operating-system speech engine instead of edge-tts/cloud APIs.
 ESPEAK_BIN = os.environ.get("ESPEAK_BIN", "espeak-ng" if os.path.exists("/usr/bin/espeak-ng") else "espeak")
