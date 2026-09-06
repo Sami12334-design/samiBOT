@@ -3365,15 +3365,19 @@ async def handle_link(update, context):
 # --- MAIN EXECUTION ---
 async def main():
     init_db()
-    def keep_alive():
-        while True:
-            self_ping()
-            time.sleep(600)
-    threading.Thread(target=keep_alive, daemon=True).start()
+
+    # Start Flask immediately – use Render's PORT env variable
+    PORT = int(os.environ.get("PORT", 10000))
+    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=PORT), daemon=True).start()
+
+    # Now connect Telethon
     try:
-        await telethon_client.start(); print("Telethon connected!")
+        await telethon_client.start()
+        print("Telethon connected!")
     except Exception as e:
-        print(f"Telethon fail: {e}"); return
+        print(f"Telethon fail: {e}")
+        return
+    # ... rest of your code ...
     bot_app = Application.builder().token(BOT_TOKEN).build()
     global PTB_BOT
     PTB_BOT = bot_app.bot
