@@ -508,12 +508,12 @@ async def menu_callback(update, context):
     elif data == "fetch":
         await query.message.reply_text("🔗 Fetch Telegram\n\nSend me a link (e.g., t.me/channel/123 or t.me/channel/123-130):")
         context.user_data['state'] = 'fetch_link'
-          elif data == "search":
+    elif data == "search":
         await query.message.reply_text("🔎 SEARCH\n\nEnter a keyword to search Telegram globally.\n\nI will prioritize public results outside the chats/channels you already joined.\nExample: Logic mid")
         context.user_data['state'] = 'search_query'
     elif data == "pdf_fetch":
         await query.message.reply_text("📄 PDF FETCH\n\nPlease upload the PDF file directly to this chat.")
-        context.user_data['state'] = 'awaiting_pdf_upload'
+        context.user_data['state'] = 'awaiting_pdf'
     elif data.startswith("posts_"):
         try: page=max(1,int(data.split("_",1)[1]))
         except Exception: page=1
@@ -524,6 +524,7 @@ async def menu_callback(update, context):
         # handles old/stale Telegram buttons created by an older bot version.
         await query.answer("Stories have been removed from Profile.", show_alert=True)
         return
+
 # --- PHOTO EDITING ---
 async def handle_photo_edit_selection(update, context, data):
     query = update.callback_query
@@ -1841,32 +1842,44 @@ def do_download_for_quality(job, output_dir, quality):
     
 # --- PDF, WORD, IMAGE COLLECT ---
 async def handle_pdf_upload(update, context):
-    if context.user_data.get('state') != 'awaiting_pdf_upload':
-        return
+    if context.user_data.get('state') != 'awaiting_pdf': return
     if not update.message.document:
-        await update.message.reply_text("❌ Please upload a valid PDF document.")
-        return
+        await update.message.reply_text("❌ Please upload a valid PDF document."); return
     if update.message.document.mime_type != "application/pdf":
-        await update.message.reply_text("❌ The file you uploaded is not a PDF.")
-        return
+        await update.message.reply_text("❌ The file you uploaded is not a PDF."); return
+    status_msg = await update.message.reply_text("⏳ Processing PDF...")
+    try:
+        file = await context.bot.get_file(update.message.document.file_id)
+        pdf_bytes = BytesIO(); await file.download_to_memory(pdf_bytes); pdf_bytes.seek(0)
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        total_pages = len(doc)
+        text_pages = []; image_pages = []
+        for page_num in range(total_pages):
+            page = doc.load_page(page_num)
+            page_text = page.get_text("text")
+            if page_text.strip(): text_pages.append(page_text)
+            images = page.get_images(full=True)
+            for img in images:
+                base_image = doc.extract_image(img[0])
+                img_bytes = BytesIO(base_image["image"]); img_bytes.seek(0)
+                image_pages.append(img_bytes)
+        doc.close()
+        await status_msg.edit_text("✅ PDF processed. Sending results...")
+        if image_pages:
+            await update.message.reply_text(f"🖼 Found {len(image_pages)} images.")
+            for i, img_bytes in enumerate(image_pages, 1):
+                await update.message.reply_photo(photo=img_bytes, caption=f"Page Image {i}")
+        if text_pages:
+            full_text = "\n\n".join(text_pages)
+            await update.message.reply_text(f"📄 Text from {len(text_pages)} pages.")
+            for i in range(0, len(full_text), 4000):
+                await update.message.reply_text(full_text[i:i+4000])
+        if not image_pages and not text_pages:
+            await status_msg.edit_text("❌ No text or images found.")
+        context.user_data['state'] = None
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Error: {e}"); context.user_data['state'] = None
 
-    # Store the file bytes in context so we can process later
-    file = await context.bot.get_file(update.message.document.file_id)
-    pdf_bytes = BytesIO()
-    await file.download_to_memory(pdf_bytes)
-    pdf_bytes.seek(0)
-    context.user_data['pdf_bytes'] = pdf_bytes
-
-    await update.message.reply_text(
-        "✅ PDF uploaded successfully!\n\n"
-        "Please enter the page number or range you want to process.\n"
-        "Examples:\n"
-        "• 1 (For page 1)\n"
-        "• 1-5 (For pages 1 to 5)\n"
-        "• all (For all pages)"
-    )
-    context.user_data['state'] = 'awaiting_pdf_pages'
-    
 async def handle_pdf_to_word(update, context):
     if context.user_data.get('state') != 'awaiting_pdf_to_word': return
     if not update.message.document:
@@ -3311,13 +3324,25 @@ async def handle_link(update, context):
         elif state == 'friends': await fetch_friends(update, context, text)
         elif state == 'names': await fetch_names(update, context, text)
         return
-    if "t.me" in text:
+          if "t.me" in text:
         username, msg_id, comment_id = parse_tg_link(text)
         if not username:
             await update.message.reply_text("Invalid link format."); return
         try:
             entity = await telethon_client.get_entity(username)
-            if msg_id and comment_id:
+            if msg_id and comment_id and "-" in text:
+                # Range fetch (e.g., t.me/channel/7-11)
+                status_msg = await update.message.reply_text(f"⏳ Fetching {msg_id} to {comment_id}...")
+                messages = await telethon_client.get_messages(entity, min_id=msg_id, max_id=comment_id + 1)
+                if not messages:
+                    await status_msg.edit_text("❌ No messages in that range."); return
+                for idx, msg in enumerate(messages, 1):
+                    if idx % 5 == 0: await status_msg.edit_text(f"Fetching {idx}/{len(messages)}...")
+                    await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=msg.id)
+                    await asyncio.sleep(1)  # Delay to protect server
+                await status_msg.edit_text(f"✅ Range complete! Fetched {len(messages)} messages."); return
+            elif msg_id and comment_id:
+                # Comment fetch (e.g., t.me/channel/123/456)
                 status_msg = await update.message.reply_text(f"⏳ Fetching comment {comment_id}...")
                 try:
                     msg = await telethon_client.get_messages(entity, ids=comment_id)
@@ -3328,26 +3353,14 @@ async def handle_link(update, context):
                         await status_msg.edit_text("❌ Comment ID not found.")
                 except Exception as e:
                     await status_msg.edit_text(f"❌ Could not fetch comment: {e}")
-            elif msg_id and "-" in text:
-                range_pattern = r'https?://t\.me/([a-zA-Z0-9_]+)/(\d+)-(\d+)'
-                m = re.search(range_pattern, text)
-                if m:
-                    msg_id_start = int(m.group(2)); msg_id_end = int(m.group(3))
-                    status_msg = await update.message.reply_text(f"⏳ Fetching {msg_id_start} to {msg_id_end}...")
-                    messages = await telethon_client.get_messages(entity, min_id=msg_id_start, max_id=msg_id_end + 1)
-                    if not messages:
-                        await status_msg.edit_text("❌ No messages in that range."); return
-                    for idx, msg in enumerate(messages, 1):
-                        if idx % 5 == 0: await status_msg.edit_text(f"Fetching {idx}/{len(messages)}...")
-                        await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=msg.id)
-                        await asyncio.sleep(1)  # Delay to protect server
-                    await status_msg.edit_text(f"✅ Range complete! Fetched {len(messages)} messages."); return
             elif msg_id:
+                # Single message fetch (e.g., t.me/channel/123)
                 msg = await telethon_client.get_messages(entity, ids=msg_id)
                 if not msg:
                     await update.message.reply_text("❌ Message not found."); return
-                await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=msg.id)
+                await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=msg_id)
             else:
+                # Batch fetch (channel link, fetch last 10 messages)
                 status_msg = await update.message.reply_text("Fetching batch (max 10)...")
                 messages = await telethon_client.get_messages(entity, limit=10)
                 if not messages:
@@ -3355,7 +3368,7 @@ async def handle_link(update, context):
                 for idx, msg in enumerate(messages, 1):
                     if idx % 5 == 0: await status_msg.edit_text(f"Fetching {idx}/{len(messages)}...")
                     await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=msg.id)
-                    await asyncio.sleep(1)  # Delay to protect server
+                    await asyncio.sleep(1)
                 await status_msg.edit_text(f"✅ Batch complete!")
         except Exception as e:
             await handle_telethon_error(update, e)
@@ -3365,19 +3378,15 @@ async def handle_link(update, context):
 # --- MAIN EXECUTION ---
 async def main():
     init_db()
-
-    # Start Flask immediately – use Render's PORT env variable
-    PORT = int(os.environ.get("PORT", 10000))
-    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=PORT), daemon=True).start()
-
-    # Now connect Telethon
+    def keep_alive():
+        while True:
+            self_ping()
+            time.sleep(600)
+    threading.Thread(target=keep_alive, daemon=True).start()
     try:
-        await telethon_client.start()
-        print("Telethon connected!")
+        await telethon_client.start(); print("Telethon connected!")
     except Exception as e:
-        print(f"Telethon fail: {e}")
-        return
-    # ... rest of your code ...
+        print(f"Telethon fail: {e}"); return
     bot_app = Application.builder().token(BOT_TOKEN).build()
     global PTB_BOT
     PTB_BOT = bot_app.bot
