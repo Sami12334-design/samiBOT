@@ -140,7 +140,7 @@ def save_user_history(user_id, username, first_name, last_name):
     c = conn.cursor()
     c.execute("INSERT INTO user_history (user_id, username, first_name, last_name, date) VALUES (?, ?, ?, ?, ?)", (user_id, username, first_name, last_name, str(__import__('datetime').datetime.now())))
     conn.commit()
-    conn.close()
+    conn.close()f
 
 def get_user_history(user_id):
     conn = sqlite3.connect('bot_data.db')
@@ -2785,7 +2785,7 @@ async def inbox_listener(event):
         except Exception as e:
             print(f"Message Manager Error: {e}")
 
-# ========================= MESSAGE MANAGER =========================
+# MESSAGE MANAGER 
 # The manager is a gatekeeper for private messages received by the connected
 # Telethon user account. It does not change Telegram's native block list.
 PTB_BOT = None
@@ -3165,7 +3165,7 @@ async def handle_mm_input(update, context):
         context.user_data.pop('mm_input',None); context.user_data.pop('mm_reply_to',None); return True
     return False
     
-# =============================== QR CODE ===============================
+# QR CODE
 def create_qr_image_sync(text):
     qr=qrcode.QRCode(version=None,error_correction=qrcode.constants.ERROR_CORRECT_M,box_size=10,border=4)
     qr.add_data(text); qr.make(fit=True)
