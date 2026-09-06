@@ -1842,45 +1842,92 @@ def do_download_for_quality(job, output_dir, quality):
     raise RuntimeError("Unknown download source")
     
 # --- PDF, WORD, IMAGE COLLECT ---
-async def handle_pdf_upload(update, context):
-    if context.user_data.get('state') != 'awaiting_pdf': return
-    if not update.message.document:
-        await update.message.reply_text("❌ Please upload a valid PDF document."); return
-    if update.message.document.mime_type != "application/pdf":
-        await update.message.reply_text("❌ The file you uploaded is not a PDF."); return
+async def handle_pdf_pages(update, context):
+    if context.user_data.get('state') != 'awaiting_pdf_pages':
+        return
+
+    pdf_bytes = context.user_data.get('pdf_bytes')
+    if not pdf_bytes:
+        await update.message.reply_text("❌ PDF session expired. Please upload the PDF again.")
+        context.user_data['state'] = None
+        return
+
+    user_input = (update.message.text or "").strip().lower()
+    if not user_input:
+        await update.message.reply_text("❌ Please send a valid page number, range, or `all`.")
+        return
+
+    if user_input == "all":
+        pages_to_process = None
+    else:
+        match = re.fullmatch(r'(\d+)(?:\s*-\s*(\d+))?', user_input)
+        if not match:
+            await update.message.reply_text("❌ Invalid input. Use a page number, a range like `1-5`, or `all`.")
+            return
+        start_page = int(match.group(1))
+        end_page = int(match.group(2)) if match.group(2) else start_page
+        if end_page < start_page:
+            await update.message.reply_text("❌ The end page must be greater than or equal to the start page.")
+            return
+        pages_to_process = (start_page, end_page)
+
     status_msg = await update.message.reply_text("⏳ Processing PDF...")
     try:
-        file = await context.bot.get_file(update.message.document.file_id)
-        pdf_bytes = BytesIO(); await file.download_to_memory(pdf_bytes); pdf_bytes.seek(0)
+        pdf_bytes.seek(0)
         doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
         total_pages = len(doc)
-        text_pages = []; image_pages = []
-        for page_num in range(total_pages):
+
+        if pages_to_process:
+            start, end = pages_to_process
+            if start < 1 or end > total_pages:
+                await status_msg.edit_text(f"❌ Invalid page range. The PDF has only {total_pages} pages.")
+                context.user_data['state'] = None
+                context.user_data.pop('pdf_bytes', None)
+                return
+            page_numbers = list(range(start - 1, end))
+        else:
+            page_numbers = list(range(total_pages))
+
+        text_pages = []
+        image_pages = []
+
+        for page_num in page_numbers:
             page = doc.load_page(page_num)
             page_text = page.get_text("text")
-            if page_text.strip(): text_pages.append(page_text)
+            if page_text.strip():
+                text_pages.append(page_text)
             images = page.get_images(full=True)
             for img in images:
                 base_image = doc.extract_image(img[0])
-                img_bytes = BytesIO(base_image["image"]); img_bytes.seek(0)
+                img_bytes = BytesIO(base_image["image"])
+                img_bytes.seek(0)
                 image_pages.append(img_bytes)
+
         doc.close()
+
         await status_msg.edit_text("✅ PDF processed. Sending results...")
+
         if image_pages:
-            await update.message.reply_text(f"🖼 Found {len(image_pages)} images.")
+            await update.message.reply_text(f"🖼 Found {len(image_pages)} image(s).")
             for i, img_bytes in enumerate(image_pages, 1):
                 await update.message.reply_photo(photo=img_bytes, caption=f"Page Image {i}")
+
         if text_pages:
             full_text = "\n\n".join(text_pages)
-            await update.message.reply_text(f"📄 Text from {len(text_pages)} pages.")
+            await update.message.reply_text(f"📄 Text from {len(text_pages)} page(s).")
             for i in range(0, len(full_text), 4000):
                 await update.message.reply_text(full_text[i:i+4000])
-        if not image_pages and not text_pages:
-            await status_msg.edit_text("❌ No text or images found.")
-        context.user_data['state'] = None
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Error: {e}"); context.user_data['state'] = None
 
+        if not image_pages and not text_pages:
+            await status_msg.edit_text("❌ No text or images found in the selected pages.")
+
+        context.user_data['state'] = None
+        context.user_data.pop('pdf_bytes', None)
+
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Error: {e}")
+        context.user_data['state'] = None
+        context.user_data.pop('pdf_bytes', None)
 async def handle_pdf_to_word(update, context):
     if context.user_data.get('state') != 'awaiting_pdf_to_word': return
     if not update.message.document:
@@ -3282,6 +3329,7 @@ async def handle_link(update, context):
     if context.user_data.get('state') == 'awaiting_text_to_image': await handle_text_to_image(update, context); return
     if context.user_data.get('state') == 'awaiting_image_to_pdf': await handle_image_collect(update, context); return
     if context.user_data.get('state') == 'awaiting_pdf': await handle_pdf_upload(update, context); return
+    if context.user_data.get('state') == 'awaiting_pdf_pages': await handle_pdf_pages(update, context); return
     if context.user_data.get('state') == 'awaiting_pdf_to_word': await handle_pdf_to_word(update, context); return
     if context.user_data.get('state') == 'awaiting_image_to_text': await handle_image_to_text(update, context); return
     if context.user_data.get('state') == 'awaiting_edit_photo': await handle_edit_photo(update, context); return
@@ -3325,7 +3373,8 @@ async def handle_link(update, context):
         elif state == 'friends': await fetch_friends(update, context, text)
         elif state == 'names': await fetch_names(update, context, text)
         return
-        if "t.me" in text:
+
+    if "t.me" in text:
         username, msg_id, comment_id = parse_tg_link(text)
         if not username:
             await update.message.reply_text("Invalid link format."); return
@@ -3340,7 +3389,7 @@ async def handle_link(update, context):
                 for idx, msg in enumerate(messages, 1):
                     if idx % 5 == 0: await status_msg.edit_text(f"Fetching {idx}/{len(messages)}...")
                     await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=msg.id)
-                    await asyncio.sleep(1)  # Delay to protect server
+                    await asyncio.sleep(1)
                 await status_msg.edit_text(f"✅ Range complete! Fetched {len(messages)} messages."); return
             elif msg_id and comment_id:
                 # Comment fetch (e.g., t.me/channel/123/456)
@@ -3375,7 +3424,6 @@ async def handle_link(update, context):
             await handle_telethon_error(update, e)
     else:
         await update.message.reply_text("👋 Use the menu buttons, or send a Telegram link.")
-        
 # --- MAIN EXECUTION ---
 async def main():
     init_db()
