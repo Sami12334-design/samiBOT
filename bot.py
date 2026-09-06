@@ -10,6 +10,7 @@ import subprocess
 import urllib.request
 import urllib.parse
 import html
+import uuid
 from io import BytesIO
 import json
 import hashlib
@@ -39,8 +40,6 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 import yt_dlp
 import imageio_ffmpeg
 import qrcode
-import cv2
-import numpy as np
 
 try:
     from telethon.tl.functions.stories import GetPeerStoriesRequest, GetStoriesByIDRequest
@@ -182,7 +181,7 @@ def tool_done_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Continue", callback_data="converter"), InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
     ])
-    import uuid
+
 
 def encode_multipart_formdata(fields, files):
     boundary = uuid.uuid4().hex
@@ -199,10 +198,6 @@ def encode_multipart_formdata(fields, files):
         body += b"\r\n"
     body += f"--{boundary}--\r\n".encode()
     return body, f"multipart/form-data; boundary={boundary}"
-
-
-async def safe_send(chat_id, bot, msg, from_chat_id, message_id):
-    # ... (Your existing safe_send code stays here)
 
 async def safe_send(chat_id, bot, msg, from_chat_id, message_id):
     """Copy a Telegram message to the bot chat while preserving media + caption."""
@@ -598,8 +593,8 @@ async def handle_photo_edit_selection(update, context, data):
 
         # --- Local contrast boost (CLAHE-style) for real "pop" ---
         try:
-            import numpy as np
-            import cv2
+        
+    
             arr = np.array(img)
             lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
             l, a, b = cv2.split(lab)
