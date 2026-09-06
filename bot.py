@@ -508,7 +508,7 @@ async def menu_callback(update, context):
     elif data == "fetch":
         await query.message.reply_text("🔗 Fetch Telegram\n\nSend me a link (e.g., t.me/channel/123 or t.me/channel/123-130):")
         context.user_data['state'] = 'fetch_link'
-       elif data == "search":
+          elif data == "search":
         await query.message.reply_text("🔎 SEARCH\n\nEnter a keyword to search Telegram globally.\n\nI will prioritize public results outside the chats/channels you already joined.\nExample: Logic mid")
         context.user_data['state'] = 'search_query'
     elif data == "pdf_fetch":
