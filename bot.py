@@ -182,6 +182,34 @@ def tool_done_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Continue", callback_data="converter"), InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
     ])
+# (Lines above this are your imports and config)
+# ...
+
+# ==================================================================
+# ADD THIS HELPER FUNCTION HERE (Right below tool_done_kb)
+# ==================================================================
+import uuid
+
+def encode_multipart_formdata(fields, files):
+    boundary = uuid.uuid4().hex
+    body = b""
+    for key, value in fields.items():
+        body += f"--{boundary}\r\n".encode()
+        body += f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode()
+        body += f"{value}\r\n".encode()
+    for key, file_data in files.items():
+        body += f"--{boundary}\r\n".encode()
+        body += f'Content-Disposition: form-data; name="{key}"; filename="image.jpg"\r\n'.encode()
+        body += b"Content-Type: image/jpeg\r\n\r\n"
+        body += file_data
+        body += b"\r\n"
+    body += f"--{boundary}--\r\n".encode()
+    return body, f"multipart/form-data; boundary={boundary}"
+
+===========================================================
+
+async def safe_send(chat_id, bot, msg, from_chat_id, message_id):
+    # ... (Your existing safe_send code stays here)
 
 async def safe_send(chat_id, bot, msg, from_chat_id, message_id):
     """Copy a Telegram message to the bot chat while preserving media + caption."""
@@ -1895,53 +1923,76 @@ async def handle_image_to_text(update, context):
         await update.message.reply_text("❌ Please upload an image.")
         return
 
-    status_msg = await update.message.reply_text("⏳ Extracting text from image...")
+    status_msg = await update.message.reply_text("⏳ Sending image to OCR API...")
 
     try:
+        # 1. Get the photo
         photo = update.message.photo[-1]
         file = await context.bot.get_file(photo.file_id)
         img_bytes = BytesIO()
         await file.download_to_memory(img_bytes)
         img_bytes.seek(0)
 
-        # Use Numpy/CV2 to read the image directly
-        img_array = np.frombuffer(img_bytes.getvalue(), np.uint8)
-        img_cv = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-
-        if img_cv is None:
-            await status_msg.edit_text("❌ Could not read the image. Please try another one.")
+        # 2. Check if API Key is set
+        api_key = os.environ.get('OCR_API_KEY', '')
+        if not api_key:
+            await status_msg.edit_text("❌ OCR_API_KEY is missing! Please add it to your Render Environment Variables.")
             context.user_data['state'] = None
             return
 
-        def do_ocr():
-            from rapidocr_onnxruntime import RapidOCR
-            ocr = RapidOCR()
-            result, elapse = ocr(img_cv)
+        # 3. Define the OCR.space API call
+        def ocr_api_request():
+            import urllib.request
+            import json
+            
+            # Prepare multipart form data
+            fields = {
+                "apikey": api_key,
+                "language": "eng",  # Change to "amh" if you have premium and want Amharic
+                "isOverlayRequired": "false",
+                "OCREngine": "2"
+            }
+            files = {"file": img_bytes.getvalue()}
+            body, content_type = encode_multipart_formdata(fields, files)
+
+            req = urllib.request.Request(
+                "https://api.ocr.space/parse/image",
+                data=body,
+                headers={"Content-Type": content_type, "User-Agent": "Mozilla/5.0"},
+                method="POST"
+            )
+            
+            with urllib.request.urlopen(req, timeout=60) as response:
+                result = json.load(response)
             return result
 
-        # Raise timeout to 120 seconds to allow slow model loading
-        result = await asyncio.wait_for(asyncio.to_thread(do_ocr), timeout=120)
+        # 4. Run in a thread so bot doesn't freeze
+        result = await asyncio.to_thread(ocr_api_request)
 
-        if not result:
+        # 5. Parse the result
+        if result.get("IsErroredOnProcessing"):
+            error_msg = result.get("ErrorMessage", "Unknown API error")
+            await status_msg.edit_text(f"❌ OCR API error: {str(error_msg)[:200]}")
+            context.user_data['state'] = None
+            return
+
+        extracted_text = result["ParsedResults"][0]["ParsedText"].strip()
+
+        if not extracted_text:
             await status_msg.edit_text("❌ No text found in the image.")
             context.user_data['state'] = None
             return
 
-        extracted_text = "\n".join([line[1] for line in result])
-        await update.message.reply_text(f"📝 **Extracted Text:**\n\n{extracted_text}", reply_markup=tool_done_kb())
+        # 6. Send the result
+        await update.message.reply_text(
+            f"📝 **Extracted Text:**\n\n{extracted_text}",
+            reply_markup=tool_done_kb()
+        )
         await status_msg.edit_text("✅ Text extraction complete!")
         context.user_data['state'] = None
 
-    except asyncio.TimeoutError:
-        await status_msg.edit_text("❌ OCR timed out after 120 seconds. Try a smaller, clearer image, or upgrade your Render plan.")
-        context.user_data['state'] = None
-
-    except MemoryError:
-        await status_msg.edit_text("❌ Out of memory (RAM)! You are running on the 512MB free tier. Please upgrade to the Starter plan to use OCR.")
-        context.user_data['state'] = None
-
     except ImportError:
-        await status_msg.edit_text("❌ OCR module not found! Please add `rapidocr_onnxruntime>=1.4` to your `requirements.txt`.")
+        await status_msg.edit_text("❌ `uuid` module is missing! Please check your imports.")
         context.user_data['state'] = None
 
     except Exception as e:
