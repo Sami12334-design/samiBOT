@@ -29,6 +29,7 @@ from telethon.sessions import StringSession
 from telethon.utils import get_peer_id
 from telethon.errors import (FloodWaitError, ChannelPrivateError, UsernameNotOccupiedError, MessageIdInvalidError)
 import pymupdf
+from groq import Groq
 import img2pdf
 from pdf2docx import Converter
 from pptx import Presentation
@@ -3324,7 +3325,7 @@ async def handle_link(update, context):
         elif state == 'friends': await fetch_friends(update, context, text)
         elif state == 'names': await fetch_names(update, context, text)
         return
-          if "t.me" in text:
+        if "t.me" in text:
         username, msg_id, comment_id = parse_tg_link(text)
         if not username:
             await update.message.reply_text("Invalid link format."); return
