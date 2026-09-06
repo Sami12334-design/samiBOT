@@ -182,13 +182,7 @@ def tool_done_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Continue", callback_data="converter"), InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
     ])
-# (Lines above this are your imports and config)
-# ...
-
-# ==================================================================
-# ADD THIS HELPER FUNCTION HERE (Right below tool_done_kb)
-# ==================================================================
-import uuid
+    import uuid
 
 def encode_multipart_formdata(fields, files):
     boundary = uuid.uuid4().hex
@@ -206,7 +200,6 @@ def encode_multipart_formdata(fields, files):
     body += f"--{boundary}--\r\n".encode()
     return body, f"multipart/form-data; boundary={boundary}"
 
-===========================================================
 
 async def safe_send(chat_id, bot, msg, from_chat_id, message_id):
     # ... (Your existing safe_send code stays here)
