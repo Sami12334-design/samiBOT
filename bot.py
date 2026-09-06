@@ -3353,6 +3353,7 @@ async def handle_link(update, context):
                     for idx, msg in enumerate(messages, 1):
                         if idx % 5 == 0: await status_msg.edit_text(f"Fetching {idx}/{len(messages)}...")
                         await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=msg.id)
+                        await asyncio.sleep(1)  # Delay to protect server
                     await status_msg.edit_text(f"✅ Range complete! Fetched {len(messages)} messages."); return
             elif msg_id:
                 msg = await telethon_client.get_messages(entity, ids=msg_id)
@@ -3360,19 +3361,20 @@ async def handle_link(update, context):
                     await update.message.reply_text("❌ Message not found."); return
                 await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=msg.id)
             else:
-                status_msg = await update.message.reply_text("Fetching batch (max 20)...")
-                messages = await telethon_client.get_messages(entity, limit=20)
+                status_msg = await update.message.reply_text("Fetching batch (max 10)...")
+                messages = await telethon_client.get_messages(entity, limit=10)
                 if not messages:
                     await status_msg.edit_text("No messages found."); return
                 for idx, msg in enumerate(messages, 1):
                     if idx % 5 == 0: await status_msg.edit_text(f"Fetching {idx}/{len(messages)}...")
                     await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=msg.id)
+                    await asyncio.sleep(1)  # Delay to protect server
                 await status_msg.edit_text(f"✅ Batch complete!")
         except Exception as e:
             await handle_telethon_error(update, e)
     else:
         await update.message.reply_text("👋 Use the menu buttons, or send a Telegram link.")
-
+        
 # --- MAIN EXECUTION ---
 async def main():
     init_db()
