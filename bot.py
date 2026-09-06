@@ -1898,14 +1898,13 @@ async def handle_image_to_text(update, context):
     status_msg = await update.message.reply_text("⏳ Extracting text from image...")
 
     try:
-        # 1. Get the photo
         photo = update.message.photo[-1]
         file = await context.bot.get_file(photo.file_id)
         img_bytes = BytesIO()
         await file.download_to_memory(img_bytes)
         img_bytes.seek(0)
 
-        # 2. Convert directly to a NumPy array (no temp files!)
+        # Use Numpy/CV2 to read the image directly
         img_array = np.frombuffer(img_bytes.getvalue(), np.uint8)
         img_cv = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
 
@@ -1914,14 +1913,14 @@ async def handle_image_to_text(update, context):
             context.user_data['state'] = None
             return
 
-        # 3. Run OCR in a separate thread with a timeout
         def do_ocr():
             from rapidocr_onnxruntime import RapidOCR
             ocr = RapidOCR()
             result, elapse = ocr(img_cv)
             return result
 
-        result = await asyncio.wait_for(asyncio.to_thread(do_ocr), timeout=90)
+        # Raise timeout to 120 seconds to allow slow model loading
+        result = await asyncio.wait_for(asyncio.to_thread(do_ocr), timeout=120)
 
         if not result:
             await status_msg.edit_text("❌ No text found in the image.")
@@ -1934,15 +1933,15 @@ async def handle_image_to_text(update, context):
         context.user_data['state'] = None
 
     except asyncio.TimeoutError:
-        await status_msg.edit_text("❌ OCR timed out after 90 seconds. Try a smaller, clearer image.")
-        context.user_data['state'] = None
-
-    except ImportError:
-        await status_msg.edit_text("❌ OCR module not found!\n\nPlease add `rapidocr_onnxruntime>=1.4` to your `requirements.txt` and redeploy.")
+        await status_msg.edit_text("❌ OCR timed out after 120 seconds. Try a smaller, clearer image, or upgrade your Render plan.")
         context.user_data['state'] = None
 
     except MemoryError:
-        await status_msg.edit_text("❌ Out of memory (RAM)! Please upgrade to a paid Render plan or use a smaller image.")
+        await status_msg.edit_text("❌ Out of memory (RAM)! You are running on the 512MB free tier. Please upgrade to the Starter plan to use OCR.")
+        context.user_data['state'] = None
+
+    except ImportError:
+        await status_msg.edit_text("❌ OCR module not found! Please add `rapidocr_onnxruntime>=1.4` to your `requirements.txt`.")
         context.user_data['state'] = None
 
     except Exception as e:
