@@ -508,11 +508,8 @@ async def menu_callback(update, context):
     elif data == "fetch":
         await query.message.reply_text("🔗 Fetch Telegram\n\nSend me a link (e.g., t.me/channel/123 or t.me/channel/123-130):")
         context.user_data['state'] = 'fetch_link'
-    elif data == "search":
+       elif data == "search":
         await query.message.reply_text("🔎 SEARCH\n\nEnter a keyword to search Telegram globally.\n\nI will prioritize public results outside the chats/channels you already joined.\nExample: Logic mid")
-        context.user_data['state'] = 'search_query'
-          elif data == "search":
-        await query.message.reply_text("🔎 SEARCH\n\nEnter a keyword to search Telegram globally...")
         context.user_data['state'] = 'search_query'
     elif data == "pdf_fetch":
         await query.message.reply_text("📄 PDF FETCH\n\nPlease upload the PDF file directly to this chat.")
@@ -527,7 +524,6 @@ async def menu_callback(update, context):
         # handles old/stale Telegram buttons created by an older bot version.
         await query.answer("Stories have been removed from Profile.", show_alert=True)
         return
-
 # --- PHOTO EDITING ---
 async def handle_photo_edit_selection(update, context, data):
     query = update.callback_query
