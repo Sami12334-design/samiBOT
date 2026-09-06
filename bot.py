@@ -511,9 +511,9 @@ async def menu_callback(update, context):
     elif data == "search":
         await query.message.reply_text("🔎 SEARCH\n\nEnter a keyword to search Telegram globally.\n\nI will prioritize public results outside the chats/channels you already joined.\nExample: Logic mid")
         context.user_data['state'] = 'search_query'
-    elif data == "pdf_fetch":
+       elif data == "pdf_fetch":
         await query.message.reply_text("📄 PDF FETCH\n\nPlease upload the PDF file directly to this chat.")
-        context.user_data['state'] = 'awaiting_pdf'
+        context.user_data['state'] = 'awaiting_pdf_upload'
     elif data.startswith("posts_"):
         try: page=max(1,int(data.split("_",1)[1]))
         except Exception: page=1
@@ -1842,44 +1842,32 @@ def do_download_for_quality(job, output_dir, quality):
     
 # --- PDF, WORD, IMAGE COLLECT ---
 async def handle_pdf_upload(update, context):
-    if context.user_data.get('state') != 'awaiting_pdf': return
+    if context.user_data.get('state') != 'awaiting_pdf_upload':
+        return
     if not update.message.document:
-        await update.message.reply_text("❌ Please upload a valid PDF document."); return
+        await update.message.reply_text("❌ Please upload a valid PDF document.")
+        return
     if update.message.document.mime_type != "application/pdf":
-        await update.message.reply_text("❌ The file you uploaded is not a PDF."); return
-    status_msg = await update.message.reply_text("⏳ Processing PDF...")
-    try:
-        file = await context.bot.get_file(update.message.document.file_id)
-        pdf_bytes = BytesIO(); await file.download_to_memory(pdf_bytes); pdf_bytes.seek(0)
-        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-        total_pages = len(doc)
-        text_pages = []; image_pages = []
-        for page_num in range(total_pages):
-            page = doc.load_page(page_num)
-            page_text = page.get_text("text")
-            if page_text.strip(): text_pages.append(page_text)
-            images = page.get_images(full=True)
-            for img in images:
-                base_image = doc.extract_image(img[0])
-                img_bytes = BytesIO(base_image["image"]); img_bytes.seek(0)
-                image_pages.append(img_bytes)
-        doc.close()
-        await status_msg.edit_text("✅ PDF processed. Sending results...")
-        if image_pages:
-            await update.message.reply_text(f"🖼 Found {len(image_pages)} images.")
-            for i, img_bytes in enumerate(image_pages, 1):
-                await update.message.reply_photo(photo=img_bytes, caption=f"Page Image {i}")
-        if text_pages:
-            full_text = "\n\n".join(text_pages)
-            await update.message.reply_text(f"📄 Text from {len(text_pages)} pages.")
-            for i in range(0, len(full_text), 4000):
-                await update.message.reply_text(full_text[i:i+4000])
-        if not image_pages and not text_pages:
-            await status_msg.edit_text("❌ No text or images found.")
-        context.user_data['state'] = None
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Error: {e}"); context.user_data['state'] = None
+        await update.message.reply_text("❌ The file you uploaded is not a PDF.")
+        return
 
+    # Store the file bytes in context so we can process later
+    file = await context.bot.get_file(update.message.document.file_id)
+    pdf_bytes = BytesIO()
+    await file.download_to_memory(pdf_bytes)
+    pdf_bytes.seek(0)
+    context.user_data['pdf_bytes'] = pdf_bytes
+
+    await update.message.reply_text(
+        "✅ PDF uploaded successfully!\n\n"
+        "Please enter the page number or range you want to process.\n"
+        "Examples:\n"
+        "• 1 (For page 1)\n"
+        "• 1-5 (For pages 1 to 5)\n"
+        "• all (For all pages)"
+    )
+    context.user_data['state'] = 'awaiting_pdf_pages'
+    
 async def handle_pdf_to_word(update, context):
     if context.user_data.get('state') != 'awaiting_pdf_to_word': return
     if not update.message.document:
