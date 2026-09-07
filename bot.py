@@ -522,10 +522,15 @@ async def menu_callback(update, context):
         except Exception: page=1
         await handle_posts_pagination(update, context, page)
         return
-    elif data.startswith("story_"):
-        # Stories were intentionally removed from Profile. This also safely
-        # handles old/stale Telegram buttons created by an older bot version.
-        await query.answer("Stories have been removed from Profile.", show_alert=True)
+       elif data.startswith("story_"):
+        await handle_story_view(update, context)
+        return
+    elif data.startswith("story_nav_"):
+        try:
+            idx = int(data.split("_")[2])
+            await send_story_at_index(update, context, idx)
+        except Exception:
+            await query.answer("Invalid navigation", show_alert=True)
         return
 
 # --- PHOTO EDITING ---
@@ -2466,7 +2471,6 @@ async def open_inbox_chat(update, context, index):
     except Exception as e:
         await query.message.reply_text(f"❌ Could not open conversation: {type(e).__name__}: {e}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Inbox", callback_data="inbox")]]))
 
-
 async def fetch_profile(update, context, target):
     try:
         entity = await telethon_client.get_entity(target)
@@ -2507,11 +2511,11 @@ async def fetch_profile(update, context, target):
                             weeks = int(seconds // 604800)
                             status_text = f"🟢 Last seen {weeks} week{'s' if weeks != 1 else ''} ago"
                 elif isinstance(status, types.UserStatusRecently):
-                    status_text = "🟢 Last seen recently"
+                    status_text = "🟢 Last seen recently (exact time hidden by privacy)"
                 elif isinstance(status, types.UserStatusLastWeek):
-                    status_text = "🟢 Last seen within this week"
+                    status_text = "🟢 Last seen within this week (exact time hidden)"
                 elif isinstance(status, types.UserStatusLastMonth):
-                    status_text = "🟢 Last seen within this month"
+                    status_text = "🟢 Last seen within this month (exact time hidden)"
                 elif isinstance(status, types.UserStatusEmpty):
                     status_text = "⚪ Last seen a long time ago"
         except Exception as e:
@@ -2548,6 +2552,79 @@ async def fetch_profile(update, context, target):
 
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {type(e).__name__}: {e}")
+        async def handle_story_view(update, context):
+    query = update.callback_query
+    await query.answer("Loading stories…")
+
+    entity = context.user_data.get("story_entity")
+    if not entity:
+        await query.edit_message_text("❌ No profile selected. Please search a user again.")
+        return
+
+    # Check if the stories API is available
+    if GetPeerStoriesRequest is None:
+        await query.edit_message_text("❌ Stories are not supported in this version (missing Telethon story modules).")
+        return
+
+    try:
+        # Fetch the peer stories
+        result = await telethon_client(GetPeerStoriesRequest(peer=entity))
+        stories = result.stories
+
+        if not stories:
+            await query.edit_message_text("📭 No stories found for this user.")
+            return
+
+        # Store stories and start with the first one (index 0)
+        context.user_data["stories_list"] = stories
+        context.user_data["story_index"] = 0
+        await send_story_at_index(update, context, 0)
+
+    except Exception as e:
+        await query.edit_message_text(f"❌ Could not load stories: {type(e).__name__}: {e}")
+
+
+async def send_story_at_index(update, context, index):
+    query = update.callback_query
+    stories = context.user_data.get("stories_list", [])
+    if not stories or index < 0 or index >= len(stories):
+        await query.edit_message_text("❌ No more stories.")
+        return
+
+    # Store current index
+    context.user_data["story_index"] = index
+    story = stories[index]
+    total = len(stories)
+
+    # Build navigation buttons
+    nav = []
+    if index > 0:
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"story_nav_{index-1}"))
+    if index < total - 1:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"story_nav_{index+1}"))
+    nav.append(InlineKeyboardButton("⬅️ Back", callback_data="profile"))
+
+    kb = InlineKeyboardMarkup([nav])
+
+    # Download and send the story media
+    media_bytes = BytesIO()
+    await telethon_client.download_media(story.media, file=media_bytes)
+    media_bytes.seek(0)
+
+    caption = f"📖 Story {index+1}/{total}"
+
+    # Detect media type and send
+    if story.media and hasattr(story.media, 'photo'):
+        await query.message.reply_photo(photo=media_bytes, caption=caption, reply_markup=kb)
+    elif story.media and hasattr(story.media, 'document'):
+        mime = getattr(story.media.document, 'mime_type', '')
+        if 'video' in mime:
+            await query.message.reply_video(video=media_bytes, caption=caption, reply_markup=kb)
+        else:
+            await query.message.reply_document(document=media_bytes, caption=caption, reply_markup=kb)
+    else:
+        await query.message.reply_document(document=media_bytes, caption=caption, reply_markup=kb)
+        
 
 # --- FAST GLOBAL TELEGRAM SEARCH ---
 #
