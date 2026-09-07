@@ -522,7 +522,7 @@ async def menu_callback(update, context):
         except Exception: page=1
         await handle_posts_pagination(update, context, page)
         return
-       elif data.startswith("story_"):
+           elif data.startswith("story_"):
         await handle_story_view(update, context)
         return
     elif data.startswith("story_nav_"):
@@ -532,6 +532,7 @@ async def menu_callback(update, context):
         except Exception:
             await query.answer("Invalid navigation", show_alert=True)
         return
+  
 
 # --- PHOTO EDITING ---
 def build_edit_keyboard(page=1):
@@ -2552,7 +2553,10 @@ async def fetch_profile(update, context, target):
 
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {type(e).__name__}: {e}")
-        async def handle_story_view(update, context):
+       # (End of fetch_profile)
+
+
+async def handle_story_view(update, context):
     query = update.callback_query
     await query.answer("Loading stories…")
 
@@ -2567,7 +2571,6 @@ async def fetch_profile(update, context, target):
         return
 
     try:
-        # Fetch the peer stories
         result = await telethon_client(GetPeerStoriesRequest(peer=entity))
         stories = result.stories
 
@@ -2575,7 +2578,6 @@ async def fetch_profile(update, context, target):
             await query.edit_message_text("📭 No stories found for this user.")
             return
 
-        # Store stories and start with the first one (index 0)
         context.user_data["stories_list"] = stories
         context.user_data["story_index"] = 0
         await send_story_at_index(update, context, 0)
@@ -2591,12 +2593,10 @@ async def send_story_at_index(update, context, index):
         await query.edit_message_text("❌ No more stories.")
         return
 
-    # Store current index
     context.user_data["story_index"] = index
     story = stories[index]
     total = len(stories)
 
-    # Build navigation buttons
     nav = []
     if index > 0:
         nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"story_nav_{index-1}"))
@@ -2606,14 +2606,12 @@ async def send_story_at_index(update, context, index):
 
     kb = InlineKeyboardMarkup([nav])
 
-    # Download and send the story media
     media_bytes = BytesIO()
     await telethon_client.download_media(story.media, file=media_bytes)
     media_bytes.seek(0)
 
     caption = f"📖 Story {index+1}/{total}"
 
-    # Detect media type and send
     if story.media and hasattr(story.media, 'photo'):
         await query.message.reply_photo(photo=media_bytes, caption=caption, reply_markup=kb)
     elif story.media and hasattr(story.media, 'document'):
@@ -2624,8 +2622,9 @@ async def send_story_at_index(update, context, index):
             await query.message.reply_document(document=media_bytes, caption=caption, reply_markup=kb)
     else:
         await query.message.reply_document(document=media_bytes, caption=caption, reply_markup=kb)
-        
 
+
+# --- FAST GLOBAL TELEGRAM SEARCH ---
 # --- FAST GLOBAL TELEGRAM SEARCH ---
 #
 # IMPORTANT:
