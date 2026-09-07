@@ -27,6 +27,8 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from telethon import TelegramClient, events, functions, types
 from telethon.sessions import StringSession
 from telethon.utils import get_peer_id
+from datetime import datetime, timedelta
+from telethon import TelegramClient, events, functions, types
 from telethon.errors import (FloodWaitError, ChannelPrivateError, UsernameNotOccupiedError, MessageIdInvalidError)
 import pymupdf
 import img2pdf
@@ -2472,11 +2474,68 @@ async def fetch_profile(update, context, target):
         context.user_data["post_entity"] = entity
         context.user_data["story_entity"] = entity
         save_user_history(entity.id, getattr(entity, "username", None), getattr(entity, "first_name", ""), getattr(entity, "last_name", ""))
+
         first_name = getattr(entity, "first_name", "") or ""
         last_name = getattr(entity, "last_name", "") or ""
         display_name = f"{first_name} {last_name}".strip() or getattr(entity, "title", "Unknown")
-        text = f"<blockquote><b>{display_name}</b>\n@{getattr(entity, 'username', None) or 'N/A'}\n\n{getattr(entity, 'about', 'No bio')}\n\nID: {entity.id}\nVerified: {getattr(entity, 'verified', False)}\nPremium: {getattr(entity, 'premium', False)}\nBot: {getattr(entity, 'bot', False)}</blockquote>"
-        kb = [[InlineKeyboardButton("📰 View Posts", callback_data="posts_1"), InlineKeyboardButton("👁 View Story", callback_data="story_start")], [InlineKeyboardButton("⬅️ Back", callback_data="more")]]
+
+        # ---- Fetch online status ----
+        status_text = "⚪ Unknown status"
+        try:
+            full_user = await telethon_client(functions.users.GetFullUserRequest(entity))
+            status = full_user.users[0].status if full_user.users else None
+
+            if status is not None:
+                if isinstance(status, types.UserStatusOnline):
+                    status_text = "🟢 Online now"
+                elif isinstance(status, types.UserStatusOffline):
+                    if status.was_online:
+                        delta = datetime.now(status.was_online.tzinfo) - status.was_online
+                        seconds = delta.total_seconds()
+                        if seconds < 60:
+                            status_text = "🟢 Last seen just now"
+                        elif seconds < 3600:
+                            minutes = int(seconds // 60)
+                            status_text = f"🟢 Last seen {minutes} minute{'s' if minutes != 1 else ''} ago"
+                        elif seconds < 86400:
+                            hours = int(seconds // 3600)
+                            status_text = f"🟢 Last seen {hours} hour{'s' if hours != 1 else ''} ago"
+                        elif seconds < 604800:
+                            days = int(seconds // 86400)
+                            status_text = f"🟢 Last seen {days} day{'s' if days != 1 else ''} ago"
+                        else:
+                            weeks = int(seconds // 604800)
+                            status_text = f"🟢 Last seen {weeks} week{'s' if weeks != 1 else ''} ago"
+                elif isinstance(status, types.UserStatusRecently):
+                    status_text = "🟢 Last seen recently"
+                elif isinstance(status, types.UserStatusLastWeek):
+                    status_text = "🟢 Last seen within this week"
+                elif isinstance(status, types.UserStatusLastMonth):
+                    status_text = "🟢 Last seen within this month"
+                elif isinstance(status, types.UserStatusEmpty):
+                    status_text = "⚪ Last seen a long time ago"
+        except Exception as e:
+            print(f"Status fetch error: {e}")
+
+        # ---- Build the full profile text ----
+        text = (
+            f"<blockquote><b>{display_name}</b>\n"
+            f"@{getattr(entity, 'username', None) or 'N/A'}\n\n"
+            f"{getattr(entity, 'about', 'No bio')}\n\n"
+            f"ID: {entity.id}\n"
+            f"Verified: {getattr(entity, 'verified', False)}\n"
+            f"Premium: {getattr(entity, 'premium', False)}\n"
+            f"Bot: {getattr(entity, 'bot', False)}\n"
+            f"Status: {status_text}</blockquote>"
+        )
+
+        # ---- Only "View Story" + "Back" buttons (no more posts) ----
+        kb = [
+            [InlineKeyboardButton("👁 View Story", callback_data="story_start")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="more")]
+        ]
+
+        # Send profile photo if available
         try:
             photo = await telethon_client.download_profile_photo(entity, file=BytesIO())
             if photo:
@@ -2486,39 +2545,9 @@ async def fetch_profile(update, context, target):
                 await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
         except Exception:
             await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {type(e).__name__}: {e}")
-
-async def handle_posts_pagination(update, context, page):
-    query = update.callback_query
-    await query.answer()
-    entity = context.user_data.get("post_entity") or context.user_data.get("profile_entity")
-    if not entity:
-        await query.edit_message_text("❌ No profile selected.")
-        return
-    per_page = 5
-    try:
-        messages = await telethon_client.get_messages(entity, limit=(page * per_page))
-    except Exception as e:
-        await query.edit_message_text(f"❌ Could not fetch posts: {e}")
-        return
-    total_posts = len(messages)
-    start = (page - 1) * per_page
-    end = min(start + per_page, total_posts)
-    page_items = messages[start:end]
-    if not page_items:
-        await query.edit_message_text("No more posts to show.")
-        return
-    title = getattr(entity, "title", None) or getattr(entity, "first_name", "User")
-    text = f"📰 POSTS OF {title}\nPage {page}\n\n"
-    for m in page_items:
-        content = (m.message or "").strip()[:80] if m.message else f"[{get_media_type(m)}]"
-        text += f"• {content}\n"
-    kb = []
-    if page > 1: kb.append([InlineKeyboardButton("⬅️ Previous", callback_data=f"posts_{page-1}")])
-    if end < total_posts: kb.append([InlineKeyboardButton("Next ➡️", callback_data=f"posts_{page+1}")])
-    kb.append([InlineKeyboardButton("⬅️ Back to Profile", callback_data="profile")])
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
 
 # --- FAST GLOBAL TELEGRAM SEARCH ---
 #
