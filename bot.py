@@ -929,7 +929,6 @@ async def handle_front_upload(update, context):
         context.user_data['state'] = None
 # --- TEXT TO VOICE: LOCAL OFFLINE eSpeak (NO AI API) ---
 # Uses the operating-system speech engine instead of edge-tts/cloud APIs.
-# No shutil required; uses standard os.path checks to find the binary.
 _espeak_candidates = [
     "/usr/bin/espeak-ng",
     "/usr/local/bin/espeak-ng",
@@ -942,9 +941,11 @@ if not ESPEAK_BIN:
         if os.path.exists(path):
             ESPEAK_BIN = path
             break
+
+# IMPORTANT: If not found, set to None so the system throws a clear error
+# and tells the user to install it on the server.
 if not ESPEAK_BIN:
-    # Fallback to trying to run it from the system PATH
-    ESPEAK_BIN = "espeak-ng" if os.path.exists("/usr/bin/espeak-ng") else "espeak"
+    ESPEAK_BIN = None
 
 # Hard safety limits so a huge paste can't hang a worker thread forever.
 TTS_MAX_CHARS = 4000
@@ -1046,7 +1047,14 @@ def _tts_espeak_sync(text, lang, voice_type, out_path):
     voice, is_requested_lang = _espeak_voice(lang, voice_type)
 
     if not ESPEAK_BIN:
-        raise RuntimeError("eSpeak (espeak-ng) is not installed on this server.")
+        raise RuntimeError(
+            "eSpeak-ng is not installed on this server. "
+            "Please install it by adding a 'build.sh' file to your Render project "
+            "with the following content:\n\n"
+            "apt-get update\n"
+            "apt-get install -y espeak-ng\n\n"
+            "Then set the Render Build Command to: bash build.sh"
+        )
 
     candidates = [voice]
     if "+" in voice:
