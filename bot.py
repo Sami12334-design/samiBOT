@@ -261,11 +261,18 @@ async def start(update, context):
         context.user_data['state'] = 'awaiting_password'
         await update.message.reply_text("🔐 TELEGRAM ASSISTANT\n\nPassword required.\nPlease enter the password to continue.")
         return
-    keyboard = [
-        [InlineKeyboardButton("📥 Inbox", callback_data="inbox"), InlineKeyboardButton("👤 Profile", callback_data="profile")],
-        [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")],
-        [InlineKeyboardButton("➕ More Commands", callback_data="more")]
-    ]
+       if is_admin(user_id):
+        keyboard = [
+            [InlineKeyboardButton("📥 Inbox", callback_data="inbox"), InlineKeyboardButton("👤 Profile", callback_data="profile")],
+            [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")],
+            [InlineKeyboardButton("➕ More Commands", callback_data="more")]
+        ]
+    else:
+        keyboard = [
+            [InlineKeyboardButton("👤 Profile", callback_data="profile")],
+            [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")],
+            [InlineKeyboardButton("➕ More Commands", callback_data="more")]
+        ]
     await update.message.reply_text("🤖 TELEGRAM ASSISTANT\n\nChoose an option:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def logout(update, context):
