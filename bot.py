@@ -410,9 +410,8 @@ async def menu_callback(update, context):
             index = -1
         await open_inbox_chat(update, context, index)
         return
-
-       if data == "main_menu":
-        if is_admin(user_id):
+    if data == "main_menu":
+        if is_admin(user_id):       
             keyboard = [[InlineKeyboardButton("📥 Inbox", callback_data="inbox"), InlineKeyboardButton("👤 Profile", callback_data="profile")], [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")], [InlineKeyboardButton("➕ More Commands", callback_data="more")]]
         else:
             keyboard = [[InlineKeyboardButton("👤 Profile", callback_data="profile")], [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")], [InlineKeyboardButton("➕ More Commands", callback_data="more")]]
