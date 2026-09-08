@@ -928,25 +928,13 @@ async def handle_front_upload(update, context):
         context.user_data.pop('bg_image', None)
         context.user_data['state'] = None
 # --- TEXT TO VOICE: LOCAL OFFLINE eSpeak (NO AI API) ---
-# Uses standard os.path checks to find the binary (no shutil required).
-_espeak_candidates = [
-    "/usr/bin/espeak-ng",
-    "/usr/local/bin/espeak-ng",
-    "/usr/bin/espeak",
-    "/usr/local/bin/espeak",
-]
-ESPEAK_BIN = os.environ.get("ESPEAK_BIN", None)
-if not ESPEAK_BIN:
-    for path in _espeak_candidates:
-        if os.path.exists(path):
-            ESPEAK_BIN = path
-            break
-if not ESPEAK_BIN:
-    ESPEAK_BIN = None
+# Uses shutil.which to find the binary anywhere on the server PATH.
+ESPEAK_BIN = os.environ.get("ESPEAK_BIN", None) or shutil.which("espeak-ng") or shutil.which("espeak")
 
+# Hard safety limits so a huge paste can't hang a worker thread forever.
 TTS_MAX_CHARS = 4000
-TTS_BASE_TIMEOUT = 30
-TTS_TIMEOUT_PER_CHAR = 0.05
+TTS_BASE_TIMEOUT = 30          # seconds, floor
+TTS_TIMEOUT_PER_CHAR = 0.05    # extra seconds per character, roughly scales with speech length
 
 _VOICE_TYPE_VARIANTS = {
     "male": "m3",
@@ -980,8 +968,10 @@ def _load_espeak_voice_langs():
         _available_voice_langs = langs
         return _available_voice_langs
 
+
 def _normalize_lang_code(lang):
     return (lang or "").strip().lower()
+
 
 def _resolve_base_voice(lang):
     norm = _normalize_lang_code(lang)
@@ -998,12 +988,14 @@ def _resolve_base_voice(lang):
             return code
     return None
 
+
 def _espeak_voice(lang, voice_type):
     variant = _VOICE_TYPE_VARIANTS.get(voice_type, "m3")
     base = _resolve_base_voice(lang)
     if base is None:
         return f"en-us+{variant}", False
     return f"{base}+{variant}", True
+
 
 def _voice_actually_works(voice):
     if not ESPEAK_BIN:
@@ -1020,6 +1012,7 @@ def _voice_actually_works(voice):
             os.unlink(path)
         except OSError:
             pass
+
 
 def _tts_espeak_sync(text, lang, voice_type, out_path):
     voice, is_requested_lang = _espeak_voice(lang, voice_type)
@@ -1051,7 +1044,76 @@ def _tts_espeak_sync(text, lang, voice_type, out_path):
 
     raise last_err or RuntimeError("Local eSpeak did not produce an audio file.")
 
-# (Keep your handle_tts and handle_tts_voice_selection functions exactly as they are below this line)
+
+async def handle_tts(update, context, lang):
+    text = (update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text("❌ Please send the text you want to convert.")
+        return
+    if len(text) > TTS_MAX_CHARS:
+        await update.message.reply_text(
+            f"❌ Text is too long ({len(text)} chars). Please send up to {TTS_MAX_CHARS} characters."
+        )
+        return
+    context.user_data['tts_text'] = text
+    context.user_data['tts_lang'] = lang
+    kb = [
+        [InlineKeyboardButton("🧑 Male", callback_data=f"tts_voice_{lang}_male"),
+         InlineKeyboardButton("👩 Female", callback_data=f"tts_voice_{lang}_female")],
+        [InlineKeyboardButton("👴 Old", callback_data=f"tts_voice_{lang}_old"),
+         InlineKeyboardButton("👶 Child", callback_data=f"tts_voice_{lang}_child")],
+        [InlineKeyboardButton("⬅️ Cancel", callback_data="converter")],
+    ]
+    await update.message.reply_text("🔊 LOCAL TEXT TO VOICE\n\nChoose a voice style:", reply_markup=InlineKeyboardMarkup(kb))
+    context.user_data['state'] = None
+
+
+async def handle_tts_voice_selection(update, context, data):
+    q = update.callback_query
+    await q.answer()
+    parts = data.split("_")
+    lang = parts[2] if len(parts) > 2 else "en"
+    voice_type = parts[3] if len(parts) > 3 else "male"
+    text = context.user_data.get('tts_text')
+    if not text:
+        await q.message.reply_text("❌ Text session expired. Open Text to Voice and send the text again.")
+        return
+
+    status = await q.message.reply_text("🔊 Converting with the local speech engine…")
+    path = None
+    try:
+        fd, path = tempfile.mkstemp(prefix="tts_", suffix=".wav")
+        os.close(fd)
+        used_voice, matched_requested_lang = await asyncio.to_thread(
+            _tts_espeak_sync, text, lang, voice_type, path
+        )
+        with open(path, "rb") as audio:
+            await q.message.reply_audio(
+                audio=audio,
+                title=f"Local Voice ({lang}, {voice_type})",
+                reply_markup=tool_done_kb()
+            )
+        if matched_requested_lang:
+            await status.edit_text("✅ Text to voice complete — no external AI API was used.")
+        else:
+            await status.edit_text(
+                f"⚠️ '{lang}' voice isn't installed on this server, so English was used instead.\n"
+                f"No external AI API was used."
+            )
+    except Exception as e:
+        await status.edit_text(
+            "❌ Local text-to-voice failed.\n\n" + html.escape(str(e)[:1200]),
+            parse_mode=ParseMode.HTML
+        )
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        context.user_data.pop('tts_text', None)
+        context.user_data.pop('tts_lang', None)
+        context.user_data['state'] = None
 # --- IMAGE FORMAT CONVERSION ---
 async def handle_image_convert(update, context, fmt):
     if not update.message.photo:
