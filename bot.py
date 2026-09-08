@@ -930,11 +930,8 @@ async def handle_front_upload(update, context):
 # --- TEXT TO VOICE: LOCAL OFFLINE eSpeak (NO AI API) ---
 # Uses shutil.which to find the binary anywhere on the server PATH.
 ESPEAK_BIN = os.environ.get("ESPEAK_BIN", None) or shutil.which("espeak-ng") or shutil.which("espeak")
-
-# Hard safety limits so a huge paste can't hang a worker thread forever.
+# --- TEXT TO VOICE (RENDER FREE TIER COMPATIBLE) ---
 TTS_MAX_CHARS = 4000
-TTS_BASE_TIMEOUT = 30          # seconds, floor
-TTS_TIMEOUT_PER_CHAR = 0.05    # extra seconds per character, roughly scales with speech length
 
 _VOICE_TYPE_VARIANTS = {
     "male": "m3",
@@ -943,107 +940,19 @@ _VOICE_TYPE_VARIANTS = {
     "child": "f4",
 }
 
-_voice_cache_lock = threading.Lock()
-_available_voice_langs = None
-
-def _load_espeak_voice_langs():
-    global _available_voice_langs
-    with _voice_cache_lock:
-        if _available_voice_langs is not None:
-            return _available_voice_langs
-        langs = set()
-        if not ESPEAK_BIN:
-            _available_voice_langs = langs
-            return langs
-        try:
-            result = subprocess.run([ESPEAK_BIN, "--voices"], check=True, capture_output=True, text=True, timeout=15)
-            for line in result.stdout.splitlines()[1:]:
-                parts = line.split()
-                if len(parts) >= 2:
-                    code = parts[1].strip().lower()
-                    if code:
-                        langs.add(code)
-        except (subprocess.SubprocessError, OSError, FileNotFoundError):
-            langs = set()
-        _available_voice_langs = langs
-        return _available_voice_langs
-
-
-def _normalize_lang_code(lang):
-    return (lang or "").strip().lower()
-
-
-def _resolve_base_voice(lang):
-    norm = _normalize_lang_code(lang)
-    available = _load_espeak_voice_langs()
-    if not available:
-        return None
-    if norm in available:
-        return norm
-    base = norm.split("-")[0]
-    if base and base in available:
-        return base
-    for code in available:
-        if code.split("-")[0] == base:
-            return code
-    return None
-
-
-def _espeak_voice(lang, voice_type):
-    variant = _VOICE_TYPE_VARIANTS.get(voice_type, "m3")
-    base = _resolve_base_voice(lang)
-    if base is None:
-        return f"en-us+{variant}", False
-    return f"{base}+{variant}", True
-
-
-def _voice_actually_works(voice):
-    if not ESPEAK_BIN:
-        return False
-    fd, path = tempfile.mkstemp(prefix="tts_test_", suffix=".wav")
-    os.close(fd)
-    try:
-        subprocess.run([ESPEAK_BIN, "-v", voice, "-w", path, "a"], check=True, capture_output=True, timeout=10)
-        return os.path.exists(path) and os.path.getsize(path) > 0
-    except (subprocess.SubprocessError, OSError):
-        return False
-    finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-
-
 def _tts_espeak_sync(text, lang, voice_type, out_path):
-    voice, is_requested_lang = _espeak_voice(lang, voice_type)
-    if not ESPEAK_BIN:
-        raise RuntimeError("eSpeak-ng is not installed on this server.")
-    
-    candidates = [voice]
-    if "+" in voice:
-        candidates.append(voice.split("+")[0])
-    candidates.append("en-us")
-
-    timeout = min(300, TTS_BASE_TIMEOUT + int(len(text) * TTS_TIMEOUT_PER_CHAR))
-    last_err = None
-
-    for candidate in candidates:
-        cmd = [ESPEAK_BIN, "-v", candidate, "-s", "155", "-a", "170", "-w", out_path, text]
-        try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=timeout)
-            if os.path.exists(out_path) and os.path.getsize(out_path) > 100:
-                return candidate, is_requested_lang
-        except subprocess.TimeoutExpired:
-            last_err = RuntimeError(f"Local eSpeak timed out after {timeout}s. Try shorter text.")
-        except subprocess.CalledProcessError as e:
-            stderr = (e.stderr or "").strip()
-            last_err = RuntimeError(f"eSpeak failed to synthesize audio.{(' ' + stderr) if stderr else ''}")
-        except OSError as e:
-            last_err = RuntimeError(f"eSpeak executed failed: {e}")
-            break
-
-    raise last_err or RuntimeError("Local eSpeak did not produce an audio file.")
-
+    # Render Free Tier does not allow apt-get, so we use gTTS instead of eSpeak
+    try:
+        from gtts import gTTS
+        # Map lang codes to Google TTS codes
+        tts_lang = 'en' if lang.startswith('en') else 'am'
+        tts = gTTS(text=text, lang=tts_lang, slow=False)
+        tts.save(out_path)
+        return "gTTS (free API)", True
+    except ImportError:
+        raise RuntimeError("gTTS is not installed. Add 'gTTS' to requirements.txt")
+    except Exception as e:
+        raise RuntimeError(f"TTS failed: {e}")
 
 async def handle_tts(update, context, lang):
     text = (update.message.text or "").strip()
@@ -1064,9 +973,8 @@ async def handle_tts(update, context, lang):
          InlineKeyboardButton("👶 Child", callback_data=f"tts_voice_{lang}_child")],
         [InlineKeyboardButton("⬅️ Cancel", callback_data="converter")],
     ]
-    await update.message.reply_text("🔊 LOCAL TEXT TO VOICE\n\nChoose a voice style:", reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text("🔊 TEXT TO VOICE\n\nChoose a voice style:", reply_markup=InlineKeyboardMarkup(kb))
     context.user_data['state'] = None
-
 
 async def handle_tts_voice_selection(update, context, data):
     q = update.callback_query
@@ -1079,10 +987,10 @@ async def handle_tts_voice_selection(update, context, data):
         await q.message.reply_text("❌ Text session expired. Open Text to Voice and send the text again.")
         return
 
-    status = await q.message.reply_text("🔊 Converting with the local speech engine…")
+    status = await q.message.reply_text("🔊 Converting to speech…")
     path = None
     try:
-        fd, path = tempfile.mkstemp(prefix="tts_", suffix=".wav")
+        fd, path = tempfile.mkstemp(prefix="tts_", suffix=".mp3")
         os.close(fd)
         used_voice, matched_requested_lang = await asyncio.to_thread(
             _tts_espeak_sync, text, lang, voice_type, path
@@ -1090,16 +998,10 @@ async def handle_tts_voice_selection(update, context, data):
         with open(path, "rb") as audio:
             await q.message.reply_audio(
                 audio=audio,
-                title=f"Local Voice ({lang}, {voice_type})",
+                title=f"Text to Voice ({lang})",
                 reply_markup=tool_done_kb()
             )
-        if matched_requested_lang:
-            await status.edit_text("✅ Text to voice complete — no external AI API was used.")
-        else:
-            await status.edit_text(
-                f"⚠️ '{lang}' voice isn't installed on this server, so English was used instead.\n"
-                f"No external AI API was used."
-            )
+        await status.edit_text("✅ Text to voice complete!")
     except Exception as e:
         await status.edit_text(
             "❌ Local text-to-voice failed.\n\n" + html.escape(str(e)[:1200]),
