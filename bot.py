@@ -3346,7 +3346,6 @@ def mm_has_link(text):
 def mm_is_video(event):
     return bool(getattr(event,'video',None)) or (getattr(event,'document',None) is not None and str(getattr(getattr(event,'document',None),'mime_type','')).startswith('video/'))
 
-# --- FIX 3: Never block the bot itself. ---
 def mm_reason(event, user_id, text):
     r=mm_get_rules(); now=time.time()
     # Owner/admins are never blocked by manager rules.
@@ -3358,6 +3357,8 @@ def mm_reason(event, user_id, text):
             return None
     except Exception:
         pass
+    # 🛑 NEW: Explicitly ignore the bot's own ID (PTSS: 8958561939)
+    if user_id == 8958561939: return None
     until=float(r.get('block_everyone_until',0))
     if mm_active(until): return f'Block everyone ({mm_left(until)})'
     item=r.get('blocked_users',{}).get(str(user_id))
@@ -3436,7 +3437,12 @@ async def process_message_manager_incoming(event):
     except Exception:
         pass
     try:
-        sender=await event.get_sender(); uid=sender.id; text=event.raw_text or ''
+        sender=await event.get_sender(); 
+        # 🛑 NEW: Ignore any bot messages (prevents spam from bot itself)
+        if getattr(sender, 'bot', False):
+            return False
+        
+        uid=sender.id; text=event.raw_text or ''
         reason=mm_reason(event,uid,text)
         if reason:
             await mm_refuse(event,reason)
@@ -3446,7 +3452,6 @@ async def process_message_manager_incoming(event):
     except Exception as e:
         print('Message Manager incoming error:',e)
         return False
-
 async def mm_active_rules(update, context):
     r=mm_get_rules(); lines=['📋 ACTIVE RULES','']
     lines.append('💬 Messaging: '+('🟢 ON' if r['messaging'] else '🔴 OFF'))
