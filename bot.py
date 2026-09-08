@@ -926,10 +926,10 @@ async def handle_front_upload(update, context):
         await status_msg.edit_text(f"❌ Background change failed: {e}")
         context.user_data.pop('bg_image', None)
         context.user_data['state'] = None
-        
-# --- TEXT TO VOICE: LOCAL OFFLINE eSpeak (NO AI API) ---
+        # --- TEXT TO VOICE: LOCAL OFFLINE eSpeak (NO AI API) ---
 # Uses the operating-system speech engine instead of edge-tts/cloud APIs.
-ESPEAK_BIN = os.environ.get("ESPEAK_BIN", "espeak-ng" if os.path.exists("/usr/bin/espeak-ng") else "espeak")
+# Requires `import shutil` at the top of the file to locate the binary.
+ESPEAK_BIN = os.environ.get("ESPEAK_BIN", None) or shutil.which("espeak-ng") or shutil.which("espeak")
 
 # Hard safety limits so a huge paste can't hang a worker thread forever.
 TTS_MAX_CHARS = 4000
@@ -962,6 +962,10 @@ def _load_espeak_voice_langs():
         if _available_voice_langs is not None:
             return _available_voice_langs
         langs = set()
+        if not ESPEAK_BIN:
+            # Binary not found, return empty set immediately
+            _available_voice_langs = langs
+            return langs
         try:
             result = subprocess.run(
                 [ESPEAK_BIN, "--voices"],
@@ -999,9 +1003,8 @@ def _resolve_base_voice(lang):
     available = _load_espeak_voice_langs()
 
     if not available:
-        # Engine voice list unavailable — best effort, let the actual
-        # espeak call fail loudly later with a clear error if it's wrong.
-        return norm or "en-us"
+        # Engine voice list unavailable (or binary missing) - return None
+        return None
 
     if norm in available:
         return norm
@@ -1041,52 +1044,60 @@ def _espeak_voice(lang, voice_type):
 def _voice_actually_works(voice):
     """
     Do a cheap dry-run to confirm eSpeak accepts the constructed voice
-    string (base+variant combos aren't all guaranteed valid). Uses --stdout
-    with a single character so it's fast and doesn't write files.
+    string (base+variant combos aren't all guaranteed valid). Uses a temp
+    file instead of --stdout for reliability on all servers.
     """
+    if not ESPEAK_BIN:
+        return False
+    fd, path = tempfile.mkstemp(prefix="tts_test_", suffix=".wav")
+    os.close(fd)
     try:
         subprocess.run(
-            [ESPEAK_BIN, "-v", voice, "--stdout", "a"],
+            [ESPEAK_BIN, "-v", voice, "-w", path, "a"],
             check=True, capture_output=True, timeout=10
         )
-        return True
+        return os.path.exists(path) and os.path.getsize(path) > 0
     except (subprocess.SubprocessError, OSError):
         return False
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def _tts_espeak_sync(text, lang, voice_type, out_path):
     voice, is_requested_lang = _espeak_voice(lang, voice_type)
 
-    if not _voice_actually_works(voice):
-        # Variant combo failed — retry with just the base voice, no variant.
-        base_only = voice.split("+")[0]
-        if _voice_actually_works(base_only):
-            voice = base_only
-        else:
-            raise RuntimeError(
-                f"eSpeak voice '{voice}' is not available on this server. "
-                f"Install the matching eSpeak voice data or choose a different language."
-            )
+    if not ESPEAK_BIN:
+        raise RuntimeError("eSpeak (espeak-ng) is not installed on this server.")
 
-    if not is_requested_lang:
-        # We silently fell back to English — surface that instead of
-        # producing wrong-language audio with no explanation.
-        pass  # caller (handle_tts_voice_selection) reports this via the reply caption
+    # Build a list of candidate voices to try: requested variant -> base voice -> english fallback
+    candidates = [voice]
+    if "+" in voice:
+        candidates.append(voice.split("+")[0])
+    candidates.append("en-us")
 
     timeout = min(300, TTS_BASE_TIMEOUT + int(len(text) * TTS_TIMEOUT_PER_CHAR))
-    cmd = [ESPEAK_BIN, "-v", voice, "-s", "155", "-a", "170", "-w", out_path, text]
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"Local eSpeak timed out after {timeout}s. Try shorter text.")
-    except subprocess.CalledProcessError as e:
-        stderr = (e.stderr or "").strip()
-        raise RuntimeError(f"eSpeak failed to synthesize audio.{(' ' + stderr) if stderr else ''}")
+    last_err = None
 
-    if not os.path.exists(out_path) or os.path.getsize(out_path) < 100:
-        raise RuntimeError("Local eSpeak did not produce an audio file.")
+    for candidate in candidates:
+        cmd = [ESPEAK_BIN, "-v", candidate, "-s", "155", "-a", "170", "-w", out_path, text]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=timeout)
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 100:
+                return candidate, is_requested_lang
+        except subprocess.TimeoutExpired:
+            last_err = RuntimeError(f"Local eSpeak timed out after {timeout}s. Try shorter text.")
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or "").strip()
+            last_err = RuntimeError(f"eSpeak failed to synthesize audio.{(' ' + stderr) if stderr else ''}")
+        except OSError as e:
+            last_err = RuntimeError(f"eSpeak executed failed: {e}")
+            break # If the binary itself is broken, don't try other voices
 
-    return voice, is_requested_lang
+    # If all failed, raise the last error
+    raise last_err or RuntimeError("Local eSpeak did not produce an audio file.")
 
 
 async def handle_tts(update, context, lang):
