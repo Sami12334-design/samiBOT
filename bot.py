@@ -11,6 +11,7 @@ import urllib.request
 import urllib.parse
 import html
 import uuid
+import shutil
 from io import BytesIO
 import json
 import hashlib
@@ -926,19 +927,30 @@ async def handle_front_upload(update, context):
         await status_msg.edit_text(f"❌ Background change failed: {e}")
         context.user_data.pop('bg_image', None)
         context.user_data['state'] = None
-        # --- TEXT TO VOICE: LOCAL OFFLINE eSpeak (NO AI API) ---
+# --- TEXT TO VOICE: LOCAL OFFLINE eSpeak (NO AI API) ---
 # Uses the operating-system speech engine instead of edge-tts/cloud APIs.
-# Requires `import shutil` at the top of the file to locate the binary.
-ESPEAK_BIN = os.environ.get("ESPEAK_BIN", None) or shutil.which("espeak-ng") or shutil.which("espeak")
+# No shutil required; uses standard os.path checks to find the binary.
+_espeak_candidates = [
+    "/usr/bin/espeak-ng",
+    "/usr/local/bin/espeak-ng",
+    "/usr/bin/espeak",
+    "/usr/local/bin/espeak",
+]
+ESPEAK_BIN = os.environ.get("ESPEAK_BIN", None)
+if not ESPEAK_BIN:
+    for path in _espeak_candidates:
+        if os.path.exists(path):
+            ESPEAK_BIN = path
+            break
+if not ESPEAK_BIN:
+    # Fallback to trying to run it from the system PATH
+    ESPEAK_BIN = "espeak-ng" if os.path.exists("/usr/bin/espeak-ng") else "espeak"
 
 # Hard safety limits so a huge paste can't hang a worker thread forever.
 TTS_MAX_CHARS = 4000
 TTS_BASE_TIMEOUT = 30          # seconds, floor
 TTS_TIMEOUT_PER_CHAR = 0.05    # extra seconds per character, roughly scales with speech length
 
-# Generic eSpeak pitch/formant variants. These are NOT English-specific —
-# eSpeak applies "+variantN" on top of ANY base language voice
-# (e.g. "fr+m3", "am+f3", "hi+m2" all work), so this map is reused for every language.
 _VOICE_TYPE_VARIANTS = {
     "male": "m3",
     "female": "f3",
@@ -947,23 +959,15 @@ _VOICE_TYPE_VARIANTS = {
 }
 
 _voice_cache_lock = threading.Lock()
-_available_voice_langs = None  # populated lazily: set of lowercase lang codes eSpeak actually has
-
+_available_voice_langs = None
 
 def _load_espeak_voice_langs():
-    """
-    Query the installed eSpeak/eSpeak-ng binary for the list of language
-    codes it actually ships, instead of assuming "am" or anything else exists.
-    Result is cached for the lifetime of the process (eSpeak's voice list
-    can't change while the bot is running).
-    """
     global _available_voice_langs
     with _voice_cache_lock:
         if _available_voice_langs is not None:
             return _available_voice_langs
         langs = set()
         if not ESPEAK_BIN:
-            # Binary not found, return empty set immediately
             _available_voice_langs = langs
             return langs
         try:
@@ -971,8 +975,6 @@ def _load_espeak_voice_langs():
                 [ESPEAK_BIN, "--voices"],
                 check=True, capture_output=True, text=True, timeout=15
             )
-            # Typical line: "  2  am             M  amharic              ..."
-            # Column 2 (index) is the language code we care about.
             for line in result.stdout.splitlines()[1:]:
                 parts = line.split()
                 if len(parts) >= 2:
@@ -980,73 +982,47 @@ def _load_espeak_voice_langs():
                     if code:
                         langs.add(code)
         except (subprocess.SubprocessError, OSError, FileNotFoundError):
-            # If we can't even query the engine, leave the set empty —
-            # callers will fall back to "en-us" and surface a clear error.
             langs = set()
         _available_voice_langs = langs
         return _available_voice_langs
 
 
 def _normalize_lang_code(lang):
-    """Lowercase and strip; keep hyphenated codes like 'en-us' / 'pt-br' intact."""
     return (lang or "").strip().lower()
 
 
 def _resolve_base_voice(lang):
-    """
-    Find the best matching eSpeak base voice for an arbitrary language code.
-    Supports hyphenated codes (e.g. 'en-us', 'pt-br') and falls back to the
-    bare language part (e.g. 'en' from 'en-us') before giving up.
-    Only falls back to English if the language is genuinely not supported.
-    """
     norm = _normalize_lang_code(lang)
     available = _load_espeak_voice_langs()
 
     if not available:
-        # Engine voice list unavailable (or binary missing) - return None
         return None
 
     if norm in available:
         return norm
 
-    # Try the base part before a hyphen, e.g. "en-gb" -> "en"
     base = norm.split("-")[0]
     if base and base in available:
         return base
 
-    # Try matching any installed variant that starts with the base, e.g.
-    # requesting "en" when only "en-us" is installed.
     for code in available:
         if code.split("-")[0] == base:
             return code
 
-    return None  # genuinely unsupported
+    return None
 
 
 def _espeak_voice(lang, voice_type):
-    """
-    Build a concrete eSpeak voice string for ANY supported language code,
-    correctly applying the male/female/old/child variant instead of
-    hardcoding English voices. Falls back to English only if the requested
-    language isn't actually installed.
-    """
     variant = _VOICE_TYPE_VARIANTS.get(voice_type, "m3")
     base = _resolve_base_voice(lang)
 
     if base is None:
-        # Language not supported by this eSpeak install — fall back to
-        # English explicitly (and let the caller know via the returned flag).
         return f"en-us+{variant}", False
 
     return f"{base}+{variant}", True
 
 
 def _voice_actually_works(voice):
-    """
-    Do a cheap dry-run to confirm eSpeak accepts the constructed voice
-    string (base+variant combos aren't all guaranteed valid). Uses a temp
-    file instead of --stdout for reliability on all servers.
-    """
     if not ESPEAK_BIN:
         return False
     fd, path = tempfile.mkstemp(prefix="tts_test_", suffix=".wav")
@@ -1072,7 +1048,6 @@ def _tts_espeak_sync(text, lang, voice_type, out_path):
     if not ESPEAK_BIN:
         raise RuntimeError("eSpeak (espeak-ng) is not installed on this server.")
 
-    # Build a list of candidate voices to try: requested variant -> base voice -> english fallback
     candidates = [voice]
     if "+" in voice:
         candidates.append(voice.split("+")[0])
@@ -1094,9 +1069,8 @@ def _tts_espeak_sync(text, lang, voice_type, out_path):
             last_err = RuntimeError(f"eSpeak failed to synthesize audio.{(' ' + stderr) if stderr else ''}")
         except OSError as e:
             last_err = RuntimeError(f"eSpeak executed failed: {e}")
-            break # If the binary itself is broken, don't try other voices
+            break
 
-    # If all failed, raise the last error
     raise last_err or RuntimeError("Local eSpeak did not produce an audio file.")
 
 
