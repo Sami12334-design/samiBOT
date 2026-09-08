@@ -522,16 +522,16 @@ async def menu_callback(update, context):
         except Exception: page=1
         await handle_posts_pagination(update, context, page)
         return
-    elif data.startswith("story_"):
-        await handle_story_view(update, context)
-        return
-    elif data.startswith("story_nav_"):
-        try:
-            idx = int(data.split("_")[2])
-            await send_story_at_index(update, context, idx)
-        except Exception:
-            await query.answer("Invalid navigation", show_alert=True)
-        return
+elif data.startswith("story_"):
+    await handle_story_view(update, context)
+    return
+elif data.startswith("story_nav_"):
+    try:
+        idx = int(data.split("_")[2])
+        await send_story_at_index(update, context, idx)
+    except Exception:
+        await query.answer("Invalid navigation", show_alert=True)
+    return
 # --- PHOTO EDITING ---
 def build_edit_keyboard(page=1):
     """Returns an InlineKeyboardMarkup for the given page."""
