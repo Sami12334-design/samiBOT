@@ -23,6 +23,8 @@ VOSK_DIR="/opt/vosk-model-small-en-us-0.15"
 if [ ! -d "$VOSK_DIR" ]; then
   mkdir -p /tmp/vosk
   curl -L --fail --retry 3 -o /tmp/vosk/model.zip https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
+  apt-get update
+apt-get install -y espeak-ng
   unzip -q /tmp/vosk/model.zip -d /tmp/vosk
   mkdir -p "$(dirname "$VOSK_DIR")"
   cp -a /tmp/vosk/vosk-model-small-en-us-0.15 "$VOSK_DIR"
