@@ -2469,7 +2469,6 @@ async def open_inbox_chat(update, context, index):
         await query.message.reply_text(f"⏳ Telegram asks us to wait {e.seconds} seconds before loading this conversation.")
     except Exception as e:
         await query.message.reply_text(f"❌ Could not open conversation: {type(e).__name__}: {e}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Inbox", callback_data="inbox")]]))
-
 async def fetch_profile(update, context, target):
     try:
         entity = await telethon_client.get_entity(target)
@@ -2482,11 +2481,10 @@ async def fetch_profile(update, context, target):
         last_name = getattr(entity, "last_name", "") or ""
         display_name = f"{first_name} {last_name}".strip() or getattr(entity, "title", "Unknown")
 
-        # ---- Fetch online status ----
+        # ---- Fetch online status (READ DIRECTLY from entity) ----
         status_text = "⚪ Unknown status"
         try:
-            full_user = await telethon_client(functions.users.GetFullUserRequest(entity))
-            status = full_user.users[0].status if full_user.users else None
+            status = entity.status  # No extra API call, works perfectly
 
             if status is not None:
                 if isinstance(status, types.UserStatusOnline):
@@ -2509,12 +2507,14 @@ async def fetch_profile(update, context, target):
                         else:
                             weeks = int(seconds // 604800)
                             status_text = f"🟢 Last seen {weeks} week{'s' if weeks != 1 else ''} ago"
+                    else:
+                        status_text = "⚪ Last seen a long time ago"
                 elif isinstance(status, types.UserStatusRecently):
-                    status_text = "🟢 Last seen recently (exact time hidden by privacy)"
+                    status_text = "🟢 Last seen recently"
                 elif isinstance(status, types.UserStatusLastWeek):
-                    status_text = "🟢 Last seen within this week (exact time hidden)"
+                    status_text = "🟢 Last seen within this week"
                 elif isinstance(status, types.UserStatusLastMonth):
-                    status_text = "🟢 Last seen within this month (exact time hidden)"
+                    status_text = "🟢 Last seen within this month"
                 elif isinstance(status, types.UserStatusEmpty):
                     status_text = "⚪ Last seen a long time ago"
         except Exception as e:
@@ -2532,7 +2532,7 @@ async def fetch_profile(update, context, target):
             f"Status: {status_text}</blockquote>"
         )
 
-        # ---- Only "View Story" + "Back" buttons (no more posts) ----
+        # ---- Only "View Story" + "Back" buttons ----
         kb = [
             [InlineKeyboardButton("👁 View Story", callback_data="story_start")],
             [InlineKeyboardButton("⬅️ Back", callback_data="more")]
@@ -2551,7 +2551,6 @@ async def fetch_profile(update, context, target):
 
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {type(e).__name__}: {e}")
-       # (End of fetch_profile)
 
 
 async def handle_story_view(update, context):
@@ -2569,6 +2568,7 @@ async def handle_story_view(update, context):
         return
 
     try:
+        # Fetch the peer stories
         result = await telethon_client(GetPeerStoriesRequest(peer=entity))
         stories = result.stories
 
@@ -2576,6 +2576,7 @@ async def handle_story_view(update, context):
             await query.edit_message_text("📭 No stories found for this user.")
             return
 
+        # Store stories and start with the first one (index 0)
         context.user_data["stories_list"] = stories
         context.user_data["story_index"] = 0
         await send_story_at_index(update, context, 0)
@@ -2591,10 +2592,12 @@ async def send_story_at_index(update, context, index):
         await query.edit_message_text("❌ No more stories.")
         return
 
+    # Store current index
     context.user_data["story_index"] = index
     story = stories[index]
     total = len(stories)
 
+    # Build navigation buttons
     nav = []
     if index > 0:
         nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"story_nav_{index-1}"))
@@ -2604,12 +2607,14 @@ async def send_story_at_index(update, context, index):
 
     kb = InlineKeyboardMarkup([nav])
 
+    # Download and send the story media
     media_bytes = BytesIO()
     await telethon_client.download_media(story.media, file=media_bytes)
     media_bytes.seek(0)
 
     caption = f"📖 Story {index+1}/{total}"
 
+    # Detect media type and send
     if story.media and hasattr(story.media, 'photo'):
         await query.message.reply_photo(photo=media_bytes, caption=caption, reply_markup=kb)
     elif story.media and hasattr(story.media, 'document'):
@@ -2620,7 +2625,6 @@ async def send_story_at_index(update, context, index):
             await query.message.reply_document(document=media_bytes, caption=caption, reply_markup=kb)
     else:
         await query.message.reply_document(document=media_bytes, caption=caption, reply_markup=kb)
-
 
 # --- FAST GLOBAL TELEGRAM SEARCH ---
 # --- FAST GLOBAL TELEGRAM SEARCH ---
