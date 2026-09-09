@@ -2495,7 +2495,7 @@ async def send_story_at_index(update, context, index):
 # --- FAST GLOBAL TELEGRAM SEARCH ---
 SEARCH_PAGE_SIZE = 8
 SEARCH_GLOBAL_LIMIT = 100
-SEARCH_MAX_FETCH = 1000  # <--- Increased to 1000 to match Legend Bot
+SEARCH_MAX_FETCH = 5000  # Fetches up to 5000, supports "Load More" for unlimited browsing
 SEARCH_JOINED_CACHE_SECONDS = 300
 
 
@@ -2527,8 +2527,13 @@ def _search_peer_name(entity):
 
 
 def _search_peer_link(entity):
+    # Force a clickable link for all groups/channels
     username = getattr(entity, "username", None)
     if username: return f"https://t.me/{username}"
+    marked_id = _search_peer_marked_id(entity)
+    if marked_id is not None and marked_id < 0:
+        # For channels/supergroups/basic groups, use t.me/c/format (forces clickable)
+        return f"https://t.me/c/{str(abs(marked_id))}"
     return None
 
 
@@ -2536,9 +2541,9 @@ def _search_message_link(entity, message_id):
     username = getattr(entity, "username", None)
     if username: return f"https://t.me/{username}/{message_id}"
     marked_id = _search_peer_marked_id(entity)
-    if marked_id is not None and marked_id < -1000000000000:
-        internal_id = str(abs(marked_id))[3:]
-        return f"https://t.me/c/{internal_id}/{message_id}"
+    if marked_id is not None and marked_id < 0:
+        # Force clickable link for message in chats/groups
+        return f"https://t.me/c/{str(abs(marked_id))}/{message_id}"
     return None
 
 
@@ -2609,6 +2614,10 @@ async def fetch_search(update, context, query):
     context.user_data.pop("search_query", None)
     context.user_data.pop("search_filter", None)
     context.user_data.pop("search_page", None)
+    # Reset pagination state
+    context.user_data["search_next_rate"] = 0
+    context.user_data["search_next_peer"] = types.InputPeerEmpty()
+    context.user_data["search_next_id"] = 0
 
     status_msg = await update.message.reply_text(
         f"🔎 Searching Telegram globally for: <b>{html.escape(query)}</b>\n"
@@ -2630,7 +2639,7 @@ async def fetch_search(update, context, query):
         fetched = 0
         global_rank = 0
 
-        # --- TRUE TELEGRAM PAGINATION LOOP (Up to 1000 Results) ---
+        # --- TRUE TELEGRAM PAGINATION LOOP (Up to 5000 Results) ---
         while fetched < SEARCH_MAX_FETCH:
             global_result = await telethon_client(
                 functions.messages.SearchGlobalRequest(
@@ -2683,6 +2692,12 @@ async def fetch_search(update, context, query):
 
             # --- PAGINATION LOGIC ---
             next_rate = getattr(global_result, "next_rate", 0)
+            
+            # Update the "Load More" state
+            context.user_data["search_next_rate"] = next_rate
+            context.user_data["search_next_peer"] = batch_messages[-1].peer_id if batch_messages else types.InputPeerEmpty()
+            context.user_data["search_next_id"] = batch_messages[-1].id if batch_messages else 0
+            
             if next_rate == 0: break
             
             last_msg = batch_messages[-1]
@@ -2691,7 +2706,6 @@ async def fetch_search(update, context, query):
             offset_rate = next_rate
             fetched += len(batch_messages)
             
-            # Add a small delay so Telegram doesn't rate-limit (FloodWait) the bot
             await asyncio.sleep(0.2)
 
         # Add standalone peer cards from ALL collected entities
@@ -2703,7 +2717,7 @@ async def fetch_search(update, context, query):
 
             name = _search_peer_name(entity)
             username = getattr(entity, "username", None)
-            peer_link = _search_peer_link(entity)  # Generates https://t.me/username
+            peer_link = _search_peer_link(entity)
             peer_key = ("peer", marked)
             if peer_key in seen: continue
             seen.add(peer_key)
@@ -2711,7 +2725,7 @@ async def fetch_search(update, context, query):
             results.append({
                 "kind": "peer", "type": kind, "peer_type": kind,
                 "peer_id": marked, "entity": entity, "message": None,
-                "link": peer_link,  # <--- This is crucial for clickable links
+                "link": peer_link,
                 "content": f"{('🤖' if kind == 'bot' else '📢' if kind == 'channel' else '👥' if kind == 'group' else '👤')} {name}",
                 "title": name,
                 "username": username,
@@ -2719,7 +2733,7 @@ async def fetch_search(update, context, query):
                 "rank": global_rank,
             })
 
-        # RACE CONDITION FIX: Check if a new search started
+        # RACE CONDITION FIX
         if context.user_data.get("search_id") != search_id:
             return
 
@@ -2733,7 +2747,7 @@ async def fetch_search(update, context, query):
 
         results.sort(key=lambda item: item.get("rank", 0), reverse=False)
 
-        context.user_data["search_results"] = results[:1000]
+        context.user_data["search_results"] = results[:5000]
         context.user_data["search_query"] = query
         context.user_data["search_filter"] = "all"
         context.user_data["search_page"] = 1
@@ -2752,6 +2766,92 @@ async def fetch_search(update, context, query):
             f"{html.escape(str(e)[:700])}",
             parse_mode=ParseMode.HTML,
         )
+
+
+async def load_more_results(update, context):
+    """Loads the next batch of results from Telegram for unlimited browsing."""
+    q = update.callback_query
+    await q.answer()
+    
+    query = context.user_data.get("search_query")
+    if not query: return
+    
+    offset_rate = context.user_data.get("search_next_rate", 0)
+    offset_peer = context.user_data.get("search_next_peer", types.InputPeerEmpty())
+    offset_id = context.user_data.get("search_next_id", 0)
+    
+    status = await q.message.reply_text("📥 Loading more results...")
+    try:
+        global_result = await telethon_client(
+            functions.messages.SearchGlobalRequest(
+                q=query, filter=types.InputMessagesFilterEmpty(),
+                min_date=0, max_date=0,
+                offset_rate=offset_rate, offset_peer=offset_peer, offset_id=offset_id,
+                limit=SEARCH_GLOBAL_LIMIT,
+            )
+        )
+        
+        new_results = []
+        existing_results = context.user_data.get("search_results", [])
+        existing_keys = {(r["peer_id"], r.get("message").id if r.get("message") else "peer") for r in existing_results}
+        
+        batch_messages = list(getattr(global_result, "messages", []) or [])
+        
+        for message in batch_messages:
+            marked_peer = _search_peer_marked_id(message.peer_id)
+            entity = _search_peer_from_result(marked_peer, {})
+            # We don't have the entity map here easily, so we reconstruct it from the result
+            for r in existing_results:
+                if r["peer_id"] == marked_peer:
+                    entity = r["entity"]
+                    break
+            
+            if entity is None: 
+                # Try to fetch entity if missing
+                try:
+                    entity = await telethon_client.get_entity(message.peer_id)
+                except:
+                    continue
+            
+            peer_kind = _search_peer_kind(entity)
+            if marked_peer in context.user_data.get("search_joined_ids", set()) and peer_kind in {"group", "channel"}:
+                continue
+            
+            message_id = getattr(message, "id", None)
+            if not message_id: continue
+            
+            if (marked_peer, message_id) in existing_keys: continue
+            
+            existing_keys.add((marked_peer, message_id))
+            media_type = _search_message_type(message)
+            link = _search_message_link(entity, message_id)
+            new_results.append({
+                "kind": "message", "type": media_type, "peer_type": peer_kind,
+                "peer_id": marked_peer, "entity": entity, "message": message,
+                "link": link, "content": _search_content(message),
+                "title": _search_peer_name(entity),
+                "username": getattr(entity, "username", None),
+                "date": getattr(message, "date", None),
+                "rank": len(existing_results) + len(new_results),
+            })
+        
+        if new_results:
+            context.user_data["search_results"] = existing_results + new_results
+        
+        # Update pagination offsets
+        next_rate = getattr(global_result, "next_rate", 0)
+        context.user_data["search_next_rate"] = next_rate
+        if batch_messages:
+            context.user_data["search_next_peer"] = batch_messages[-1].peer_id
+            context.user_data["search_next_id"] = batch_messages[-1].id
+        
+        await status.delete()
+        await display_search_page(update, context, 1, context.user_data.get("search_filter", "all"))
+        
+    except FloodWaitError as e:
+        await status.edit_text(f"⏳ Rate limit. Wait {e.seconds}s.")
+    except Exception as e:
+        await status.edit_text(f"❌ Error loading more: {e}")
 
 
 def _search_filter_match(item, filter_type):
@@ -2846,10 +2946,19 @@ async def display_search_page(update, context, page, filter_type=None):
             content = html.escape(item.get("content") or "")
             if len(content) > 180: content = content[:177] + "..."
 
-            # Generate the CLICKABLE LINK
-            if item.get("link"):
+            # FORCE CLICKABLE LINKS FOR EVERYTHING
+            link = item.get("link")
+            if not link:
+                marked_id = item.get("peer_id")
+                if marked_id:
+                    if item.get("kind") == "message":
+                        link = f"https://t.me/c/{str(abs(marked_id))}/{item.get('message').id if item.get('message') else ''}"
+                    else:
+                        link = f"https://t.me/c/{str(abs(marked_id))}"
+
+            if link:
                 lines.append(
-                    f"<b>{index}.</b> {icon} <a href=\"{html.escape(item['link'], quote=True)}\">"
+                    f"<b>{index}.</b> {icon} <a href=\"{html.escape(link, quote=True)}\">"
                     f"{peer_name}{username_text}</a>\n{content}\n"
                 )
             else:
@@ -2858,7 +2967,7 @@ async def display_search_page(update, context, page, filter_type=None):
                 )
 
     lines.append(f"Page {page}/{total_pages} • {total_results} results")
-    lines.append("Sort by relevance and activity")  # <--- Matches Legend Bot
+    lines.append("Sort by relevance and activity")
     lines.append("</blockquote>")
     text = "\n".join(lines)
 
@@ -2869,6 +2978,11 @@ async def display_search_page(update, context, page, filter_type=None):
         nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"search_page_{page - 1}"))
     if page < total_pages:
         nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"search_page_{page + 1}"))
+    
+    # Add "Load More" button for unlimited browsing
+    if context.user_data.get("search_next_rate", 0) != 0 and len(results) < SEARCH_MAX_FETCH:
+        nav.append(InlineKeyboardButton("📥 Load More", callback_data="search_load_more"))
+        
     if nav: kb.append(nav)
 
     kb.append([
@@ -2884,6 +2998,8 @@ async def display_search_page(update, context, page, filter_type=None):
             if "message is not modified" not in str(exc).lower(): raise
     else:
         await update.message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+# --- Preserving your original fetch_friends function ---
 async def fetch_friends(update, context, text):
     parts = text.split(" ")
     if len(parts) < 2: await update.message.reply_text("⚠️ Use: @group @user"); return
@@ -2911,7 +3027,6 @@ async def fetch_friends(update, context, text):
         text += "</blockquote>"
         await update.message.reply_text(text, parse_mode=ParseMode.HTML)
     except Exception as e: await update.message.reply_text(f"❌ Error: {e}")
-
 async def fetch_names(update, context, target):
     try:
         entity = await telethon_client.get_entity(target)
