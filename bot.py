@@ -4070,7 +4070,6 @@ async def fetch_friends(update, context, text):
             f"❌ Error: "
             f"{html.escape(str(e)[:700])}"
         )
-```
 # --- Preserving your original fetch_friends function ---
 async def fetch_friends(update, context, text):
     parts = text.split(" ")
