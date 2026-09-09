@@ -2492,11 +2492,23 @@ async def send_story_at_index(update, context, index):
     else:
         await query.message.reply_document(document=media_bytes, caption=caption, reply_markup=kb)
 # --- FAST GLOBAL TELEGRAM SEARCH ---
-# --- FAST GLOBAL TELEGRAM SEARCH ---
+```python
+# --- SAFE PUBLIC TELEGRAM SEARCH ---
+# IMPORTANT:
+# telethon_client is a single Telegram account/session.
+# Therefore this search MUST NOT expose that account's private history.
+# This implementation only accepts publicly identifiable peers
+# (public username required) for message results.
+#
+# If you want each bot user to search THEIR OWN Telegram account,
+# you need a separate authorized Telethon session for each user.
+#
+# This version prevents admin/private-chat leakage while keeping
+# Telegram global public search functionality.
+
 SEARCH_PAGE_SIZE = 8
 SEARCH_GLOBAL_LIMIT = 100
-SEARCH_MAX_FETCH = 5000  # Fetches up to 5000, supports "Load More" for unlimited browsing
-SEARCH_JOINED_CACHE_SECONDS = 300
+SEARCH_MAX_FETCH = 5000
 
 
 def _search_peer_marked_id(entity):
@@ -2508,497 +2520,1414 @@ def _search_peer_marked_id(entity):
 
 
 def _search_peer_kind(entity):
-    if entity is None: return "unknown"
-    if getattr(entity, "bot", False): return "bot"
-    if hasattr(entity, "broadcast"): return "channel" if getattr(entity, "broadcast", False) else "group"
-    if entity.__class__.__name__ == "Chat": return "group"
-    if hasattr(entity, "first_name") or hasattr(entity, "username"): return "user"
+    if entity is None:
+        return "unknown"
+
+    if getattr(entity, "bot", False):
+        return "bot"
+
+    if hasattr(entity, "broadcast"):
+        return "channel" if getattr(entity, "broadcast", False) else "group"
+
+    if entity.__class__.__name__ == "Chat":
+        return "group"
+
+    if hasattr(entity, "first_name") or hasattr(entity, "username"):
+        return "user"
+
     return "unknown"
 
 
 def _search_peer_name(entity):
-    if entity is None: return "Unknown"
+    if entity is None:
+        return "Unknown"
+
     title = getattr(entity, "title", None)
-    if title: return str(title).strip()
+    if title:
+        return str(title).strip()
+
     first = (getattr(entity, "first_name", None) or "").strip()
     last = (getattr(entity, "last_name", None) or "").strip()
+
     name = f"{first} {last}".strip()
+
     return name or "Unknown"
 
 
-def _search_peer_link(entity):
-    # Force a clickable link for all groups/channels
+def _search_is_public_peer(entity):
+    """
+    SECURITY RULE:
+
+    Only allow entities that have a public Telegram username.
+
+    This prevents the admin Telethon session from exposing:
+    - private groups
+    - private channels
+    - private conversations
+    - private users
+    - admin-only chats
+    """
+
+    if entity is None:
+        return False
+
     username = getattr(entity, "username", None)
-    if username: return f"https://t.me/{username}"
-    marked_id = _search_peer_marked_id(entity)
-    if marked_id is not None and marked_id < 0:
-        # For channels/supergroups/basic groups, use t.me/c/format (forces clickable)
-        return f"https://t.me/c/{str(abs(marked_id))}"
+
+    if not username:
+        return False
+
+    username = str(username).strip()
+
+    if not username:
+        return False
+
+    return True
+
+
+def _search_peer_link(entity):
+    """
+    Only generate public username links.
+
+    We intentionally DO NOT generate t.me/c/... links here because
+    those can point to private/internal Telegram chats.
+    """
+
+    if not _search_is_public_peer(entity):
+        return None
+
+    username = getattr(entity, "username", None)
+
+    if username:
+        return f"https://t.me/{username}"
+
     return None
 
 
 def _search_message_link(entity, message_id):
+    """
+    Message links are generated only for public username-based chats.
+    """
+
+    if not _search_is_public_peer(entity):
+        return None
+
     username = getattr(entity, "username", None)
-    if username: return f"https://t.me/{username}/{message_id}"
-    marked_id = _search_peer_marked_id(entity)
-    if marked_id is not None and marked_id < 0:
-        # Force clickable link for message in chats/groups
-        return f"https://t.me/c/{str(abs(marked_id))}/{message_id}"
+
+    if username and message_id:
+        return f"https://t.me/{username}/{message_id}"
+
     return None
 
 
 def _search_message_type(message):
-    if getattr(message, "photo", None): return "photo"
-    if getattr(message, "video", None): return "video"
-    if getattr(message, "voice", None): return "voice"
-    if getattr(message, "audio", None): return "audio"
-    if getattr(message, "gif", None): return "gif"
-    if getattr(message, "document", None): return "document"
+    if getattr(message, "photo", None):
+        return "photo"
+
+    if getattr(message, "video", None):
+        return "video"
+
+    if getattr(message, "voice", None):
+        return "voice"
+
+    if getattr(message, "audio", None):
+        return "audio"
+
+    if getattr(message, "gif", None):
+        return "gif"
+
+    if getattr(message, "document", None):
+        return "document"
+
     text = (getattr(message, "message", None) or "").strip()
-    if re.search(r"https?://|t\.me/|www\.", text, re.I): return "link"
+
+    if re.search(r"https?://|t\.me/|www\.", text, re.I):
+        return "link"
+
     return "text"
 
 
 def _search_content(message):
     text = (getattr(message, "message", None) or "").strip()
-    if text: return re.sub(r"\s+", " ", text)[:180]
+
+    if text:
+        return re.sub(r"\s+", " ", text)[:180]
+
     media_type = _search_message_type(message)
-    labels = {"photo": "📷 Photo", "video": "🎬 Video", "voice": "🎤 Voice message",
-              "audio": "🎵 Audio", "gif": "🎞️ GIF", "document": "📄 Document",
-              "link": "🔗 Link", "text": "💬 Message"}
+
+    labels = {
+        "photo": "📷 Photo",
+        "video": "🎬 Video",
+        "voice": "🎤 Voice message",
+        "audio": "🎵 Audio",
+        "gif": "🎞️ GIF",
+        "document": "📄 Document",
+        "link": "🔗 Link",
+        "text": "💬 Message",
+    }
+
     return labels.get(media_type, "💬 Message")
 
 
-async def _get_joined_peer_ids(context):
-    now = time.monotonic()
-    cached_at = context.application.bot_data.get("search_joined_cache_at", 0.0)
-    cached_ids = context.application.bot_data.get("search_joined_ids")
-    if cached_ids is not None and now - cached_at < SEARCH_JOINED_CACHE_SECONDS:
-        return set(cached_ids)
-
-    joined = set()
-    try:
-        async for dialog in telethon_client.iter_dialogs():
-            entity = getattr(dialog, "entity", None)
-            if entity is None: continue
-            kind = _search_peer_kind(entity)
-            if kind in {"group", "channel"}:
-                marked = _search_peer_marked_id(entity)
-                if marked is not None: joined.add(marked)
-    except Exception as exc:
-        if cached_ids is not None:
-            print(f"[Search] Cache refresh failed, using old cache: {exc}")
-            return set(cached_ids)
-        raise RuntimeError(f"Could not load joined chats for exclusion: {exc}")
-
-    context.application.bot_data["search_joined_ids"] = joined
-    context.application.bot_data["search_joined_cache_at"] = now
-    return joined
-
-
 def _search_peer_from_result(peer_id, peer_map):
-    if peer_id is None: return None
-    try: return peer_map.get(int(peer_id))
-    except Exception: return None
+    if peer_id is None:
+        return None
+
+    try:
+        return peer_map.get(int(peer_id))
+    except Exception:
+        return None
 
 
 async def fetch_search(update, context, query):
     query = (query or "").strip()
+
     if not query:
-        await update.message.reply_text("🔎 Please enter a keyword, for example: Logic mid")
+        await update.message.reply_text(
+            "🔎 Please enter a keyword, for example: Logic mid"
+        )
         return
 
     search_id = uuid.uuid4().hex[:8]
+
+    # ---------------------------------------------------------
+    # USER-SPECIFIC SEARCH STATE
+    # ---------------------------------------------------------
+
     context.user_data["search_id"] = search_id
     context.user_data.pop("search_results", None)
     context.user_data.pop("search_query", None)
     context.user_data.pop("search_filter", None)
     context.user_data.pop("search_page", None)
-    # Reset pagination state
+
     context.user_data["search_next_rate"] = 0
     context.user_data["search_next_peer"] = types.InputPeerEmpty()
     context.user_data["search_next_id"] = 0
 
     status_msg = await update.message.reply_text(
-        f"🔎 Searching Telegram globally for: <b>{html.escape(query)}</b>\n"
-        "⚡ Server-side search • excluding your joined groups/channels",
+        f"🔎 Searching public Telegram content for: "
+        f"<b>{html.escape(query)}</b>\n"
+        "🌐 Public channels and public groups only",
         parse_mode=ParseMode.HTML,
     )
 
     started = time.monotonic()
+
     try:
-        joined_ids = await _get_joined_peer_ids(context)
         all_peer_entities = {}
         results = []
         seen = set()
-        joined_hidden = 0
+
+        fetched = 0
+        global_rank = 0
 
         offset_rate = 0
         offset_peer = types.InputPeerEmpty()
         offset_id = 0
-        fetched = 0
-        global_rank = 0
 
-        # --- TRUE TELEGRAM PAGINATION LOOP (Up to 5000 Results) ---
+        # -----------------------------------------------------
+        # TELEGRAM GLOBAL SEARCH
+        #
+        # NOTE:
+        # telethon_client is still the admin/account session.
+        # The security boundary below is _search_is_public_peer().
+        # -----------------------------------------------------
+
         while fetched < SEARCH_MAX_FETCH:
+
             global_result = await telethon_client(
                 functions.messages.SearchGlobalRequest(
-                    q=query, filter=types.InputMessagesFilterEmpty(),
-                    min_date=0, max_date=0,
-                    offset_rate=offset_rate, offset_peer=offset_peer, offset_id=offset_id,
+                    q=query,
+                    filter=types.InputMessagesFilterEmpty(),
+                    min_date=0,
+                    max_date=0,
+                    offset_rate=offset_rate,
+                    offset_peer=offset_peer,
+                    offset_id=offset_id,
                     limit=SEARCH_GLOBAL_LIMIT,
                 )
             )
 
-            # Add entities from this batch to the overall map
-            for entity in list(getattr(global_result, "chats", []) or []) + list(getattr(global_result, "users", []) or []):
-                marked = _search_peer_marked_id(entity)
-                if marked is not None: all_peer_entities[marked] = entity
+            # -------------------------------------------------
+            # COLLECT ENTITIES
+            # -------------------------------------------------
 
-            batch_messages = list(getattr(global_result, "messages", []) or [])
-            if not batch_messages: break
+            entities = (
+                list(getattr(global_result, "chats", []) or [])
+                +
+                list(getattr(global_result, "users", []) or [])
+            )
+
+            for entity in entities:
+                marked = _search_peer_marked_id(entity)
+
+                if marked is None:
+                    continue
+
+                # SECURITY:
+                # Store ONLY public entities.
+                if not _search_is_public_peer(entity):
+                    continue
+
+                all_peer_entities[marked] = entity
+
+            batch_messages = list(
+                getattr(global_result, "messages", []) or []
+            )
+
+            if not batch_messages:
+                break
+
+            # -------------------------------------------------
+            # PROCESS MESSAGES
+            # -------------------------------------------------
 
             for message in batch_messages:
-                marked_peer = _search_peer_marked_id(message.peer_id)
-                entity = _search_peer_from_result(marked_peer, all_peer_entities)
 
-                if entity is None: continue
+                marked_peer = _search_peer_marked_id(
+                    getattr(message, "peer_id", None)
+                )
+
+                if marked_peer is None:
+                    continue
+
+                entity = _search_peer_from_result(
+                    marked_peer,
+                    all_peer_entities
+                )
+
+                if entity is None:
+                    continue
+
+                # -------------------------------------------------
+                # CRITICAL SECURITY CHECK
+                #
+                # If the entity is not public, NEVER display it.
+                #
+                # This is what prevents private/admin history
+                # from being shown to bot users.
+                # -------------------------------------------------
+
+                if not _search_is_public_peer(entity):
+                    continue
 
                 peer_kind = _search_peer_kind(entity)
 
-                if marked_peer in joined_ids and peer_kind in {"group", "channel"}:
-                    joined_hidden += 1
+                if peer_kind not in {
+                    "channel",
+                    "group",
+                    "bot",
+                    "user",
+                }:
                     continue
 
                 message_id = getattr(message, "id", None)
-                if not message_id: continue
 
-                key = (marked_peer, int(message_id))
-                if key in seen: continue
+                if not message_id:
+                    continue
+
+                key = (
+                    marked_peer,
+                    int(message_id),
+                )
+
+                if key in seen:
+                    continue
+
                 seen.add(key)
 
                 media_type = _search_message_type(message)
-                link = _search_message_link(entity, message_id)
+
+                link = _search_message_link(
+                    entity,
+                    message_id
+                )
+
                 global_rank += 1
+
                 results.append({
-                    "kind": "message", "type": media_type, "peer_type": peer_kind,
-                    "peer_id": marked_peer, "entity": entity, "message": message,
-                    "link": link, "content": _search_content(message),
+                    "kind": "message",
+                    "type": media_type,
+                    "peer_type": peer_kind,
+                    "peer_id": marked_peer,
+                    "entity": entity,
+                    "message": message,
+                    "link": link,
+                    "content": _search_content(message),
                     "title": _search_peer_name(entity),
                     "username": getattr(entity, "username", None),
                     "date": getattr(message, "date", None),
                     "rank": global_rank,
                 })
 
-            # --- PAGINATION LOGIC ---
-            next_rate = getattr(global_result, "next_rate", 0)
-            
-            # Update the "Load More" state
+            # -------------------------------------------------
+            # PAGINATION
+            # -------------------------------------------------
+
+            next_rate = getattr(
+                global_result,
+                "next_rate",
+                0
+            )
+
             context.user_data["search_next_rate"] = next_rate
-            context.user_data["search_next_peer"] = batch_messages[-1].peer_id if batch_messages else types.InputPeerEmpty()
-            context.user_data["search_next_id"] = batch_messages[-1].id if batch_messages else 0
-            
-            if next_rate == 0: break
-            
-            last_msg = batch_messages[-1]
-            offset_peer = last_msg.peer_id
-            offset_id = last_msg.id
+
+            if batch_messages:
+
+                last_message = batch_messages[-1]
+
+                context.user_data["search_next_peer"] = (
+                    getattr(
+                        last_message,
+                        "peer_id",
+                        types.InputPeerEmpty()
+                    )
+                )
+
+                context.user_data["search_next_id"] = (
+                    getattr(
+                        last_message,
+                        "id",
+                        0
+                    )
+                )
+
+            if not next_rate:
+                break
+
+            last_message = batch_messages[-1]
+
+            offset_peer = getattr(
+                last_message,
+                "peer_id",
+                types.InputPeerEmpty()
+            )
+
+            offset_id = getattr(
+                last_message,
+                "id",
+                0
+            )
+
             offset_rate = next_rate
+
             fetched += len(batch_messages)
-            
+
             await asyncio.sleep(0.2)
 
-        # Add standalone peer cards from ALL collected entities
+        # -----------------------------------------------------
+        # ADD PUBLIC PEER RESULTS
+        # -----------------------------------------------------
+
         for marked, entity in all_peer_entities.items():
+
+            if not _search_is_public_peer(entity):
+                continue
+
             kind = _search_peer_kind(entity)
-            if kind in {"group", "channel"} and marked in joined_ids: continue
-            if kind not in {"group", "channel", "bot", "user"}: continue
-            if any(r["peer_id"] == marked for r in results): continue
+
+            if kind not in {
+                "group",
+                "channel",
+                "bot",
+                "user",
+            }:
+                continue
+
+            if any(
+                r["peer_id"] == marked
+                for r in results
+            ):
+                continue
 
             name = _search_peer_name(entity)
-            username = getattr(entity, "username", None)
+
+            username = getattr(
+                entity,
+                "username",
+                None
+            )
+
             peer_link = _search_peer_link(entity)
-            peer_key = ("peer", marked)
-            if peer_key in seen: continue
+
+            if not peer_link:
+                continue
+
+            peer_key = (
+                "peer",
+                marked
+            )
+
+            if peer_key in seen:
+                continue
+
             seen.add(peer_key)
+
             global_rank += 1
+
+            icon = {
+                "bot": "🤖",
+                "channel": "📢",
+                "group": "👥",
+                "user": "👤",
+            }.get(kind, "🔹")
+
             results.append({
-                "kind": "peer", "type": kind, "peer_type": kind,
-                "peer_id": marked, "entity": entity, "message": None,
+                "kind": "peer",
+                "type": kind,
+                "peer_type": kind,
+                "peer_id": marked,
+                "entity": entity,
+                "message": None,
                 "link": peer_link,
-                "content": f"{('🤖' if kind == 'bot' else '📢' if kind == 'channel' else '👥' if kind == 'group' else '👤')} {name}",
+                "content": f"{icon} {name}",
                 "title": name,
                 "username": username,
                 "date": None,
                 "rank": global_rank,
             })
 
-        # RACE CONDITION FIX
+        # -----------------------------------------------------
+        # RACE CONDITION PROTECTION
+        # -----------------------------------------------------
+
         if context.user_data.get("search_id") != search_id:
             return
 
+        # -----------------------------------------------------
+        # NO RESULTS
+        # -----------------------------------------------------
+
         if not results:
+
             await status_msg.edit_text(
-                f"❌ No public results found for <b>{html.escape(query)}</b>.\n\n"
-                "The search intentionally hides results from groups/channels you already joined.",
+                f"❌ No public results found for "
+                f"<b>{html.escape(query)}</b>.",
                 parse_mode=ParseMode.HTML,
             )
+
             return
 
-        results.sort(key=lambda item: item.get("rank", 0), reverse=False)
+        # -----------------------------------------------------
+        # SORT RESULTS
+        # -----------------------------------------------------
+
+        results.sort(
+            key=lambda item: item.get("rank", 0)
+        )
+
+        # -----------------------------------------------------
+        # SAVE ONLY TO THIS BOT USER'S SESSION
+        # -----------------------------------------------------
 
         context.user_data["search_results"] = results[:5000]
         context.user_data["search_query"] = query
         context.user_data["search_filter"] = "all"
         context.user_data["search_page"] = 1
-        context.user_data["search_joined_hidden"] = joined_hidden
-        context.user_data["search_elapsed"] = round(time.monotonic() - started, 2)
+        context.user_data["search_elapsed"] = round(
+            time.monotonic() - started,
+            2
+        )
 
         await status_msg.delete()
-        await display_search_page(update, context, 1, "all")
+
+        await display_search_page(
+            update,
+            context,
+            1,
+            "all"
+        )
 
     except FloodWaitError as e:
-        await status_msg.edit_text(f"⏳ Telegram rate limit. Please wait {e.seconds} seconds and try again.")
-    except Exception as e:
-        print(f"[Search] Global search failed: {type(e).__name__}: {e}")
+
         await status_msg.edit_text(
-            f"❌ Search failed: <code>{html.escape(type(e).__name__)}</code>\n\n"
+            f"⏳ Telegram rate limit. "
+            f"Please wait {e.seconds} seconds and try again."
+        )
+
+    except Exception as e:
+
+        print(
+            f"[Search] Global search failed: "
+            f"{type(e).__name__}: {e}"
+        )
+
+        await status_msg.edit_text(
+            f"❌ Search failed: "
+            f"<code>{html.escape(type(e).__name__)}</code>\n\n"
             f"{html.escape(str(e)[:700])}",
             parse_mode=ParseMode.HTML,
         )
 
 
 async def load_more_results(update, context):
-    """Loads the next batch of results from Telegram for unlimited browsing."""
+    """
+    Load the next public-search batch.
+
+    IMPORTANT:
+    Never fetch an entity and then automatically trust it.
+    Every entity is checked with _search_is_public_peer().
+    """
+
     q = update.callback_query
+
     await q.answer()
-    
+
     query = context.user_data.get("search_query")
-    if not query: return
-    
-    offset_rate = context.user_data.get("search_next_rate", 0)
-    offset_peer = context.user_data.get("search_next_peer", types.InputPeerEmpty())
-    offset_id = context.user_data.get("search_next_id", 0)
-    
-    status = await q.message.reply_text("📥 Loading more results...")
+
+    if not query:
+        return
+
+    offset_rate = context.user_data.get(
+        "search_next_rate",
+        0
+    )
+
+    offset_peer = context.user_data.get(
+        "search_next_peer",
+        types.InputPeerEmpty()
+    )
+
+    offset_id = context.user_data.get(
+        "search_next_id",
+        0
+    )
+
+    status = await q.message.reply_text(
+        "📥 Loading more public results..."
+    )
+
     try:
+
         global_result = await telethon_client(
             functions.messages.SearchGlobalRequest(
-                q=query, filter=types.InputMessagesFilterEmpty(),
-                min_date=0, max_date=0,
-                offset_rate=offset_rate, offset_peer=offset_peer, offset_id=offset_id,
+                q=query,
+                filter=types.InputMessagesFilterEmpty(),
+                min_date=0,
+                max_date=0,
+                offset_rate=offset_rate,
+                offset_peer=offset_peer,
+                offset_id=offset_id,
                 limit=SEARCH_GLOBAL_LIMIT,
             )
         )
-        
-        new_results = []
-        existing_results = context.user_data.get("search_results", [])
-        existing_keys = {(r["peer_id"], r.get("message").id if r.get("message") else "peer") for r in existing_results}
-        
-        batch_messages = list(getattr(global_result, "messages", []) or [])
-        
-        for message in batch_messages:
-            marked_peer = _search_peer_marked_id(message.peer_id)
-            entity = _search_peer_from_result(marked_peer, {})
-            # We don't have the entity map here easily, so we reconstruct it from the result
-            for r in existing_results:
-                if r["peer_id"] == marked_peer:
-                    entity = r["entity"]
-                    break
-            
-            if entity is None: 
-                # Try to fetch entity if missing
-                try:
-                    entity = await telethon_client.get_entity(message.peer_id)
-                except:
-                    continue
-            
-            peer_kind = _search_peer_kind(entity)
-            if marked_peer in context.user_data.get("search_joined_ids", set()) and peer_kind in {"group", "channel"}:
+
+        # -----------------------------------------------------
+        # BUILD ENTITY MAP FROM THIS RESPONSE
+        # -----------------------------------------------------
+
+        peer_map = {}
+
+        entities = (
+            list(getattr(global_result, "chats", []) or [])
+            +
+            list(getattr(global_result, "users", []) or [])
+        )
+
+        for entity in entities:
+
+            if not _search_is_public_peer(entity):
                 continue
-            
-            message_id = getattr(message, "id", None)
-            if not message_id: continue
-            
-            if (marked_peer, message_id) in existing_keys: continue
-            
-            existing_keys.add((marked_peer, message_id))
-            media_type = _search_message_type(message)
-            link = _search_message_link(entity, message_id)
+
+            marked = _search_peer_marked_id(entity)
+
+            if marked is None:
+                continue
+
+            peer_map[marked] = entity
+
+        new_results = []
+
+        existing_results = context.user_data.get(
+            "search_results",
+            []
+        )
+
+        existing_keys = set()
+
+        for r in existing_results:
+
+            message = r.get("message")
+
+            if message is not None:
+                existing_keys.add(
+                    (
+                        r.get("peer_id"),
+                        getattr(message, "id", None)
+                    )
+                )
+            else:
+                existing_keys.add(
+                    (
+                        r.get("peer_id"),
+                        "peer"
+                    )
+                )
+
+        batch_messages = list(
+            getattr(global_result, "messages", []) or []
+        )
+
+        for message in batch_messages:
+
+            marked_peer = _search_peer_marked_id(
+                getattr(message, "peer_id", None)
+            )
+
+            if marked_peer is None:
+                continue
+
+            entity = peer_map.get(marked_peer)
+
+            # -------------------------------------------------
+            # If entity is missing, DO NOT blindly fetch it.
+            # A get_entity() call could retrieve a private entity
+            # belonging to the admin account.
+            # -------------------------------------------------
+
+            if entity is None:
+                continue
+
+            # -------------------------------------------------
+            # CRITICAL SECURITY CHECK
+            # -------------------------------------------------
+
+            if not _search_is_public_peer(entity):
+                continue
+
+            peer_kind = _search_peer_kind(entity)
+
+            if peer_kind not in {
+                "channel",
+                "group",
+                "bot",
+                "user",
+            }:
+                continue
+
+            message_id = getattr(
+                message,
+                "id",
+                None
+            )
+
+            if not message_id:
+                continue
+
+            key = (
+                marked_peer,
+                message_id
+            )
+
+            if key in existing_keys:
+                continue
+
+            existing_keys.add(key)
+
+            media_type = _search_message_type(
+                message
+            )
+
+            link = _search_message_link(
+                entity,
+                message_id
+            )
+
+            if not link:
+                continue
+
             new_results.append({
-                "kind": "message", "type": media_type, "peer_type": peer_kind,
-                "peer_id": marked_peer, "entity": entity, "message": message,
-                "link": link, "content": _search_content(message),
+                "kind": "message",
+                "type": media_type,
+                "peer_type": peer_kind,
+                "peer_id": marked_peer,
+                "entity": entity,
+                "message": message,
+                "link": link,
+                "content": _search_content(message),
                 "title": _search_peer_name(entity),
-                "username": getattr(entity, "username", None),
-                "date": getattr(message, "date", None),
-                "rank": len(existing_results) + len(new_results),
+                "username": getattr(
+                    entity,
+                    "username",
+                    None
+                ),
+                "date": getattr(
+                    message,
+                    "date",
+                    None
+                ),
+                "rank": (
+                    len(existing_results)
+                    +
+                    len(new_results)
+                ),
             })
-        
+
         if new_results:
-            context.user_data["search_results"] = existing_results + new_results
-        
-        # Update pagination offsets
-        next_rate = getattr(global_result, "next_rate", 0)
+
+            context.user_data["search_results"] = (
+                existing_results
+                +
+                new_results
+            )
+
+        # -----------------------------------------------------
+        # UPDATE PAGINATION
+        # -----------------------------------------------------
+
+        next_rate = getattr(
+            global_result,
+            "next_rate",
+            0
+        )
+
         context.user_data["search_next_rate"] = next_rate
+
         if batch_messages:
-            context.user_data["search_next_peer"] = batch_messages[-1].peer_id
-            context.user_data["search_next_id"] = batch_messages[-1].id
-        
+
+            last_message = batch_messages[-1]
+
+            context.user_data["search_next_peer"] = (
+                getattr(
+                    last_message,
+                    "peer_id",
+                    types.InputPeerEmpty()
+                )
+            )
+
+            context.user_data["search_next_id"] = (
+                getattr(
+                    last_message,
+                    "id",
+                    0
+                )
+            )
+
         await status.delete()
-        await display_search_page(update, context, 1, context.user_data.get("search_filter", "all"))
-        
+
+        await display_search_page(
+            update,
+            context,
+            1,
+            context.user_data.get(
+                "search_filter",
+                "all"
+            )
+        )
+
     except FloodWaitError as e:
-        await status.edit_text(f"⏳ Rate limit. Wait {e.seconds}s.")
+
+        await status.edit_text(
+            f"⏳ Rate limit. Wait {e.seconds}s."
+        )
+
     except Exception as e:
-        await status.edit_text(f"❌ Error loading more: {e}")
+
+        await status.edit_text(
+            f"❌ Error: "
+            f"{html.escape(str(e)[:700])}",
+            parse_mode=ParseMode.HTML
+        )
 
 
 def _search_filter_match(item, filter_type):
-    if filter_type == "all": return True
-    if filter_type == "messages": return item.get("kind") == "message"
-    if filter_type == "peers": return item.get("kind") == "peer"
-    if filter_type == "photos": return item.get("type") == "photo"
-    if filter_type == "videos": return item.get("type") == "video"
-    if filter_type == "files": return item.get("type") == "document"
-    if filter_type == "gifs": return item.get("type") == "gif"
-    if filter_type == "audio": return item.get("type") in {"audio", "voice"}
-    if filter_type == "links": return item.get("type") == "link"
-    if filter_type == "channels": return item.get("peer_type") == "channel" and item.get("kind") == "peer"
-    if filter_type == "groups": return item.get("peer_type") == "group" and item.get("kind") == "peer"
-    if filter_type == "bots": return item.get("peer_type") == "bot" and item.get("kind") == "peer"
-    if filter_type == "users": return item.get("peer_type") == "user" and item.get("kind") == "peer"
+
+    if filter_type == "all":
+        return True
+
+    if filter_type == "messages":
+        return item.get("kind") == "message"
+
+    if filter_type == "peers":
+        return item.get("kind") == "peer"
+
+    if filter_type == "photos":
+        return item.get("type") == "photo"
+
+    if filter_type == "videos":
+        return item.get("type") == "video"
+
+    if filter_type == "files":
+        return item.get("type") == "document"
+
+    if filter_type == "gifs":
+        return item.get("type") == "gif"
+
+    if filter_type == "audio":
+        return item.get("type") in {
+            "audio",
+            "voice"
+        }
+
+    if filter_type == "links":
+        return item.get("type") == "link"
+
+    if filter_type == "channels":
+        return (
+            item.get("peer_type") == "channel"
+            and
+            item.get("kind") == "peer"
+        )
+
+    if filter_type == "groups":
+        return (
+            item.get("peer_type") == "group"
+            and
+            item.get("kind") == "peer"
+        )
+
+    if filter_type == "bots":
+        return (
+            item.get("peer_type") == "bot"
+            and
+            item.get("kind") == "peer"
+        )
+
+    if filter_type == "users":
+        return (
+            item.get("peer_type") == "user"
+            and
+            item.get("kind") == "peer"
+        )
+
     return True
 
 
 def _search_filter_buttons(results, active):
+
     definitions = [
-        ("all", "🔎 All"), ("messages", "💬 Messages"), ("peers", "👥 Peers"),
-        ("photos", "📷 Photos"), ("videos", "🎬 Videos"), ("files", "📄 Files"),
-        ("gifs", "🎞️ GIFs"), ("audio", "🎵 Audio"), ("links", "🔗 Links"),
-        ("channels", "📢 Channels"), ("groups", "👥 Groups"),
-        ("bots", "🤖 Bots"), ("users", "👤 Users"),
+        ("all", "🔎 All"),
+        ("messages", "💬 Messages"),
+        ("peers", "👥 Peers"),
+        ("photos", "📷 Photos"),
+        ("videos", "🎬 Videos"),
+        ("files", "📄 Files"),
+        ("gifs", "🎞️ GIFs"),
+        ("audio", "🎵 Audio"),
+        ("links", "🔗 Links"),
+        ("channels", "📢 Channels"),
+        ("groups", "👥 Groups"),
+        ("bots", "🤖 Bots"),
+        ("users", "👤 Users"),
     ]
 
     counts = {}
+
     for filter_type, _ in definitions:
-        counts[filter_type] = sum(1 for item in results if _search_filter_match(item, filter_type))
+
+        counts[filter_type] = sum(
+            1
+            for item in results
+            if _search_filter_match(
+                item,
+                filter_type
+            )
+        )
 
     available = []
+
     for filter_type, label in definitions:
-        if filter_type == "all" or counts[filter_type] > 0:
-            shown = f"{label} ({counts[filter_type]})"
-            if filter_type == active: shown = f"✅ {shown}"
-            available.append((filter_type, shown))
+
+        if (
+            filter_type == "all"
+            or
+            counts[filter_type] > 0
+        ):
+
+            shown = (
+                f"{label} "
+                f"({counts[filter_type]})"
+            )
+
+            if filter_type == active:
+                shown = f"✅ {shown}"
+
+            available.append(
+                (
+                    filter_type,
+                    shown
+                )
+            )
 
     rows = []
-    for i in range(0, len(available), 3):
-        rows.append([InlineKeyboardButton(label, callback_data=f"sf_{filter_type}") for filter_type, label in available[i:i + 3]])
+
+    for i in range(
+        0,
+        len(available),
+        3
+    ):
+
+        row = []
+
+        for filter_type, label in available[i:i + 3]:
+
+            row.append(
+                InlineKeyboardButton(
+                    label,
+                    callback_data=f"sf_{filter_type}"
+                )
+            )
+
+        rows.append(row)
+
     return rows, counts
 
 
-async def display_search_page(update, context, page, filter_type=None):
-    callback = update.callback_query
-    if callback: await callback.answer()
+async def display_search_page(
+    update,
+    context,
+    page,
+    filter_type=None
+):
 
-    if not context.user_data.get("search_results"):
-        await update.message.reply_text("❌ Search session expired. Please search again.")
+    callback = update.callback_query
+
+    if callback:
+        await callback.answer()
+
+    if not context.user_data.get(
+        "search_results"
+    ):
+
+        if callback:
+
+            await callback.message.reply_text(
+                "❌ Search session expired. "
+                "Please search again."
+            )
+
+        else:
+
+            await update.message.reply_text(
+                "❌ Search session expired. "
+                "Please search again."
+            )
+
         return
 
-    results = context.user_data.get("search_results", [])
-    search_query = context.user_data.get("search_query", "")
-    active = filter_type or context.user_data.get("search_filter", "all")
+    results = context.user_data.get(
+        "search_results",
+        []
+    )
 
-    filtered = [item for item in results if _search_filter_match(item, active)]
+    search_query = context.user_data.get(
+        "search_query",
+        ""
+    )
+
+    active = (
+        filter_type
+        or
+        context.user_data.get(
+            "search_filter",
+            "all"
+        )
+    )
+
+    filtered = [
+        item
+        for item in results
+        if _search_filter_match(
+            item,
+            active
+        )
+    ]
+
     per_page = SEARCH_PAGE_SIZE
+
     total_results = len(filtered)
-    total_pages = max(1, (total_results + per_page - 1) // per_page)
-    page = max(1, min(int(page), total_pages))
-    
+
+    total_pages = max(
+        1,
+        (
+            total_results
+            +
+            per_page
+            -
+            1
+        )
+        //
+        per_page
+    )
+
+    page = max(
+        1,
+        min(
+            int(page),
+            total_pages
+        )
+    )
+
     context.user_data["search_page"] = page
     context.user_data["search_filter"] = active
 
-    start = (page - 1) * per_page
-    page_items = filtered[start:start + per_page]
+    start = (
+        page - 1
+    ) * per_page
 
-    elapsed = context.user_data.get("search_elapsed", 0)
-    joined_hidden = context.user_data.get("search_joined_hidden", 0)
+    page_items = filtered[
+        start:start + per_page
+    ]
+
+    elapsed = context.user_data.get(
+        "search_elapsed",
+        0
+    )
 
     lines = [
         "<blockquote>",
-        "<b>🌐 GLOBAL TELEGRAM SEARCH</b>",
-        f"🔎 <b>{html.escape(search_query)}</b>",
-        f"⚡ {elapsed}s • {joined_hidden} hidden during fetch",
+        "<b>🌐 PUBLIC TELEGRAM SEARCH</b>",
+        (
+            f"🔎 <b>"
+            f"{html.escape(search_query)}"
+            f"</b>"
+        ),
+        (
+            f"⚡ {elapsed}s"
+        ),
         "",
     ]
 
     if not page_items:
-        lines.append("<i>No results in this filter.</i>")
+
+        lines.append(
+            "<i>No results in this filter.</i>"
+        )
+
     else:
-        for index, item in enumerate(page_items, start=start + 1):
-            peer_name = html.escape(item.get("title") or "Unknown")
-            username = item.get("username")
-            username_text = f" @{html.escape(username)}" if username else ""
-            icon = {"photo": "📷", "video": "🎬", "document": "📄", "gif": "🎞️",
-                    "audio": "🎵", "voice": "🎤", "link": "🔗", "bot": "🤖",
-                    "channel": "📢", "group": "👥", "user": "👤", "text": "💬"}.get(item.get("type"), "🔹")
 
-            content = html.escape(item.get("content") or "")
-            if len(content) > 180: content = content[:177] + "..."
+        for index, item in enumerate(
+            page_items,
+            start=start + 1
+        ):
 
-            # FORCE CLICKABLE LINKS FOR EVERYTHING
+            peer_name = html.escape(
+                item.get("title")
+                or
+                "Unknown"
+            )
+
+            username = item.get(
+                "username"
+            )
+
+            username_text = (
+                f" @{html.escape(username)}"
+                if username
+                else ""
+            )
+
+            icon = {
+                "photo": "📷",
+                "video": "🎬",
+                "document": "📄",
+                "gif": "🎞️",
+                "audio": "🎵",
+                "voice": "🎤",
+                "link": "🔗",
+                "bot": "🤖",
+                "channel": "📢",
+                "group": "👥",
+                "user": "👤",
+                "text": "💬",
+            }.get(
+                item.get("type"),
+                "🔹"
+            )
+
+            content = html.escape(
+                item.get("content")
+                or
+                ""
+            )
+
+            if len(content) > 180:
+                content = (
+                    content[:177]
+                    +
+                    "..."
+                )
+
             link = item.get("link")
-            if not link:
-                marked_id = item.get("peer_id")
-                if marked_id:
-                    if item.get("kind") == "message":
-                        link = f"https://t.me/c/{str(abs(marked_id))}/{item.get('message').id if item.get('message') else ''}"
-                    else:
-                        link = f"https://t.me/c/{str(abs(marked_id))}"
+
+            # -------------------------------------------------
+            # SECURITY:
+            # Never manufacture t.me/c/... links.
+            # -------------------------------------------------
 
             if link:
+
                 lines.append(
-                    f"<b>{index}.</b> {icon} <a href=\"{html.escape(link, quote=True)}\">"
-                    f"{peer_name}{username_text}</a>\n{content}\n"
-                )
-            else:
-                lines.append(
-                    f"<b>{index}.</b> {icon} <b>{peer_name}{username_text}</b>\n{content}\n"
+                    f"<b>{index}.</b> "
+                    f"{icon} "
+                    f"<a href=\""
+                    f"{html.escape(link, quote=True)}"
+                    f"\">"
+                    f"{peer_name}"
+                    f"{username_text}"
+                    f"</a>\n"
+                    f"{content}\n"
                 )
 
-    lines.append(f"Page {page}/{total_pages} • {total_results} results")
-    lines.append("Sort by relevance and activity")
+            else:
+
+                lines.append(
+                    f"<b>{index}.</b> "
+                    f"{icon} "
+                    f"<b>"
+                    f"{peer_name}"
+                    f"{username_text}"
+                    f"</b>\n"
+                    f"{content}\n"
+                )
+
+    lines.append(
+        f"Page {page}/{total_pages} "
+        f"• {total_results} results"
+    )
+
+    lines.append(
+        "🌐 Public Telegram content only"
+    )
+
     lines.append("</blockquote>")
+
     text = "\n".join(lines)
 
-    kb, counts = _search_filter_buttons(results, active)
+    kb, counts = _search_filter_buttons(
+        results,
+        active
+    )
 
     nav = []
+
     if page > 1:
-        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"search_page_{page - 1}"))
+
+        nav.append(
+            InlineKeyboardButton(
+                "⬅️ Prev",
+                callback_data=(
+                    f"search_page_{page - 1}"
+                )
+            )
+        )
+
     if page < total_pages:
-        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"search_page_{page + 1}"))
-    
-    # Add "Load More" button for unlimited browsing
-    if context.user_data.get("search_next_rate", 0) != 0 and len(results) < SEARCH_MAX_FETCH:
-        nav.append(InlineKeyboardButton("📥 Load More", callback_data="search_load_more"))
-        
-    if nav: kb.append(nav)
+
+        nav.append(
+            InlineKeyboardButton(
+                "Next ➡️",
+                callback_data=(
+                    f"search_page_{page + 1}"
+                )
+            )
+        )
+
+    if (
+        context.user_data.get(
+            "search_next_rate",
+            0
+        ) != 0
+        and
+        len(results) < SEARCH_MAX_FETCH
+    ):
+
+        nav.append(
+            InlineKeyboardButton(
+                "📥 Load More",
+                callback_data="search_load_more"
+            )
+        )
+
+    if nav:
+        kb.append(nav)
 
     kb.append([
-        InlineKeyboardButton("🔄 New Search", callback_data="search"),
-        InlineKeyboardButton("⬅️ Back", callback_data="more"),
+        InlineKeyboardButton(
+            "🔄 New Search",
+            callback_data="search"
+        ),
+        InlineKeyboardButton(
+            "⬅️ Back",
+            callback_data="more"
+        ),
     ])
+
     markup = InlineKeyboardMarkup(kb)
 
     if callback:
-        try:
-            await callback.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-        except Exception as exc:
-            if "message is not modified" not in str(exc).lower(): raise
-    else:
-        await update.message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
+        try:
+
+            await callback.edit_message_text(
+                text,
+                reply_markup=markup,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+
+        except Exception as exc:
+
+            if (
+                "message is not modified"
+                not in str(exc).lower()
+            ):
+                raise
+
+    else:
+
+        await update.message.reply_text(
+            text,
+            reply_markup=markup,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+
+
+# --- FRIEND SEARCH ---
+# This function is unrelated to the global-search privacy issue.
+# It is kept separate from the search implementation above.
+
+async def fetch_friends(update, context, text):
+
+    parts = text.split()
+
+    if len(parts) < 2:
+
+        await update.message.reply_text(
+            "⚠️ Use: @group @user"
+        )
+
+        return
+
+    try:
+
+        group_entity = await telethon_client.get_entity(
+            parts[0]
+        )
+
+        target_user = await telethon_client.get_entity(
+            parts[1]
+        )
+
+        messages = await telethon_client.get_messages(
+            group_entity,
+            limit=500
+        )
+
+        reply_data = {}
+
+        for m in messages:
+
+            if (
+                m.sender_id == target_user.id
+                and
+                m.reply_to_msg_id
+            ):
+
+                try:
+
+                    reply_to_msg = (
+                        await telethon_client.get_messages(
+                            group_entity,
+                            ids=m.reply_to_msg_id
+                        )
+                    )
+
+                    if (
+                        reply_to_msg
+                        and
+                        reply_to_msg.sender_id
+                    ):
+
+                        sender_id = (
+                            reply_to_msg.sender_id
+                        )
+
+                        if sender_id not in reply_data:
+
+                            reply_data[sender_id] = {
+                                "count": 0,
+                                "date": str(m.date),
+                            }
+
+                            try:
+
+                                sender_entity = (
+                                    await telethon_client.get_entity(
+                                        sender_id
+                                    )
+                                )
+
+                                first_name = (
+                                    getattr(
+                                        sender_entity,
+                                        "first_name",
+                                        ""
+                                    )
+                                    or
+                                    ""
+                                )
+
+                                last_name = (
+                                    getattr(
+                                        sender_entity,
+                                        "last_name",
+                                        ""
+                                    )
+                                    or
+                                    ""
+                                )
+
+                                reply_data[sender_id]["name"] = (
+                                    f"{first_name} "
+                                    f"{last_name}"
+                                ).strip()
+
+                            except Exception:
+
+                                reply_data[sender_id]["name"] = (
+                                    "Unknown"
+                                )
+
+                        reply_data[sender_id]["count"] += 1
+
+                except Exception:
+                    pass
+
+        sorted_replies = sorted(
+            reply_data.items(),
+            key=lambda x: x[1]["count"],
+            reverse=True
+        )[:10]
+
+        text = (
+            "<blockquote>"
+            "Replies them in the groups:\n"
+            "when - to whom (total times)\n"
+        )
+
+        for sid, data in sorted_replies:
+
+            text += (
+                f"|{data['date'][:5]} - "
+                f"{html.escape(data['name'])} "
+                f"({data['count']})\n"
+            )
+
+        text += "</blockquote>"
+
+        await update.message.reply_text(
+            text,
+            parse_mode=ParseMode.HTML
+        )
+
+    except Exception as e:
+
+        await update.message.reply_text(
+            f"❌ Error: "
+            f"{html.escape(str(e)[:700])}"
+        )
+```
 # --- Preserving your original fetch_friends function ---
 async def fetch_friends(update, context, text):
     parts = text.split(" ")
