@@ -2493,20 +2493,13 @@ async def send_story_at_index(update, context, index):
         await query.message.reply_document(document=media_bytes, caption=caption, reply_markup=kb)
 # --- FAST GLOBAL TELEGRAM SEARCH ---
 # --- FAST GLOBAL TELEGRAM SEARCH ---
-#
-# This version implements TRUE Telegram-side pagination.
-# It uses the 'next_rate' from the response and the last message's peer/id
-# to correctly fetch the next batch, up to a safe limit.
-# It also prevents race conditions by checking the session ID.
-
 SEARCH_PAGE_SIZE = 8
 SEARCH_GLOBAL_LIMIT = 100
-SEARCH_MAX_FETCH = 500  # Safety cap
+SEARCH_MAX_FETCH = 1000  # <--- Increased to 1000 to match Legend Bot
 SEARCH_JOINED_CACHE_SECONDS = 300
 
 
 def _search_peer_marked_id(entity):
-    """Return Telegram's marked peer ID safely using utils.get_peer_id."""
     try:
         return int(get_peer_id(entity))
     except Exception:
@@ -2515,25 +2508,18 @@ def _search_peer_marked_id(entity):
 
 
 def _search_peer_kind(entity):
-    if entity is None:
-        return "unknown"
-    if getattr(entity, "bot", False):
-        return "bot"
-    if hasattr(entity, "broadcast"):
-        return "channel" if getattr(entity, "broadcast", False) else "group"
-    if entity.__class__.__name__ == "Chat":
-        return "group"
-    if hasattr(entity, "first_name") or hasattr(entity, "username"):
-        return "user"
+    if entity is None: return "unknown"
+    if getattr(entity, "bot", False): return "bot"
+    if hasattr(entity, "broadcast"): return "channel" if getattr(entity, "broadcast", False) else "group"
+    if entity.__class__.__name__ == "Chat": return "group"
+    if hasattr(entity, "first_name") or hasattr(entity, "username"): return "user"
     return "unknown"
 
 
 def _search_peer_name(entity):
-    if entity is None:
-        return "Unknown"
+    if entity is None: return "Unknown"
     title = getattr(entity, "title", None)
-    if title:
-        return str(title).strip()
+    if title: return str(title).strip()
     first = (getattr(entity, "first_name", None) or "").strip()
     last = (getattr(entity, "last_name", None) or "").strip()
     name = f"{first} {last}".strip()
@@ -2542,15 +2528,13 @@ def _search_peer_name(entity):
 
 def _search_peer_link(entity):
     username = getattr(entity, "username", None)
-    if username:
-        return f"https://t.me/{username}"
+    if username: return f"https://t.me/{username}"
     return None
 
 
 def _search_message_link(entity, message_id):
     username = getattr(entity, "username", None)
-    if username:
-        return f"https://t.me/{username}/{message_id}"
+    if username: return f"https://t.me/{username}/{message_id}"
     marked_id = _search_peer_marked_id(entity)
     if marked_id is not None and marked_id < -1000000000000:
         internal_id = str(abs(marked_id))[3:]
@@ -2572,19 +2556,15 @@ def _search_message_type(message):
 
 def _search_content(message):
     text = (getattr(message, "message", None) or "").strip()
-    if text:
-        return re.sub(r"\s+", " ", text)[:180]
+    if text: return re.sub(r"\s+", " ", text)[:180]
     media_type = _search_message_type(message)
-    labels = {
-        "photo": "📷 Photo", "video": "🎬 Video", "voice": "🎤 Voice message",
-        "audio": "🎵 Audio", "gif": "🎞️ GIF", "document": "📄 Document",
-        "link": "🔗 Link", "text": "💬 Message",
-    }
+    labels = {"photo": "📷 Photo", "video": "🎬 Video", "voice": "🎤 Voice message",
+              "audio": "🎵 Audio", "gif": "🎞️ GIF", "document": "📄 Document",
+              "link": "🔗 Link", "text": "💬 Message"}
     return labels.get(media_type, "💬 Message")
 
 
 async def _get_joined_peer_ids(context):
-    """Cache joined peer IDs, throwing a clear error if it fails on a cold cache."""
     now = time.monotonic()
     cached_at = context.application.bot_data.get("search_joined_cache_at", 0.0)
     cached_ids = context.application.bot_data.get("search_joined_ids")
@@ -2595,13 +2575,11 @@ async def _get_joined_peer_ids(context):
     try:
         async for dialog in telethon_client.iter_dialogs():
             entity = getattr(dialog, "entity", None)
-            if entity is None:
-                continue
+            if entity is None: continue
             kind = _search_peer_kind(entity)
             if kind in {"group", "channel"}:
                 marked = _search_peer_marked_id(entity)
-                if marked is not None:
-                    joined.add(marked)
+                if marked is not None: joined.add(marked)
     except Exception as exc:
         if cached_ids is not None:
             print(f"[Search] Cache refresh failed, using old cache: {exc}")
@@ -2614,12 +2592,9 @@ async def _get_joined_peer_ids(context):
 
 
 def _search_peer_from_result(peer_id, peer_map):
-    if peer_id is None:
-        return None
-    try:
-        return peer_map.get(int(peer_id))
-    except Exception:
-        return None
+    if peer_id is None: return None
+    try: return peer_map.get(int(peer_id))
+    except Exception: return None
 
 
 async def fetch_search(update, context, query):
@@ -2628,7 +2603,6 @@ async def fetch_search(update, context, query):
         await update.message.reply_text("🔎 Please enter a keyword, for example: Logic mid")
         return
 
-    # Generate a unique session ID to prevent race conditions
     search_id = uuid.uuid4().hex[:8]
     context.user_data["search_id"] = search_id
     context.user_data.pop("search_results", None)
@@ -2645,51 +2619,41 @@ async def fetch_search(update, context, query):
     started = time.monotonic()
     try:
         joined_ids = await _get_joined_peer_ids(context)
-
-        # Accumulate all entities from all batches to fix Problem #3
         all_peer_entities = {}
         results = []
         seen = set()
         joined_hidden = 0
 
-        # Pagination state
         offset_rate = 0
         offset_peer = types.InputPeerEmpty()
         offset_id = 0
         fetched = 0
         global_rank = 0
 
-        # --- TRUE TELEGRAM PAGINATION LOOP ---
+        # --- TRUE TELEGRAM PAGINATION LOOP (Up to 1000 Results) ---
         while fetched < SEARCH_MAX_FETCH:
             global_result = await telethon_client(
                 functions.messages.SearchGlobalRequest(
-                    q=query,
-                    filter=types.InputMessagesFilterEmpty(),
-                    min_date=0,
-                    max_date=0,
-                    offset_rate=offset_rate,
-                    offset_peer=offset_peer,
-                    offset_id=offset_id,
+                    q=query, filter=types.InputMessagesFilterEmpty(),
+                    min_date=0, max_date=0,
+                    offset_rate=offset_rate, offset_peer=offset_peer, offset_id=offset_id,
                     limit=SEARCH_GLOBAL_LIMIT,
                 )
             )
 
-            # Add entities from this batch to the overall map (Fixes Problem #3)
+            # Add entities from this batch to the overall map
             for entity in list(getattr(global_result, "chats", []) or []) + list(getattr(global_result, "users", []) or []):
                 marked = _search_peer_marked_id(entity)
-                if marked is not None:
-                    all_peer_entities[marked] = entity
+                if marked is not None: all_peer_entities[marked] = entity
 
             batch_messages = list(getattr(global_result, "messages", []) or [])
-            if not batch_messages:
-                break
+            if not batch_messages: break
 
             for message in batch_messages:
                 marked_peer = _search_peer_marked_id(message.peer_id)
-                entity = _search_peer_from_result(marked_peer, all_peer_entities) # Use accumulated map
+                entity = _search_peer_from_result(marked_peer, all_peer_entities)
 
-                if entity is None:
-                    continue
+                if entity is None: continue
 
                 peer_kind = _search_peer_kind(entity)
 
@@ -2698,82 +2662,64 @@ async def fetch_search(update, context, query):
                     continue
 
                 message_id = getattr(message, "id", None)
-                if not message_id:
-                    continue
+                if not message_id: continue
 
                 key = (marked_peer, int(message_id))
-                if key in seen:
-                    continue
+                if key in seen: continue
                 seen.add(key)
 
                 media_type = _search_message_type(message)
                 link = _search_message_link(entity, message_id)
                 global_rank += 1
                 results.append({
-                    "kind": "message",
-                    "type": media_type,
-                    "peer_type": peer_kind,
-                    "peer_id": marked_peer,
-                    "entity": entity,
-                    "message": message,
-                    "link": link,
-                    "content": _search_content(message),
+                    "kind": "message", "type": media_type, "peer_type": peer_kind,
+                    "peer_id": marked_peer, "entity": entity, "message": message,
+                    "link": link, "content": _search_content(message),
                     "title": _search_peer_name(entity),
                     "username": getattr(entity, "username", None),
                     "date": getattr(message, "date", None),
-                    "rank": global_rank,  # FIXED: Rank, not score
+                    "rank": global_rank,
                 })
 
-            # --- CORRECT PAGINATION CALCULATION ---
-            # Get the next rate from the result. If 0, we are done.
+            # --- PAGINATION LOGIC ---
             next_rate = getattr(global_result, "next_rate", 0)
-            if next_rate == 0:
-                break
+            if next_rate == 0: break
             
-            # Derive the next offset_peer and offset_id from the LAST message
             last_msg = batch_messages[-1]
             offset_peer = last_msg.peer_id
             offset_id = last_msg.id
             offset_rate = next_rate
             fetched += len(batch_messages)
+            
+            # Add a small delay so Telegram doesn't rate-limit (FloodWait) the bot
+            await asyncio.sleep(0.2)
 
-        # Add standalone peer cards from ALL collected entities (Fixes Problem #3)
-        # We check if the entity is already represented by a message first.
+        # Add standalone peer cards from ALL collected entities
         for marked, entity in all_peer_entities.items():
             kind = _search_peer_kind(entity)
-            if kind in {"group", "channel"} and marked in joined_ids:
-                continue
-            if kind not in {"group", "channel", "bot", "user"}:
-                continue
-
-            if any(r["peer_id"] == marked for r in results):
-                continue
+            if kind in {"group", "channel"} and marked in joined_ids: continue
+            if kind not in {"group", "channel", "bot", "user"}: continue
+            if any(r["peer_id"] == marked for r in results): continue
 
             name = _search_peer_name(entity)
             username = getattr(entity, "username", None)
-            peer_link = _search_peer_link(entity)
+            peer_link = _search_peer_link(entity)  # Generates https://t.me/username
             peer_key = ("peer", marked)
-            if peer_key in seen:
-                continue
+            if peer_key in seen: continue
             seen.add(peer_key)
             global_rank += 1
             results.append({
-                "kind": "peer",
-                "type": kind,
-                "peer_type": kind,
-                "peer_id": marked,
-                "entity": entity,
-                "message": None,
-                "link": peer_link,
-                "content": f"{('🤖' if kind == 'bot' else '📢' if kind == 'channel' else '👥' if kind == 'group' else '👤')} {name}"
-                            + (f"  @{username}" if username else ""),
+                "kind": "peer", "type": kind, "peer_type": kind,
+                "peer_id": marked, "entity": entity, "message": None,
+                "link": peer_link,  # <--- This is crucial for clickable links
+                "content": f"{('🤖' if kind == 'bot' else '📢' if kind == 'channel' else '👥' if kind == 'group' else '👤')} {name}",
                 "title": name,
                 "username": username,
                 "date": None,
                 "rank": global_rank,
             })
 
-        # RACE CONDITION FIX (Problem #2): Check if a new search started
+        # RACE CONDITION FIX: Check if a new search started
         if context.user_data.get("search_id") != search_id:
             return
 
@@ -2785,11 +2731,9 @@ async def fetch_search(update, context, query):
             )
             return
 
-        # Sort by rank to preserve Telegram's natural order
         results.sort(key=lambda item: item.get("rank", 0), reverse=False)
 
-        # Store results and meta
-        context.user_data["search_results"] = results[:500]
+        context.user_data["search_results"] = results[:1000]
         context.user_data["search_query"] = query
         context.user_data["search_filter"] = "all"
         context.user_data["search_page"] = 1
@@ -2800,9 +2744,7 @@ async def fetch_search(update, context, query):
         await display_search_page(update, context, 1, "all")
 
     except FloodWaitError as e:
-        await status_msg.edit_text(
-            f"⏳ Telegram rate limit. Please wait {e.seconds} seconds and try again."
-        )
+        await status_msg.edit_text(f"⏳ Telegram rate limit. Please wait {e.seconds} seconds and try again.")
     except Exception as e:
         print(f"[Search] Global search failed: {type(e).__name__}: {e}")
         await status_msg.edit_text(
@@ -2813,53 +2755,29 @@ async def fetch_search(update, context, query):
 
 
 def _search_filter_match(item, filter_type):
-    if filter_type == "all":
-        return True
-    # Distinguish messages vs peers for the "All" filter
-    if filter_type == "messages":
-        return item.get("kind") == "message"
-    if filter_type == "peers":
-        return item.get("kind") == "peer"
-    if filter_type == "photos":
-        return item.get("type") == "photo"
-    if filter_type == "videos":
-        return item.get("type") == "video"
-    if filter_type == "files":
-        return item.get("type") == "document"
-    if filter_type == "gifs":
-        return item.get("type") == "gif"
-    if filter_type == "audio":
-        return item.get("type") in {"audio", "voice"}
-    if filter_type == "links":
-        return item.get("type") == "link"
-    if filter_type == "channels":
-        # Only the actual Channel entity, not messages from channels
-        return item.get("peer_type") == "channel" and item.get("kind") == "peer"
-    if filter_type == "groups":
-        return item.get("peer_type") == "group" and item.get("kind") == "peer"
-    if filter_type == "bots":
-        return item.get("peer_type") == "bot" and item.get("kind") == "peer"
-    if filter_type == "users":
-        return item.get("peer_type") == "user" and item.get("kind") == "peer"
+    if filter_type == "all": return True
+    if filter_type == "messages": return item.get("kind") == "message"
+    if filter_type == "peers": return item.get("kind") == "peer"
+    if filter_type == "photos": return item.get("type") == "photo"
+    if filter_type == "videos": return item.get("type") == "video"
+    if filter_type == "files": return item.get("type") == "document"
+    if filter_type == "gifs": return item.get("type") == "gif"
+    if filter_type == "audio": return item.get("type") in {"audio", "voice"}
+    if filter_type == "links": return item.get("type") == "link"
+    if filter_type == "channels": return item.get("peer_type") == "channel" and item.get("kind") == "peer"
+    if filter_type == "groups": return item.get("peer_type") == "group" and item.get("kind") == "peer"
+    if filter_type == "bots": return item.get("peer_type") == "bot" and item.get("kind") == "peer"
+    if filter_type == "users": return item.get("peer_type") == "user" and item.get("kind") == "peer"
     return True
 
 
 def _search_filter_buttons(results, active):
-    """Create only filters that actually have results."""
     definitions = [
-        ("all", "🔎 All"),
-        ("messages", "💬 Messages"),
-        ("peers", "👥 Peers"),
-        ("photos", "📷 Photos"),
-        ("videos", "🎬 Videos"),
-        ("files", "📄 Files"),
-        ("gifs", "🎞️ GIFs"),
-        ("audio", "🎵 Audio"),
-        ("links", "🔗 Links"),
-        ("channels", "📢 Channels"),
-        ("groups", "👥 Groups"),
-        ("bots", "🤖 Bots"),
-        ("users", "👤 Users"),
+        ("all", "🔎 All"), ("messages", "💬 Messages"), ("peers", "👥 Peers"),
+        ("photos", "📷 Photos"), ("videos", "🎬 Videos"), ("files", "📄 Files"),
+        ("gifs", "🎞️ GIFs"), ("audio", "🎵 Audio"), ("links", "🔗 Links"),
+        ("channels", "📢 Channels"), ("groups", "👥 Groups"),
+        ("bots", "🤖 Bots"), ("users", "👤 Users"),
     ]
 
     counts = {}
@@ -2870,25 +2788,19 @@ def _search_filter_buttons(results, active):
     for filter_type, label in definitions:
         if filter_type == "all" or counts[filter_type] > 0:
             shown = f"{label} ({counts[filter_type]})"
-            if filter_type == active:
-                shown = f"✅ {shown}"
+            if filter_type == active: shown = f"✅ {shown}"
             available.append((filter_type, shown))
 
     rows = []
     for i in range(0, len(available), 3):
-        rows.append([
-            InlineKeyboardButton(label, callback_data=f"sf_{filter_type}")
-            for filter_type, label in available[i:i + 3]
-        ])
+        rows.append([InlineKeyboardButton(label, callback_data=f"sf_{filter_type}") for filter_type, label in available[i:i + 3]])
     return rows, counts
 
 
 async def display_search_page(update, context, page, filter_type=None):
     callback = update.callback_query
-    if callback:
-        await callback.answer()
+    if callback: await callback.answer()
 
-    # Guard against race conditions
     if not context.user_data.get("search_results"):
         await update.message.reply_text("❌ Search session expired. Please search again.")
         return
@@ -2902,6 +2814,7 @@ async def display_search_page(update, context, page, filter_type=None):
     total_results = len(filtered)
     total_pages = max(1, (total_results + per_page - 1) // per_page)
     page = max(1, min(int(page), total_pages))
+    
     context.user_data["search_page"] = page
     context.user_data["search_filter"] = active
 
@@ -2926,16 +2839,14 @@ async def display_search_page(update, context, page, filter_type=None):
             peer_name = html.escape(item.get("title") or "Unknown")
             username = item.get("username")
             username_text = f" @{html.escape(username)}" if username else ""
-            icon = {
-                "photo": "📷", "video": "🎬", "document": "📄", "gif": "🎞️",
-                "audio": "🎵", "voice": "🎤", "link": "🔗", "bot": "🤖",
-                "channel": "📢", "group": "👥", "user": "👤", "text": "💬",
-            }.get(item.get("type"), "🔹")
+            icon = {"photo": "📷", "video": "🎬", "document": "📄", "gif": "🎞️",
+                    "audio": "🎵", "voice": "🎤", "link": "🔗", "bot": "🤖",
+                    "channel": "📢", "group": "👥", "user": "👤", "text": "💬"}.get(item.get("type"), "🔹")
 
             content = html.escape(item.get("content") or "")
-            if len(content) > 180:
-                content = content[:177] + "..."
+            if len(content) > 180: content = content[:177] + "..."
 
+            # Generate the CLICKABLE LINK
             if item.get("link"):
                 lines.append(
                     f"<b>{index}.</b> {icon} <a href=\"{html.escape(item['link'], quote=True)}\">"
@@ -2947,6 +2858,7 @@ async def display_search_page(update, context, page, filter_type=None):
                 )
 
     lines.append(f"Page {page}/{total_pages} • {total_results} results")
+    lines.append("Sort by relevance and activity")  # <--- Matches Legend Bot
     lines.append("</blockquote>")
     text = "\n".join(lines)
 
@@ -2957,8 +2869,7 @@ async def display_search_page(update, context, page, filter_type=None):
         nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"search_page_{page - 1}"))
     if page < total_pages:
         nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"search_page_{page + 1}"))
-    if nav:
-        kb.append(nav)
+    if nav: kb.append(nav)
 
     kb.append([
         InlineKeyboardButton("🔄 New Search", callback_data="search"),
@@ -2968,22 +2879,11 @@ async def display_search_page(update, context, page, filter_type=None):
 
     if callback:
         try:
-            await callback.edit_message_text(
-                text,
-                reply_markup=markup,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
+            await callback.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         except Exception as exc:
-            if "message is not modified" not in str(exc).lower():
-                raise
+            if "message is not modified" not in str(exc).lower(): raise
     else:
-        await update.message.reply_text(
-            text,
-            reply_markup=markup,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+        await update.message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 async def fetch_friends(update, context, text):
     parts = text.split(" ")
     if len(parts) < 2: await update.message.reply_text("⚠️ Use: @group @user"); return
