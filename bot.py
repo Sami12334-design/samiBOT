@@ -2492,7 +2492,6 @@ async def send_story_at_index(update, context, index):
     else:
         await query.message.reply_document(document=media_bytes, caption=caption, reply_markup=kb)
 # --- FAST GLOBAL TELEGRAM SEARCH ---
-```python
 # --- SAFE PUBLIC TELEGRAM SEARCH ---
 # IMPORTANT:
 # telethon_client is a single Telegram account/session.
@@ -3783,6 +3782,150 @@ async def display_search_page(
         )
 
 
+# --- FRIEND SEARCH ---
+# This function is unrelated to the global-search privacy issue.
+# It is kept separate from the search implementation above.
+
+async def fetch_friends(update, context, text):
+
+    parts = text.split()
+
+    if len(parts) < 2:
+
+        await update.message.reply_text(
+            "⚠️ Use: @group @user"
+        )
+
+        return
+
+    try:
+
+        group_entity = await telethon_client.get_entity(
+            parts[0]
+        )
+
+        target_user = await telethon_client.get_entity(
+            parts[1]
+        )
+
+        messages = await telethon_client.get_messages(
+            group_entity,
+            limit=500
+        )
+
+        reply_data = {}
+
+        for m in messages:
+
+            if (
+                m.sender_id == target_user.id
+                and
+                m.reply_to_msg_id
+            ):
+
+                try:
+
+                    reply_to_msg = (
+                        await telethon_client.get_messages(
+                            group_entity,
+                            ids=m.reply_to_msg_id
+                        )
+                    )
+
+                    if (
+                        reply_to_msg
+                        and
+                        reply_to_msg.sender_id
+                    ):
+
+                        sender_id = (
+                            reply_to_msg.sender_id
+                        )
+
+                        if sender_id not in reply_data:
+
+                            reply_data[sender_id] = {
+                                "count": 0,
+                                "date": str(m.date),
+                            }
+
+                            try:
+
+                                sender_entity = (
+                                    await telethon_client.get_entity(
+                                        sender_id
+                                    )
+                                )
+
+                                first_name = (
+                                    getattr(
+                                        sender_entity,
+                                        "first_name",
+                                        ""
+                                    )
+                                    or
+                                    ""
+                                )
+
+                                last_name = (
+                                    getattr(
+                                        sender_entity,
+                                        "last_name",
+                                        ""
+                                    )
+                                    or
+                                    ""
+                                )
+
+                                reply_data[sender_id]["name"] = (
+                                    f"{first_name} "
+                                    f"{last_name}"
+                                ).strip()
+
+                            except Exception:
+
+                                reply_data[sender_id]["name"] = (
+                                    "Unknown"
+                                )
+
+                        reply_data[sender_id]["count"] += 1
+
+                except Exception:
+                    pass
+
+        sorted_replies = sorted(
+            reply_data.items(),
+            key=lambda x: x[1]["count"],
+            reverse=True
+        )[:10]
+
+        text = (
+            "<blockquote>"
+            "Replies them in the groups:\n"
+            "when - to whom (total times)\n"
+        )
+
+        for sid, data in sorted_replies:
+
+            text += (
+                f"|{data['date'][:5]} - "
+                f"{html.escape(data['name'])} "
+                f"({data['count']})\n"
+            )
+
+        text += "</blockquote>"
+
+        await update.message.reply_text(
+            text,
+            parse_mode=ParseMode.HTML
+        )
+
+    except Exception as e:
+
+        await update.message.reply_text(
+            f"❌ Error: "
+            f"{html.escape(str(e)[:700])}"
+        )
 # --- FRIEND SEARCH ---
 # This function is unrelated to the global-search privacy issue.
 # It is kept separate from the search implementation above.
