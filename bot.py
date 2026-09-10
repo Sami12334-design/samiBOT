@@ -4130,7 +4130,6 @@ async def inbox_listener(event):
             await process_message_manager_incoming(event)
         except Exception as e:
             print(f"Message Manager Error: {e}")
-
 # MESSAGE MANAGER 
 # The manager is a gatekeeper for private messages received by the connected
 # Telethon user account. It does not change Telegram's native block list.
