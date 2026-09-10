@@ -4134,6 +4134,11 @@ async def inbox_listener(event):
 # MESSAGE MANAGER 
 # The manager is a gatekeeper for private messages received by the connected
 # Telethon user account. It does not change Telegram's native block list.
+#
+# Available to EVERY authenticated bot user (not only admins).
+# NOTE: The underlying Telethon session is a single shared account, so the
+# rules below are GLOBAL — every user who opens the manager edits the same
+# ruleset. Forwarding of incoming private messages was intentionally removed.
 PTB_BOT = None
 MM_DB_ID = 1
 
@@ -4226,7 +4231,6 @@ def mm_main_kb():
         [InlineKeyboardButton(f'💬 Messaging: {state}', callback_data='mm_toggle')],
         [InlineKeyboardButton('🚫 Block Messages', callback_data='mm_block'), InlineKeyboardButton('🔎 Filter Messages', callback_data='mm_filter')],
         [InlineKeyboardButton('📋 Active Rules', callback_data='mm_rules'), InlineKeyboardButton('👥 Blocked Users', callback_data='mm_blocked')],
-        [InlineKeyboardButton('📩 Forwarding', callback_data='mm_forwarding')],
         [InlineKeyboardButton('⬅️ Back', callback_data='more')]
     ])
 
@@ -4246,7 +4250,7 @@ async def mm_block_menu(update, context):
         [InlineKeyboardButton('📋 Blocked Users', callback_data='mm_blocked')],
         [InlineKeyboardButton('⬅️ Back', callback_data='message_manager')]
     ])
-    await update.callback_query.edit_message_text('🚫 BLOCK MESSAGES\n\n'+status+'\n\nBlock rules stop forwarding and silently delete incoming messages.', reply_markup=kb)
+    await update.callback_query.edit_message_text('🚫 BLOCK MESSAGES\n\n'+status+'\n\nBlock rules silently delete incoming messages.', reply_markup=kb)
 
 async def mm_filter_menu(update, context):
     r=mm_get_rules()
@@ -4266,17 +4270,17 @@ def mm_is_video(event):
     return bool(getattr(event,'video',None)) or (getattr(event,'document',None) is not None and str(getattr(getattr(event,'document',None),'mime_type','')).startswith('video/'))
 
 def mm_reason(event, user_id, text):
-    r=mm_get_rules(); now=time.time()
+    r=mm_get_rules()
     # Owner/admins are never blocked by manager rules.
     if user_id in ADMIN_IDS: return None
-    # Never block the bot itself (prevents loop)
+    # Never block the bot itself (prevents loop).
     try:
         me = telethon_client.loop.run_until_complete(telethon_client.get_me())
         if user_id == me.id:
             return None
     except Exception:
         pass
-    # 🛑 NEW: Explicitly ignore the bot's own ID (PTSS: 8958561939)
+    # Explicitly ignore the bot's own ID (PTSS: 8958561939).
     if user_id == 8958561939: return None
     until=float(r.get('block_everyone_until',0))
     if mm_active(until): return f'Block everyone ({mm_left(until)})'
@@ -4303,50 +4307,8 @@ async def mm_refuse(event, reason):
         print('Manager revoke error:', e)
     # NOTE: No response message is sent.
 
-def mm_message_preview(event):
-    text=(getattr(event,'raw_text','') or '').strip()
-    if text: return text[:1500]
-    if getattr(event,'photo',None): return '🖼️ Photo'
-    if getattr(event,'video',None): return '🎥 Video'
-    if getattr(event,'voice',None): return '🎤 Voice message'
-    if getattr(event,'audio',None): return '🎵 Audio'
-    if getattr(event,'document',None): return '📄 Document'
-    return '📎 Media message'
-
-# --- FIX 5: Exclude bot's own ID from forwarding and deduplicate admin list. ---
-async def mm_forward(event):
-    if not ADMIN_IDS: print('Message Manager: ADMIN_IDS is empty; forwarding skipped.'); return
-    try:
-        bot_me = await telethon_client.get_me()
-        bot_id = bot_me.id
-    except Exception:
-        bot_id = None
-
-    admin_list = list(set(ADMIN_IDS))
-    if bot_id:
-        admin_list = [aid for aid in admin_list if aid != bot_id]
-    if not admin_list:
-        print('Message Manager: No valid admin recipients after filtering.')
-        return
-
-    sender=await event.get_sender()
-    name=' '.join(x for x in [getattr(sender,'first_name',''),getattr(sender,'last_name','')] if x).strip() or 'Unknown'
-    username=getattr(sender,'username',None)
-    header=f'📩 NEW MESSAGE\n\n👤 From: {name}\n🆔 User ID: {sender.id}\n🔗 Username: @{username}' if username else f'📩 NEW MESSAGE\n\n👤 From: {name}\n🆔 User ID: {sender.id}\n🔗 Username: N/A'
-    preview=mm_message_preview(event)
-    for admin_id in admin_list:
-        try:
-            if PTB_BOT:
-                kb=InlineKeyboardMarkup([[InlineKeyboardButton('💬 Reply',callback_data=f'mm_reply|{sender.id}'), InlineKeyboardButton('🚫 Block User',callback_data=f'mm_block_from_message|{sender.id}')]])
-                await PTB_BOT.send_message(admin_id, header+'\n\n'+preview[:3500], reply_markup=kb)
-            else:
-                await telethon_client.send_message(admin_id, header+'\n\n👇 Original message:\n'+preview)
-            if getattr(event,'media',None):
-                await telethon_client.send_file(admin_id, event.media, caption='📎 Original media')
-        except Exception as e:
-            print(f'Message Manager forwarding error to {admin_id}: {e}')
-
 # --- FIX 6: Ignore events sent by the bot itself (kills infinite loops). ---
+# Forwarding was removed: incoming allowed messages are simply left alone.
 async def process_message_manager_incoming(event):
     if not event.is_private or event.out: return False
     try:
@@ -4356,21 +4318,22 @@ async def process_message_manager_incoming(event):
     except Exception:
         pass
     try:
-        sender=await event.get_sender(); 
-        # 🛑 NEW: Ignore any bot messages (prevents spam from bot itself)
+        sender=await event.get_sender()
+        # Ignore any bot messages (prevents spam from bot itself).
         if getattr(sender, 'bot', False):
             return False
-        
+
         uid=sender.id; text=event.raw_text or ''
         reason=mm_reason(event,uid,text)
         if reason:
             await mm_refuse(event,reason)
             return True
-        await mm_forward(event)
+        # No forward, no report — the message is simply allowed through.
         return True
     except Exception as e:
         print('Message Manager incoming error:',e)
         return False
+
 async def mm_active_rules(update, context):
     r=mm_get_rules(); lines=['📋 ACTIVE RULES','']
     lines.append('💬 Messaging: '+('🟢 ON' if r['messaging'] else '🔴 OFF'))
@@ -4428,7 +4391,7 @@ async def mm_set_rule_duration(update, context, kind, value):
         if keyword: r['keyword_rules'][keyword]=until
         else: await q.answer('Keyword no longer exists',show_alert=True); return
     mm_save(r)
-    for _key in ('mm_input','mm_duration_kind','mm_reply_to'): context.user_data.pop(_key,None)
+    for _key in ('mm_input','mm_duration_kind'): context.user_data.pop(_key,None)
     await q.answer('Saved')
     if kind=='everyone': await mm_block_menu(update,context)
     elif kind in {'links','videos'}: await mm_filter_menu(update,context)
@@ -4437,9 +4400,12 @@ async def mm_set_rule_duration(update, context, kind, value):
 
 async def handle_mm_callback(update, context, data):
     q=update.callback_query; uid=update.effective_user.id
-    if not is_authenticated(uid) or not is_admin(uid): await q.answer('Admin only',show_alert=True); return True
+    # All authenticated users can use the manager — no admin-only gate.
+    if not is_authenticated(uid):
+        await q.answer('Please authenticate first with /start', show_alert=True)
+        return True
     if data=='message_manager':
-        for _key in ('mm_input','mm_duration_kind','mm_reply_to'): context.user_data.pop(_key,None)
+        for _key in ('mm_input','mm_duration_kind'): context.user_data.pop(_key,None)
         await q.answer(); await mm_show(update,context); return True
     if data=='mm_toggle':
         r=mm_get_rules(); r['messaging']=0 if r['messaging'] else 1; mm_save(r); await q.answer('Messaging '+('ON' if r['messaging'] else 'OFF')); await mm_show(update,context); return True
@@ -4448,9 +4414,6 @@ async def handle_mm_callback(update, context, data):
     if data=='mm_rules': await q.answer(); await mm_active_rules(update,context); return True
     if data=='mm_blocked': await q.answer(); await mm_show_blocked(update,context); return True
     if data=='mm_filters': await q.answer(); await mm_show_filters(update,context); return True
-    if data=='mm_forwarding':
-        await q.answer(); admins=', '.join(map(str,ADMIN_IDS)) or 'NONE'
-        await q.edit_message_text('📩 FORWARDING\n\nIncoming private messages are forwarded to these ADMIN_IDS:\n'+admins+'\n\nThe connected Telethon account must be able to message those IDs, and each admin should start this bot to receive Bot API controls.',reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Back',callback_data='message_manager')]])); return True
     if data in {'mm_block_everyone','mm_filter_links','mm_filter_videos'}:
         await q.answer(); prefix={'mm_block_everyone':'mm_dur|everyone','mm_filter_links':'mm_dur|links','mm_filter_videos':'mm_dur|videos'}[data]
         await q.edit_message_text('⏱️ Choose duration:',reply_markup=mm_duration_kb(prefix)); return True
@@ -4476,12 +4439,6 @@ async def handle_mm_callback(update, context, data):
         token=data.split('|',1)[1]; r=mm_get_rules(); key=next((k for k in r['keyword_rules'] if hashlib.sha1(k.encode()).hexdigest()[:10]==token),None)
         if key: r['keyword_rules'].pop(key,None); mm_save(r)
         await q.answer('Keyword removed'); await mm_show_filters(update,context); return True
-    if data=='mm_block_from_message':
-        target=data.split('|',1)[1] if '|' in data else ''
-    if data.startswith('mm_block_from_message|'):
-        target=data.split('|',1)[1]; context.user_data['mm_duration_kind']='user:'+target; await q.answer(); await q.edit_message_text(f'🚫 Block user {target}\n\nChoose duration:',reply_markup=mm_duration_kb('mm_dur|user:'+target)); return True
-    if data.startswith('mm_reply|'):
-        target=data.split('|',1)[1]; context.user_data['mm_reply_to']=int(target); context.user_data['mm_input']='reply'; await q.answer(); await q.message.reply_text(f'💬 Reply mode enabled for user {target}. Send your reply text.'); return True
     return False
 
 async def handle_mm_input(update, context):
@@ -4507,15 +4464,7 @@ async def handle_mm_input(update, context):
                 key=next((k for k in r['keyword_rules'] if hashlib.sha1(k.encode()).hexdigest()[:10]==token),None)
             if key: r['keyword_rules'][key]=until
         mm_save(r); context.user_data.pop('mm_input',None); await update.message.reply_text('✅ Manager rule saved.'); return True
-    if mode=='reply':
-        target=context.user_data.get('mm_reply_to')
-        if not target: context.user_data.pop('mm_input',None); return True
-        try:
-            await telethon_client.send_message(int(target),text); await update.message.reply_text('✅ Reply sent to the user.')
-        except Exception as e: await update.message.reply_text(f'❌ Reply failed: {e}')
-        context.user_data.pop('mm_input',None); context.user_data.pop('mm_reply_to',None); return True
     return False
-    
 # QR CODE
 def create_qr_image_sync(text):
     qr=qrcode.QRCode(version=None,error_correction=qrcode.constants.ERROR_CORRECT_M,box_size=10,border=4)
