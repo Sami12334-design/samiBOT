@@ -25,7 +25,6 @@ from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageChops
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
-from telethon import TelegramClient, events, functions, types
 from telethon.sessions import StringSession
 from telethon.utils import get_peer_id
 from datetime import datetime, timedelta
@@ -535,7 +534,7 @@ async def menu_callback(update, context):
     elif data == "pdf_fetch":
         await query.message.reply_text("📄 PDF FETCH\n\nPlease upload the PDF file directly to this chat.")
         context.user_data['state'] = 'awaiting_pdf'
-        elif data.startswith("posts_"):
+    elif data.startswith("posts_"):
         try: page=max(1,int(data.split("_",1)[1]))
         except Exception: page=1
         await handle_posts_pagination(update, context, page)
