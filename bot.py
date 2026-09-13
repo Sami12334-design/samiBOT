@@ -46,10 +46,19 @@ import imageio_ffmpeg
 import qrcode
 
 try:
-    from telethon.tl.functions.stories import GetPeerStoriesRequest, GetStoriesByIDRequest
+    from telethon.tl.functions.stories import (
+        GetPeerStoriesRequest,
+        GetStoriesByIDRequest,
+        GetStoryViewsListRequest,
+        GetStoryReactionsListRequest,
+        GetAllStoriesRequest,
+    )
 except ImportError:
     GetPeerStoriesRequest = None
     GetStoriesByIDRequest = None
+    GetStoryViewsListRequest = None
+    GetStoryReactionsListRequest = None
+    GetAllStoriesRequest = None
 
 app = Flask(__name__)
 
@@ -418,7 +427,7 @@ async def menu_callback(update, context):
             keyboard = [[InlineKeyboardButton("👤 Profile", callback_data="profile")], [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")], [InlineKeyboardButton("➕ More Commands", callback_data="more")]]
         await query.message.reply_text("🤖 TELEGRAM ASSISTANT", reply_markup=InlineKeyboardMarkup(keyboard))
     elif data == "more":
-        kb = [[InlineKeyboardButton("🔎 Search", callback_data="search"), InlineKeyboardButton("📊 Statistics", callback_data="stats")], [InlineKeyboardButton("📄 PDF Fetch", callback_data="pdf_fetch")], [InlineKeyboardButton("🔄 Converter", callback_data="converter")], [InlineKeyboardButton("🎬 Video Downloader", callback_data="video_downloader")]]
+        kb = [[InlineKeyboardButton("🔎 Search", callback_data="search"), InlineKeyboardButton("📊 Statistics", callback_data="stats")], [InlineKeyboardButton("📄 PDF Fetch", callback_data="pdf_fetch")], [InlineKeyboardButton("🔄 Converter", callback_data="converter")], [InlineKeyboardButton("🎬 Video Downloader", callback_data="video_downloader")], [InlineKeyboardButton("🌐 Story Tools", callback_data="story_tools_menu")]]
         if is_admin(user_id):
             admin_buttons = [[InlineKeyboardButton("💬 Message Manager", callback_data="message_manager")], [InlineKeyboardButton("🔔 Track", callback_data="track"), InlineKeyboardButton("🔗 Names", callback_data="names")], [InlineKeyboardButton("👥 Groups", callback_data="groups"), InlineKeyboardButton("💬 Messages", callback_data="messages")], [InlineKeyboardButton("🔎 Analysis", callback_data="analysis"), InlineKeyboardButton("📢 Channels", callback_data="channels")], [InlineKeyboardButton("👍 Reputation", callback_data="rep"), InlineKeyboardButton("👥 Friends", callback_data="friends")], [InlineKeyboardButton("🔄 Reactions", callback_data="reactions"), InlineKeyboardButton("🎁 Gifts", callback_data="gifts")], [InlineKeyboardButton("📤 Share", callback_data="share"), InlineKeyboardButton("🔵 Words Frequency", callback_data="words")], [InlineKeyboardButton("👥 Common Groups", callback_data="common")], [InlineKeyboardButton("📢 Broadcast", callback_data="broadcast")]]
             kb = admin_buttons + kb
@@ -526,13 +535,41 @@ async def menu_callback(update, context):
     elif data == "pdf_fetch":
         await query.message.reply_text("📄 PDF FETCH\n\nPlease upload the PDF file directly to this chat.")
         context.user_data['state'] = 'awaiting_pdf'
-    elif data.startswith("posts_"):
+        elif data.startswith("posts_"):
         try: page=max(1,int(data.split("_",1)[1]))
         except Exception: page=1
         await handle_posts_pagination(update, context, page)
         return
-    elif data.startswith("story_"):
-        await handle_story_view(update, context)
+    elif data == "story_tools_menu":
+        kb = [
+            [InlineKeyboardButton("📋 Who Viewed", callback_data="story_tools_viewers"),
+             InlineKeyboardButton("❤️ Reactions List", callback_data="story_tools_reactions")],
+            [InlineKeyboardButton("🌐 All Stories Feed", callback_data="story_tools_feed")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="more")]
+        ]
+        await query.message.reply_text(
+            "🌐 STORY TOOLS\n\nChoose an option:",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+        return
+    elif data == "story_tools_viewers":
+        context.user_data['state'] = 'story_tools_viewers_input'
+        await query.message.reply_text(
+            "📋 WHO VIEWED STORY\n\n"
+            "Send: username story_id\n"
+            "Example: durov 42"
+        )
+        return
+    elif data == "story_tools_reactions":
+        context.user_data['state'] = 'story_tools_reactions_input'
+        await query.message.reply_text(
+            "❤️ REACTIONS LIST\n\n"
+            "Send: username story_id\n"
+            "Example: durov 42"
+        )
+        return
+    elif data == "story_tools_feed":
+        await fetch_all_stories_feed(update, context)
         return
     elif data.startswith("story_nav_"):
         try:
@@ -540,6 +577,9 @@ async def menu_callback(update, context):
             await send_story_at_index(update, context, idx)
         except Exception:
             await query.answer("Invalid navigation", show_alert=True)
+        return
+    elif data.startswith("story_"):
+        await handle_story_view(update, context)
         return
 # --- PHOTO EDITING ---
 def build_edit_keyboard(page=1):
@@ -2449,6 +2489,140 @@ async def handle_story_view(update, context):
 
     except Exception as e:
         await query.edit_message_text(f"❌ Could not load stories: {type(e).__name__}: {e}")
+# ─── STORY TOOLS (open to all authenticated users) ───
+async def fetch_all_stories_feed(update, context):
+    """GetAllStoriesRequest — sends the session account's full story feed."""
+    query = update.callback_query
+    status = await query.message.reply_text("⏳ Loading stories feed…")
+    try:
+        if GetAllStoriesRequest is None:
+            await status.edit_text("❌ Stories not supported in this Telethon version.")
+            return
+        result = await telethon_client(GetAllStoriesRequest())
+        peer_stories = getattr(result, 'peer_stories', []) or []
+        if not peer_stories:
+            await status.edit_text("📭 No stories in the feed right now.")
+            return
+        await status.edit_text(f"✅ Found {len(peer_stories)} peer(s) with stories. Sending…")
+        sent = 0
+        for ps in peer_stories[:20]:
+            peer = getattr(ps, 'peer', None)
+            stories = getattr(ps, 'stories', []) or []
+            for story in stories[:3]:
+                try:
+                    media_bytes = BytesIO()
+                    await telethon_client.download_media(story.media, file=media_bytes)
+                    media_bytes.seek(0)
+                    caption = f"🌐 Story from {peer}\nStory ID: {story.id}"
+                    if getattr(story, 'photo', None):
+                        await query.message.reply_photo(photo=media_bytes, caption=caption)
+                    else:
+                        await query.message.reply_video(video=media_bytes, caption=caption)
+                    sent += 1
+                    await asyncio.sleep(0.4)
+                except Exception as inner:
+                    print(f"Story send error: {inner}")
+        await status.edit_text(f"✅ Feed done. Sent {sent} stories.")
+    except Exception as e:
+        await status.edit_text(f"❌ Failed: {type(e).__name__}: {str(e)[:500]}")
+
+
+async def handle_story_tools_viewers(update, context):
+    """GetStoryViewsListRequest — who viewed a specific story."""
+    text = (update.message.text or "").strip()
+    parts = text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await update.message.reply_text("❌ Format: username story_id\nExample: durov 42")
+        context.user_data['state'] = None
+        return
+    username, story_id = parts[0], int(parts[1])
+    status = await update.message.reply_text("⏳ Fetching viewers…")
+    try:
+        if GetStoryViewsListRequest is None:
+            await status.edit_text("❌ Not supported in this Telethon version.")
+            return
+        entity = await telethon_client.get_entity(username)
+        result = await telethon_client(GetStoryViewsListRequest(
+            peer=entity, id=story_id, offset='', limit=100,
+        ))
+        views_count = getattr(result, 'views_count', 0)
+        views = getattr(result, 'views', []) or []
+        if not views:
+            await status.edit_text(
+                f"📋 Story {story_id}: {views_count} view(s).\n\n"
+                "ℹ️ No detailed viewer list was returned."
+            )
+            return
+        lines = [f"📋 WHO VIEWED STORY {story_id}", f"Total views: {views_count}", ""]
+        for i, v in enumerate(views[:50], 1):
+            try:
+                u = await telethon_client.get_entity(v.user_id)
+                name = f"{getattr(u,'first_name','') or ''} {getattr(u,'last_name','') or ''}".strip() or "Unknown"
+                uname = f"@{u.username}" if getattr(u, 'username', None) else "no-username"
+                lines.append(f"{i}. {name} ({uname})")
+            except Exception:
+                lines.append(f"{i}. User {getattr(v, 'user_id', '?')}")
+        out = "\n".join(lines)
+        for i in range(0, len(out), 4000):
+            await update.message.reply_text(out[i:i+4000])
+        await status.edit_text("✅ Done.")
+    except Exception as e:
+        await status.edit_text(f"❌ Failed: {type(e).__name__}: {str(e)[:500]}")
+    finally:
+        context.user_data['state'] = None
+
+
+async def handle_story_tools_reactions(update, context):
+    """GetStoryReactionsListRequest — reactions on a specific story."""
+    text = (update.message.text or "").strip()
+    parts = text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await update.message.reply_text("❌ Format: username story_id\nExample: durov 42")
+        context.user_data['state'] = None
+        return
+    username, story_id = parts[0], int(parts[1])
+    status = await update.message.reply_text("⏳ Fetching reactions…")
+    try:
+        if GetStoryReactionsListRequest is None:
+            await status.edit_text("❌ Not supported in this Telethon version.")
+            return
+        entity = await telethon_client.get_entity(username)
+        result = await telethon_client(GetStoryReactionsListRequest(
+            peer=entity, id=story_id, limit=100,
+        ))
+        reactions = getattr(result, 'reactions', []) or []
+        count = getattr(result, 'count', 0)
+        if not reactions:
+            await status.edit_text(
+                f"❤️ Story {story_id}: {count} reaction(s).\n\n"
+                "ℹ️ No detailed reaction list was returned."
+            )
+            return
+        lines = [f"❤️ REACTIONS ON STORY {story_id}", f"Total reactions: {count}", ""]
+        for i, r in enumerate(reactions[:50], 1):
+            try:
+                peer_id = getattr(r, 'peer_id', None)
+                user_id = getattr(peer_id, 'user_id', peer_id) if peer_id else None
+                u = await telethon_client.get_entity(user_id) if user_id else None
+                name = f"{getattr(u,'first_name','') or ''}".strip() or f"User {user_id}"
+                reaction = getattr(r, 'reaction', None)
+                emoji = ""
+                if reaction and hasattr(reaction, 'emoticon'):
+                    emoji = reaction.emoticon
+                elif reaction and hasattr(reaction, 'document_id'):
+                    emoji = "🎨"
+                lines.append(f"{i}. {emoji} {name}")
+            except Exception:
+                lines.append(f"{i}. Reaction")
+        out = "\n".join(lines)
+        for i in range(0, len(out), 4000):
+            await update.message.reply_text(out[i:i+4000])
+        await status.edit_text("✅ Done.")
+    except Exception as e:
+        await status.edit_text(f"❌ Failed: {type(e).__name__}: {str(e)[:500]}")
+    finally:
+        context.user_data['state'] = None
+
 
 
 async def send_story_at_index(update, context, index):
@@ -4601,6 +4775,8 @@ async def handle_link(update, context):
     if context.user_data.get('state') == 'awaiting_voice_en': await handle_voice_to_text(update, context, 'en-US'); return
     if context.user_data.get('state') == 'awaiting_voice_am': await handle_voice_to_text(update, context, 'am-ET'); return
     if context.user_data.get('state') == 'awaiting_video_link': await handle_video_download(update, context); return
+    if context.user_data.get('state') == 'story_tools_viewers_input': await handle_story_tools_viewers(update, context); return
+    if context.user_data.get('state') == 'story_tools_reactions_input': await handle_story_tools_reactions(update, context); return
     if context.user_data.get('state') == 'awaiting_password':
         if text == BOT_PASSWORD:
             add_authenticated_user(user_id); context.user_data['state'] = None
