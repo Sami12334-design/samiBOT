@@ -590,13 +590,22 @@ async def menu_callback(update, context):
     elif data == "story_tools_feed":
         await fetch_all_stories_feed(update, context)
         return
-    elif data.startswith("story_nav_"):
-        try:
-            idx = int(data.split("_")[2])
-            await send_story_at_index(update, context, idx)
-        except Exception:
-            await query.answer("Invalid navigation", show_alert=True)
-        return
+    elif data == "story_start":
+    await handle_story_view(update, context)
+    return
+
+   elif data.startswith("story_nav_"):
+    try:
+        idx = int(data.split("_")[2])
+        await send_story_at_index(update, context, idx)
+    except Exception as e:
+        await query.answer("Invalid navigation", show_alert=True)
+        print(f"Story navigation error: {e}")
+    return
+
+   elif data.startswith("story_"):
+    await handle_story_view(update, context)
+    return
     elif data == "story_current_viewers":
         await handle_current_story_viewers(update, context)
         return
