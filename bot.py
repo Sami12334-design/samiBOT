@@ -541,11 +541,31 @@ async def menu_callback(update, context):
         return
     elif data == "story_tools_menu":
         kb = [
-            [InlineKeyboardButton("📋 Who Viewed", callback_data="story_tools_viewers"),
-             InlineKeyboardButton("❤️ Reactions List", callback_data="story_tools_reactions")],
-            [InlineKeyboardButton("🌐 All Stories Feed", callback_data="story_tools_feed")],
-            [InlineKeyboardButton("⬅️ Back", callback_data="more")]
-        ]
+    [
+        InlineKeyboardButton(
+            "📖 Story Viewer",
+            callback_data="story_tools_story_viewer"
+        )
+    ],
+    [
+        InlineKeyboardButton(
+            "🌐 All Stories Feed",
+            callback_data="story_tools_feed"
+        )
+    ],
+    [
+        InlineKeyboardButton(
+            "👤 Who Visited My Profile",
+            callback_data="story_profile_visitors"
+        )
+    ],
+    [
+        InlineKeyboardButton(
+            "⬅️ Back",
+            callback_data="more"
+        )
+    ]
+]
         await query.message.reply_text(
             "🌐 STORY TOOLS\n\nChoose an option:",
             reply_markup=InlineKeyboardMarkup(kb)
@@ -576,6 +596,13 @@ async def menu_callback(update, context):
             await send_story_at_index(update, context, idx)
         except Exception:
             await query.answer("Invalid navigation", show_alert=True)
+        return
+    elif data == "story_current_viewers":
+        await handle_current_story_viewers(update, context)
+        return
+
+    elif data == "story_current_reactions":
+        await handle_current_story_reactions(update, context)
         return
     elif data.startswith("story_"):
         await handle_story_view(update, context)
@@ -2526,145 +2553,529 @@ async def fetch_all_stories_feed(update, context):
         await status.edit_text(f"❌ Failed: {type(e).__name__}: {str(e)[:500]}")
 
 
-async def handle_story_tools_viewers(update, context):
-    """GetStoryViewsListRequest — who viewed a specific story."""
-    text = (update.message.text or "").strip()
-    parts = text.split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        await update.message.reply_text("❌ Format: username story_id\nExample: durov 42")
-        context.user_data['state'] = None
+async def handle_current_story_viewers(update, context):
+    query = update.callback_query
+
+    await query.answer("Loading viewers...")
+
+    entity = context.user_data.get("story_entity")
+    story_id = context.user_data.get("current_story_id")
+
+    if not entity:
+        await query.message.reply_text(
+            "❌ Story owner was not found."
+        )
         return
-    username, story_id = parts[0], int(parts[1])
-    status = await update.message.reply_text("⏳ Fetching viewers…")
+
+    if not story_id:
+        await query.message.reply_text(
+            "❌ Current story was not found."
+        )
+        return
+
+    if GetStoryViewsListRequest is None:
+        await query.message.reply_text(
+            "❌ Your Telethon version does not support story viewers."
+        )
+        return
+
+    status = await query.message.reply_text(
+        "⏳ Fetching who viewed this story..."
+    )
+
     try:
-        if GetStoryViewsListRequest is None:
-            await status.edit_text("❌ Not supported in this Telethon version.")
-            return
-        entity = await telethon_client.get_entity(username)
-        result = await telethon_client(GetStoryViewsListRequest(
-            peer=entity, id=story_id, offset='', limit=100,
-        ))
-        views_count = getattr(result, 'views_count', 0)
-        views = getattr(result, 'views', []) or []
+
+        result = await telethon_client(
+            GetStoryViewsListRequest(
+                peer=entity,
+                id=story_id,
+                offset="",
+                limit=100
+            )
+        )
+
+        views_count = getattr(
+            result,
+            "views_count",
+            0
+        )
+
+        views = getattr(
+            result,
+            "views",
+            []
+        ) or []
+
         if not views:
+
             await status.edit_text(
-                f"📋 Story {story_id}: {views_count} view(s).\n\n"
-                "ℹ️ No detailed viewer list was returned."
+                f"👁 WHO VIEWED STORY\n\n"
+                f"Story ID: {story_id}\n"
+                f"Total views: {views_count}\n\n"
+                f"ℹ️ Telegram did not return a detailed viewer list."
             )
+
             return
-        lines = [f"📋 WHO VIEWED STORY {story_id}", f"Total views: {views_count}", ""]
-        for i, v in enumerate(views[:50], 1):
+
+        lines = [
+            "👁 WHO VIEWED THIS STORY",
+            "",
+            f"🆔 Story ID: {story_id}",
+            f"👁 Total views: {views_count}",
+            ""
+        ]
+
+        for i, view in enumerate(views, 1):
+
             try:
-                u = await telethon_client.get_entity(v.user_id)
-                name = f"{getattr(u,'first_name','') or ''} {getattr(u,'last_name','') or ''}".strip() or "Unknown"
-                uname = f"@{u.username}" if getattr(u, 'username', None) else "no-username"
-                lines.append(f"{i}. {name} ({uname})")
+
+                user_id = getattr(
+                    view,
+                    "user_id",
+                    None
+                )
+
+                user = None
+
+                if user_id:
+                    try:
+                        user = await telethon_client.get_entity(
+                            user_id
+                        )
+                    except Exception:
+                        pass
+
+                first_name = (
+                    getattr(user, "first_name", "")
+                    if user else ""
+                ) or ""
+
+                last_name = (
+                    getattr(user, "last_name", "")
+                    if user else ""
+                ) or ""
+
+                name = f"{first_name} {last_name}".strip()
+
+                if not name:
+                    name = f"User {user_id}"
+
+                username = (
+                    getattr(user, "username", None)
+                    if user else None
+                )
+
+                username_text = (
+                    f"@{username}"
+                    if username
+                    else "no username"
+                )
+
+                # Viewer timestamp
+                view_date = getattr(
+                    view,
+                    "date",
+                    None
+                )
+
+                if view_date:
+
+                    try:
+                        view_time = view_date.strftime(
+                            "%Y-%m-%d %H:%M"
+                        )
+                    except Exception:
+                        view_time = str(view_date)
+
+                else:
+                    view_time = "time unavailable"
+
+                lines.append(
+                    f"{i}. 👤 {name}\n"
+                    f"   🔗 {username_text}\n"
+                    f"   🕒 Viewed: {view_time}"
+                )
+
             except Exception:
-                lines.append(f"{i}. User {getattr(v, 'user_id', '?')}")
-        out = "\n".join(lines)
-        for i in range(0, len(out), 4000):
-            await update.message.reply_text(out[i:i+4000])
-        await status.edit_text("✅ Done.")
+
+                lines.append(
+                    f"{i}. 👤 Unknown viewer"
+                )
+
+        output = "\n".join(lines)
+
+        # Telegram message limit
+        for start in range(0, len(output), 4000):
+
+            await query.message.reply_text(
+                output[start:start + 4000]
+            )
+
+        await status.edit_text(
+            "✅ Viewer list loaded."
+        )
+
     except Exception as e:
-        await status.edit_text(f"❌ Failed: {type(e).__name__}: {str(e)[:500]}")
-    finally:
-        context.user_data['state'] = None
 
+        await status.edit_text(
+            "❌ Failed to load viewers.\n\n"
+            f"{type(e).__name__}: {str(e)[:500]}"
+        )
 
-async def handle_story_tools_reactions(update, context):
-    """GetStoryReactionsListRequest — reactions on a specific story."""
-    text = (update.message.text or "").strip()
-    parts = text.split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        await update.message.reply_text("❌ Format: username story_id\nExample: durov 42")
-        context.user_data['state'] = None
+async def handle_current_story_reactions(update, context):
+    query = update.callback_query
+
+    await query.answer("Loading reactions...")
+
+    entity = context.user_data.get("story_entity")
+    story_id = context.user_data.get("current_story_id")
+
+    if not entity:
+        await query.message.reply_text(
+            "❌ Story owner was not found."
+        )
         return
-    username, story_id = parts[0], int(parts[1])
-    status = await update.message.reply_text("⏳ Fetching reactions…")
+
+    if not story_id:
+        await query.message.reply_text(
+            "❌ Current story was not found."
+        )
+        return
+
+    if GetStoryReactionsListRequest is None:
+        await query.message.reply_text(
+            "❌ Your Telethon version does not support story reactions."
+        )
+        return
+
+    status = await query.message.reply_text(
+        "⏳ Fetching reactions..."
+    )
+
     try:
-        if GetStoryReactionsListRequest is None:
-            await status.edit_text("❌ Not supported in this Telethon version.")
-            return
-        entity = await telethon_client.get_entity(username)
-        result = await telethon_client(GetStoryReactionsListRequest(
-            peer=entity, id=story_id, limit=100,
-        ))
-        reactions = getattr(result, 'reactions', []) or []
-        count = getattr(result, 'count', 0)
-        if not reactions:
-            await status.edit_text(
-                f"❤️ Story {story_id}: {count} reaction(s).\n\n"
-                "ℹ️ No detailed reaction list was returned."
+
+        result = await telethon_client(
+            GetStoryReactionsListRequest(
+                peer=entity,
+                id=story_id,
+                limit=100
             )
+        )
+
+        reactions = getattr(
+            result,
+            "reactions",
+            []
+        ) or []
+
+        count = getattr(
+            result,
+            "count",
+            0
+        )
+
+        if not reactions:
+
+            await status.edit_text(
+                f"❤️ REACTIONS\n\n"
+                f"Story ID: {story_id}\n"
+                f"Total reactions: {count}\n\n"
+                f"ℹ️ No detailed reaction list returned."
+            )
+
             return
-        lines = [f"❤️ REACTIONS ON STORY {story_id}", f"Total reactions: {count}", ""]
-        for i, r in enumerate(reactions[:50], 1):
+
+        lines = [
+            "❤️ REACTIONS ON THIS STORY",
+            "",
+            f"🆔 Story ID: {story_id}",
+            f"❤️ Total reactions: {count}",
+            ""
+        ]
+
+        for i, reaction_item in enumerate(
+            reactions,
+            1
+        ):
+
             try:
-                peer_id = getattr(r, 'peer_id', None)
-                user_id = getattr(peer_id, 'user_id', peer_id) if peer_id else None
-                u = await telethon_client.get_entity(user_id) if user_id else None
-                name = f"{getattr(u,'first_name','') or ''}".strip() or f"User {user_id}"
-                reaction = getattr(r, 'reaction', None)
-                emoji = ""
-                if reaction and hasattr(reaction, 'emoticon'):
-                    emoji = reaction.emoticon
-                elif reaction and hasattr(reaction, 'document_id'):
-                    emoji = "🎨"
-                lines.append(f"{i}. {emoji} {name}")
+
+                peer_id = getattr(
+                    reaction_item,
+                    "peer_id",
+                    None
+                )
+
+                user_id = getattr(
+                    peer_id,
+                    "user_id",
+                    peer_id
+                )
+
+                user = None
+
+                if user_id:
+
+                    try:
+                        user = await telethon_client.get_entity(
+                            user_id
+                        )
+                    except Exception:
+                        pass
+
+                first_name = (
+                    getattr(user, "first_name", "")
+                    if user else ""
+                ) or ""
+
+                last_name = (
+                    getattr(user, "last_name", "")
+                    if user else ""
+                ) or ""
+
+                name = (
+                    f"{first_name} {last_name}"
+                    .strip()
+                )
+
+                if not name:
+                    name = f"User {user_id}"
+
+                username = (
+                    getattr(user, "username", None)
+                    if user else None
+                )
+
+                username_text = (
+                    f"@{username}"
+                    if username
+                    else "no username"
+                )
+
+                reaction = getattr(
+                    reaction_item,
+                    "reaction",
+                    None
+                )
+
+                emoji = "❤️"
+
+                if reaction:
+
+                    if hasattr(
+                        reaction,
+                        "emoticon"
+                    ):
+                        emoji = reaction.emoticon
+
+                    elif hasattr(
+                        reaction,
+                        "document_id"
+                    ):
+                        emoji = "🎨"
+
+                lines.append(
+                    f"{i}. {emoji} {name}\n"
+                    f"   🔗 {username_text}"
+                )
+
             except Exception:
-                lines.append(f"{i}. Reaction")
-        out = "\n".join(lines)
-        for i in range(0, len(out), 4000):
-            await update.message.reply_text(out[i:i+4000])
-        await status.edit_text("✅ Done.")
+
+                lines.append(
+                    f"{i}. ❤️ Reaction"
+                )
+
+        output = "\n".join(lines)
+
+        for start in range(
+            0,
+            len(output),
+            4000
+        ):
+
+            await query.message.reply_text(
+                output[start:start + 4000]
+            )
+
+        await status.edit_text(
+            "✅ Reaction list loaded."
+        )
+
     except Exception as e:
-        await status.edit_text(f"❌ Failed: {type(e).__name__}: {str(e)[:500]}")
-    finally:
-        context.user_data['state'] = None
 
-
+        await status.edit_text(
+            "❌ Failed to load reactions.\n\n"
+            f"{type(e).__name__}: {str(e)[:500]}"
+        )
 
 async def send_story_at_index(update, context, index):
     query = update.callback_query
+
     stories = context.user_data.get("stories_list", [])
-    if not stories or index < 0 or index >= len(stories):
-        await query.edit_message_text("❌ No more stories.")
+    entity = context.user_data.get("story_entity")
+
+    if not stories:
+        await query.message.reply_text("❌ No stories loaded.")
         return
 
-    # Store current index
+    if entity is None:
+        await query.message.reply_text("❌ Story owner was not found.")
+        return
+
+    if index < 0 or index >= len(stories):
+        await query.message.reply_text("📭 No more stories.")
+        return
+
     context.user_data["story_index"] = index
+
     story = stories[index]
     total = len(stories)
 
-    # Build navigation buttons
-    nav = []
+    # Save the CURRENT story ID.
+    # This is important for Who Viewed and Reactions.
+    context.user_data["current_story_id"] = story.id
+
+    # -----------------------------
+    # NAVIGATION BUTTONS
+    # -----------------------------
+    nav_buttons = []
+
     if index > 0:
-        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"story_nav_{index-1}"))
+        nav_buttons.append(
+            InlineKeyboardButton(
+                "⬅️ Prev",
+                callback_data=f"story_nav_{index - 1}"
+            )
+        )
+
     if index < total - 1:
-        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"story_nav_{index+1}"))
-    nav.append(InlineKeyboardButton("⬅️ Back", callback_data="profile"))
+        nav_buttons.append(
+            InlineKeyboardButton(
+                "Next ➡️",
+                callback_data=f"story_nav_{index + 1}"
+            )
+        )
 
-    kb = InlineKeyboardMarkup([nav])
+    # -----------------------------
+    # STORY TOOLS
+    # -----------------------------
+    tool_buttons = [
+        InlineKeyboardButton(
+            "👁 Who Viewed",
+            callback_data="story_current_viewers"
+        ),
+        InlineKeyboardButton(
+            "❤️ Reactions",
+            callback_data="story_current_reactions"
+        )
+    ]
 
-    # Download and send the story media
-    media_bytes = BytesIO()
-    await telethon_client.download_media(story.media, file=media_bytes)
-    media_bytes.seek(0)
+    keyboard = []
 
-    caption = f"📖 Story {index+1}/{total}"
+    if nav_buttons:
+        keyboard.append(nav_buttons)
 
-    # Detect media type and send
-    if story.media and hasattr(story.media, 'photo'):
-        await query.message.reply_photo(photo=media_bytes, caption=caption, reply_markup=kb)
-    elif story.media and hasattr(story.media, 'document'):
-        mime = getattr(story.media.document, 'mime_type', '')
-        if 'video' in mime:
-            await query.message.reply_video(video=media_bytes, caption=caption, reply_markup=kb)
+    keyboard.append(tool_buttons)
+
+    keyboard.append([
+        InlineKeyboardButton(
+            "⬅️ Back",
+            callback_data="story_tools_menu"
+        )
+    ])
+
+    kb = InlineKeyboardMarkup(keyboard)
+
+    # -----------------------------
+    # DOWNLOAD STORY
+    # -----------------------------
+    try:
+        media_bytes = BytesIO()
+
+        await telethon_client.download_media(
+            story.media,
+            file=media_bytes
+        )
+
+        media_bytes.seek(0)
+
+        # Story date
+        story_date = getattr(story, "date", None)
+
+        if story_date:
+            try:
+                date_text = story_date.strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                date_text = str(story_date)
         else:
-            await query.message.reply_document(document=media_bytes, caption=caption, reply_markup=kb)
-    else:
-        await query.message.reply_document(document=media_bytes, caption=caption, reply_markup=kb)
-# --- FAST GLOBAL TELEGRAM SEARCH ---
+            date_text = "Unknown"
+
+        owner_name = (
+            getattr(entity, "first_name", None)
+            or getattr(entity, "title", None)
+            or getattr(entity, "username", None)
+            or "Unknown"
+        )
+
+        caption = (
+            f"📖 Story {index + 1}/{total}\n"
+            f"👤 {owner_name}\n"
+            f"🆔 Story ID: {story.id}\n"
+            f"🕒 Posted: {date_text}"
+        )
+
+        # -----------------------------
+        # PHOTO
+        # -----------------------------
+        if story.media and hasattr(story.media, "photo"):
+
+            await query.message.reply_photo(
+                photo=media_bytes,
+                caption=caption,
+                reply_markup=kb
+            )
+
+        # -----------------------------
+        # VIDEO / DOCUMENT
+        # -----------------------------
+        elif story.media and hasattr(story.media, "document"):
+
+            mime = getattr(
+                story.media.document,
+                "mime_type",
+                ""
+            )
+
+            if "video" in mime:
+
+                await query.message.reply_video(
+                    video=media_bytes,
+                    caption=caption,
+                    reply_markup=kb
+                )
+
+            else:
+
+                await query.message.reply_document(
+                    document=media_bytes,
+                    caption=caption,
+                    reply_markup=kb
+                )
+
+        else:
+
+            await query.message.reply_document(
+                document=media_bytes,
+                caption=caption,
+                reply_markup=kb
+            )
+
+    except Exception as e:
+
+        await query.message.reply_text(
+            f"❌ Could not display story.\n\n"
+            f"{type(e).__name__}: {str(e)[:500]}"
+        )
 # --- SAFE PUBLIC TELEGRAM SEARCH ---
 # IMPORTANT:
 # telethon_client is a single Telegram account/session.
