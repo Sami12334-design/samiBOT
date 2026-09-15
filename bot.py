@@ -2496,34 +2496,89 @@ async def fetch_profile(update, context, target):
 
 async def handle_story_view(update, context):
     query = update.callback_query
-    await query.answer("Loading stories…")
-
-    entity = context.user_data.get("story_entity")
-    if not entity:
-        await query.edit_message_text("❌ No profile selected. Please search a user again.")
-        return
-
-    # Check if the stories API is available
-    if GetPeerStoriesRequest is None:
-        await query.edit_message_text("❌ Stories are not supported in this version (missing Telethon story modules).")
-        return
 
     try:
-        # Fetch the peer stories
-        result = await telethon_client(GetPeerStoriesRequest(peer=entity))
-        stories = result.stories
+        await query.answer("⏳ Loading stories...")
+    except Exception:
+        pass
 
-        if not stories:
-            await query.edit_message_text("📭 No stories found for this user.")
+    # Get the profile/story owner
+    entity = context.user_data.get("story_entity")
+
+    # Fallback to profile entity
+    if not entity:
+        entity = context.user_data.get("profile_entity")
+
+    if not entity:
+        await query.message.reply_text(
+            "❌ No profile selected.\n\n"
+            "Please search a Telegram user again."
+        )
+        return
+
+    if GetPeerStoriesRequest is None:
+        await query.message.reply_text(
+            "❌ Story API is not available.\n\n"
+            "Please update your Telethon package."
+        )
+        return
+
+    status = await query.message.reply_text(
+        "⏳ Loading Telegram stories..."
+    )
+
+    try:
+        # Get stories from the selected Telegram profile
+        result = await telethon_client(
+            GetPeerStoriesRequest(peer=entity)
+        )
+
+        stories = getattr(result, "stories", []) or []
+
+        # Keep only real stories that contain media
+        valid_stories = []
+
+        for story in stories:
+            if getattr(story, "media", None):
+                valid_stories.append(story)
+
+        if not valid_stories:
+            await status.edit_text(
+                "📭 No active stories found for this user."
+            )
             return
 
-        # Store stories and start with the first one (index 0)
-        context.user_data["stories_list"] = stories
+        # Save stories for this bot user
+        context.user_data["story_entity"] = entity
+        context.user_data["stories_list"] = valid_stories
         context.user_data["story_index"] = 0
-        await send_story_at_index(update, context, 0)
+        context.user_data["current_story_id"] = valid_stories[0].id
+
+        # No old story message yet
+        context.user_data["story_message_id"] = None
+
+        await status.edit_text(
+            f"✅ Found {len(valid_stories)} active stor"
+            f"{'y' if len(valid_stories) == 1 else 'ies'}."
+        )
+
+        # Show FIRST story
+        await send_story_at_index(
+            update,
+            context,
+            0
+        )
 
     except Exception as e:
-        await query.edit_message_text(f"❌ Could not load stories: {type(e).__name__}: {e}")
+        await status.edit_text(
+            "❌ Could not load stories.\n\n"
+            f"{type(e).__name__}: {str(e)[:500]}"
+        )
+
+        print(
+            f"STORY LOAD ERROR: "
+            f"{type(e).__name__}: {e}"
+        )
 # ─── STORY TOOLS (open to all authenticated users) ───
 async def fetch_all_stories_feed(update, context):
     """GetAllStoriesRequest — sends the session account's full story feed."""
@@ -2920,55 +2975,90 @@ async def handle_current_story_reactions(update, context):
 async def send_story_at_index(update, context, index):
     query = update.callback_query
 
-    stories = context.user_data.get("stories_list", [])
-    entity = context.user_data.get("story_entity")
+    stories = context.user_data.get(
+        "stories_list",
+        []
+    )
+
+    entity = context.user_data.get(
+        "story_entity"
+    )
 
     if not stories:
-        await query.message.reply_text("❌ No stories loaded.")
+        await query.message.reply_text(
+            "❌ No stories are loaded."
+        )
         return
 
     if entity is None:
-        await query.message.reply_text("❌ Story owner was not found.")
+        await query.message.reply_text(
+            "❌ Story owner was not found."
+        )
         return
 
+    # Check index
     if index < 0 or index >= len(stories):
-        await query.message.reply_text("📭 No more stories.")
+        await query.answer(
+            "📭 No more stories.",
+            show_alert=True
+        )
         return
-
-    context.user_data["story_index"] = index
 
     story = stories[index]
     total = len(stories)
 
-    # Save the CURRENT story ID.
-    # This is important for Who Viewed and Reactions.
+    # Save current story
+    context.user_data["story_index"] = index
     context.user_data["current_story_id"] = story.id
 
-    # -----------------------------
-    # NAVIGATION BUTTONS
-    # -----------------------------
-    nav_buttons = []
+    # -----------------------------------------
+    # DELETE PREVIOUS STORY MESSAGE
+    # -----------------------------------------
+
+    old_message_id = context.user_data.get(
+        "story_message_id"
+    )
+
+    if old_message_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=query.message.chat_id,
+                message_id=old_message_id
+            )
+        except Exception as e:
+            print(
+                f"Could not delete old story: {e}"
+            )
+
+    # -----------------------------------------
+    # BUILD NAVIGATION BUTTONS
+    # -----------------------------------------
+
+    buttons = []
+
+    navigation = []
 
     if index > 0:
-        nav_buttons.append(
+        navigation.append(
             InlineKeyboardButton(
-                "⬅️ Prev",
+                "⬅️ Previous",
                 callback_data=f"story_nav_{index - 1}"
             )
         )
 
     if index < total - 1:
-        nav_buttons.append(
+        navigation.append(
             InlineKeyboardButton(
                 "Next ➡️",
                 callback_data=f"story_nav_{index + 1}"
             )
         )
 
-    # -----------------------------
-    # STORY TOOLS
-    # -----------------------------
-    tool_buttons = [
+    if navigation:
+        buttons.append(navigation)
+
+    # Story information
+    buttons.append([
         InlineKeyboardButton(
             "👁 Who Viewed",
             callback_data="story_current_viewers"
@@ -2977,113 +3067,183 @@ async def send_story_at_index(update, context, index):
             "❤️ Reactions",
             callback_data="story_current_reactions"
         )
-    ]
+    ])
 
-    keyboard = []
-
-    if nav_buttons:
-        keyboard.append(nav_buttons)
-
-    keyboard.append(tool_buttons)
-
-    keyboard.append([
+    buttons.append([
         InlineKeyboardButton(
-            "⬅️ Back",
-            callback_data="story_tools_menu"
+            "⬅️ Back to Profile",
+            callback_data="profile"
         )
     ])
 
-    kb = InlineKeyboardMarkup(keyboard)
+    keyboard = InlineKeyboardMarkup(buttons)
 
-    # -----------------------------
+    # -----------------------------------------
     # DOWNLOAD STORY
-    # -----------------------------
+    # -----------------------------------------
+
     try:
         media_bytes = BytesIO()
 
-        await telethon_client.download_media(
+        downloaded = await telethon_client.download_media(
             story.media,
             file=media_bytes
         )
 
+        if not downloaded:
+            await query.message.reply_text(
+                "❌ Could not download this story."
+            )
+            return
+
         media_bytes.seek(0)
 
-        # Story date
-        story_date = getattr(story, "date", None)
+        # -----------------------------------------
+        # STORY DATE
+        # -----------------------------------------
+
+        story_date = getattr(
+            story,
+            "date",
+            None
+        )
 
         if story_date:
             try:
-                date_text = story_date.strftime("%Y-%m-%d %H:%M")
+                date_text = story_date.strftime(
+                    "%Y-%m-%d %H:%M"
+                )
             except Exception:
                 date_text = str(story_date)
         else:
             date_text = "Unknown"
 
-        owner_name = (
-            getattr(entity, "first_name", None)
-            or getattr(entity, "title", None)
-            or getattr(entity, "username", None)
-            or "Unknown"
+        # -----------------------------------------
+        # OWNER NAME
+        # -----------------------------------------
+
+        first_name = getattr(
+            entity,
+            "first_name",
+            ""
+        ) or ""
+
+        last_name = getattr(
+            entity,
+            "last_name",
+            ""
+        ) or ""
+
+        username = getattr(
+            entity,
+            "username",
+            None
         )
 
+        owner_name = (
+            f"{first_name} {last_name}"
+        ).strip()
+
+        if not owner_name:
+            owner_name = (
+                f"@{username}"
+                if username
+                else "Unknown"
+            )
+
+        # -----------------------------------------
+        # CAPTION
+        # -----------------------------------------
+
         caption = (
-            f"📖 Story {index + 1}/{total}\n"
+            f"📖 STORY {index + 1}/{total}\n\n"
             f"👤 {owner_name}\n"
             f"🆔 Story ID: {story.id}\n"
             f"🕒 Posted: {date_text}"
         )
 
-        # -----------------------------
-        # PHOTO
-        # -----------------------------
-        if story.media and hasattr(story.media, "photo"):
+        # -----------------------------------------
+        # SEND STORY
+        # -----------------------------------------
 
-            await query.message.reply_photo(
+        sent_message = None
+
+        media = getattr(
+            story,
+            "media",
+            None
+        )
+
+        # PHOTO
+        if media and hasattr(
+            media,
+            "photo"
+        ):
+            sent_message = await query.message.reply_photo(
                 photo=media_bytes,
                 caption=caption,
-                reply_markup=kb
+                reply_markup=keyboard
             )
 
-        # -----------------------------
-        # VIDEO / DOCUMENT
-        # -----------------------------
-        elif story.media and hasattr(story.media, "document"):
+        # DOCUMENT / VIDEO
+        elif media and hasattr(
+            media,
+            "document"
+        ):
+            document = media.document
 
-            mime = getattr(
-                story.media.document,
+            mime_type = getattr(
+                document,
                 "mime_type",
                 ""
-            )
+            ) or ""
 
-            if "video" in mime:
-
-                await query.message.reply_video(
+            if mime_type.startswith(
+                "video/"
+            ):
+                sent_message = await query.message.reply_video(
                     video=media_bytes,
                     caption=caption,
-                    reply_markup=kb
+                    reply_markup=keyboard
                 )
-
             else:
-
-                await query.message.reply_document(
+                sent_message = await query.message.reply_document(
                     document=media_bytes,
                     caption=caption,
-                    reply_markup=kb
+                    reply_markup=keyboard
                 )
 
         else:
-
-            await query.message.reply_document(
+            sent_message = await query.message.reply_document(
                 document=media_bytes,
                 caption=caption,
-                reply_markup=kb
+                reply_markup=keyboard
             )
+
+        # Save the Telegram message ID
+        if sent_message:
+            context.user_data[
+                "story_message_id"
+            ] = sent_message.message_id
+
+        try:
+            await query.answer(
+                f"Story {index + 1}/{total}"
+            )
+        except Exception:
+            pass
 
     except Exception as e:
 
+        print(
+            f"STORY DISPLAY ERROR: "
+            f"{type(e).__name__}: {e}"
+        )
+
         await query.message.reply_text(
-            f"❌ Could not display story.\n\n"
-            f"{type(e).__name__}: {str(e)[:500]}"
+            "❌ Could not display this story.\n\n"
+            f"{type(e).__name__}: "
+            f"{str(e)[:500]}"
         )
 # --- SAFE PUBLIC TELEGRAM SEARCH ---
 # IMPORTANT:
