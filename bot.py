@@ -25,6 +25,7 @@ from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageChops
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
+from telethon import TelegramClient, events, functions, types
 from telethon.sessions import StringSession
 from telethon.utils import get_peer_id
 from datetime import datetime, timedelta
@@ -45,19 +46,10 @@ import imageio_ffmpeg
 import qrcode
 
 try:
-    from telethon.tl.functions.stories import (
-        GetPeerStoriesRequest,
-        GetStoriesByIDRequest,
-        GetStoryViewsListRequest,
-        GetStoryReactionsListRequest,
-        GetAllStoriesRequest,
-    )
+    from telethon.tl.functions.stories import GetPeerStoriesRequest, GetStoriesByIDRequest
 except ImportError:
     GetPeerStoriesRequest = None
     GetStoriesByIDRequest = None
-    GetStoryViewsListRequest = None
-    GetStoryReactionsListRequest = None
-    GetAllStoriesRequest = None
 
 app = Flask(__name__)
 
@@ -426,7 +418,7 @@ async def menu_callback(update, context):
             keyboard = [[InlineKeyboardButton("👤 Profile", callback_data="profile")], [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")], [InlineKeyboardButton("➕ More Commands", callback_data="more")]]
         await query.message.reply_text("🤖 TELEGRAM ASSISTANT", reply_markup=InlineKeyboardMarkup(keyboard))
     elif data == "more":
-        kb = [[InlineKeyboardButton("🔎 Search", callback_data="search"), InlineKeyboardButton("📊 Statistics", callback_data="stats")], [InlineKeyboardButton("📄 PDF Fetch", callback_data="pdf_fetch")], [InlineKeyboardButton("🔄 Converter", callback_data="converter")], [InlineKeyboardButton("🎬 Video Downloader", callback_data="video_downloader")], [InlineKeyboardButton("🌐 Story Tools", callback_data="story_tools_menu")]]
+        kb = [[InlineKeyboardButton("🔎 Search", callback_data="search"), InlineKeyboardButton("📊 Statistics", callback_data="stats")], [InlineKeyboardButton("📄 PDF Fetch", callback_data="pdf_fetch")], [InlineKeyboardButton("🔄 Converter", callback_data="converter")], [InlineKeyboardButton("🎬 Video Downloader", callback_data="video_downloader")]]
         if is_admin(user_id):
             admin_buttons = [[InlineKeyboardButton("💬 Message Manager", callback_data="message_manager")], [InlineKeyboardButton("🔔 Track", callback_data="track"), InlineKeyboardButton("🔗 Names", callback_data="names")], [InlineKeyboardButton("👥 Groups", callback_data="groups"), InlineKeyboardButton("💬 Messages", callback_data="messages")], [InlineKeyboardButton("🔎 Analysis", callback_data="analysis"), InlineKeyboardButton("📢 Channels", callback_data="channels")], [InlineKeyboardButton("👍 Reputation", callback_data="rep"), InlineKeyboardButton("👥 Friends", callback_data="friends")], [InlineKeyboardButton("🔄 Reactions", callback_data="reactions"), InlineKeyboardButton("🎁 Gifts", callback_data="gifts")], [InlineKeyboardButton("📤 Share", callback_data="share"), InlineKeyboardButton("🔵 Words Frequency", callback_data="words")], [InlineKeyboardButton("👥 Common Groups", callback_data="common")], [InlineKeyboardButton("📢 Broadcast", callback_data="broadcast")]]
             kb = admin_buttons + kb
@@ -539,82 +531,15 @@ async def menu_callback(update, context):
         except Exception: page=1
         await handle_posts_pagination(update, context, page)
         return
-    elif data == "story_tools_menu":
-        kb = [
-    [
-        InlineKeyboardButton(
-            "📖 Story Viewer",
-            callback_data="story_tools_story_viewer"
-        )
-    ],
-    [
-        InlineKeyboardButton(
-            "🌐 All Stories Feed",
-            callback_data="story_tools_feed"
-        )
-    ],
-    [
-        InlineKeyboardButton(
-            "👤 Who Visited My Profile",
-            callback_data="story_profile_visitors"
-        )
-    ],
-    [
-        InlineKeyboardButton(
-            "⬅️ Back",
-            callback_data="more"
-        )
-    ]
-]
-        await query.message.reply_text(
-            "🌐 STORY TOOLS\n\nChoose an option:",
-            reply_markup=InlineKeyboardMarkup(kb)
-        )
-        return
-    elif data == "story_tools_viewers":
-        context.user_data['state'] = 'story_tools_viewers_input'
-        await query.message.reply_text(
-            "📋 WHO VIEWED STORY\n\n"
-            "Send: username story_id\n"
-            "Example: durov 42"
-        )
-        return
-    elif data == "story_tools_reactions":
-        context.user_data['state'] = 'story_tools_reactions_input'
-        await query.message.reply_text(
-            "❤️ REACTIONS LIST\n\n"
-            "Send: username story_id\n"
-            "Example: durov 42"
-        )
-        return
-    elif data == "story_tools_feed":
-        await fetch_all_stories_feed(update, context)
-        return
-    elif data == "story_start":
-    await handle_story_view(update, context)
-    return
-
-   elif data.startswith("story_nav_"):
-    try:
-        idx = int(data.split("_")[2])
-        await send_story_at_index(update, context, idx)
-    except Exception as e:
-        await query.answer("Invalid navigation", show_alert=True)
-        print(f"Story navigation error: {e}")
-    return
-
-   elif data.startswith("story_"):
-    await handle_story_view(update, context)
-    return
-    elif data == "story_current_viewers":
-        await handle_current_story_viewers(update, context)
-        return
-
-    elif data == "story_current_reactions":
-        await handle_current_story_reactions(update, context)
-        return
     elif data.startswith("story_"):
         await handle_story_view(update, context)
+        return
+    elif data.startswith("story_nav_"):
+        try:
+            idx = int(data.split("_")[2])
+            await send_story_at_index(update, context, idx)
+        except Exception:
+            await query.answer("Invalid navigation", show_alert=True)
         return
 # --- PHOTO EDITING ---
 def build_edit_keyboard(page=1):
@@ -2496,916 +2421,168 @@ async def fetch_profile(update, context, target):
 
 async def handle_story_view(update, context):
     query = update.callback_query
+    await query.answer("Loading stories…")
 
-    try:
-        await query.answer("⏳ Loading stories...")
-    except Exception:
-        pass
-
-    # Get the profile/story owner
     entity = context.user_data.get("story_entity")
-
-    # Fallback to profile entity
     if not entity:
-        entity = context.user_data.get("profile_entity")
-
-    if not entity:
-        await query.message.reply_text(
-            "❌ No profile selected.\n\n"
-            "Please search a Telegram user again."
-        )
+        await query.edit_message_text("❌ No profile selected. Please search a user again.")
         return
 
+    # Check if the stories API is available
     if GetPeerStoriesRequest is None:
-        await query.message.reply_text(
-            "❌ Story API is not available.\n\n"
-            "Please update your Telethon package."
-        )
+        await query.edit_message_text("❌ Stories are not supported in this version (missing Telethon story modules).")
         return
 
-    status = await query.message.reply_text(
-        "⏳ Loading Telegram stories..."
-    )
-
     try:
-        # Get stories from the selected Telegram profile
-        result = await telethon_client(
-            GetPeerStoriesRequest(peer=entity)
-        )
+        # Fetch the peer stories
+        result = await telethon_client(GetPeerStoriesRequest(peer=entity))
+        stories = result.stories
 
-        stories = getattr(result, "stories", []) or []
-
-        # Keep only real stories that contain media
-        valid_stories = []
-
-        for story in stories:
-            if getattr(story, "media", None):
-                valid_stories.append(story)
-
-        if not valid_stories:
-            await status.edit_text(
-                "📭 No active stories found for this user."
-            )
+        if not stories:
+            await query.edit_message_text("📭 No stories found for this user.")
             return
 
-        # Save stories for this bot user
-        context.user_data["story_entity"] = entity
-        context.user_data["stories_list"] = valid_stories
+        # Store stories and start with the first one (index 0)
+        context.user_data["stories_list"] = stories
         context.user_data["story_index"] = 0
-        context.user_data["current_story_id"] = valid_stories[0].id
-
-        # No old story message yet
-        context.user_data["story_message_id"] = None
-
-        await status.edit_text(
-            f"✅ Found {len(valid_stories)} active stor"
-            f"{'y' if len(valid_stories) == 1 else 'ies'}."
-        )
-
-        # Show FIRST story
-        await send_story_at_index(
-            update,
-            context,
-            0
-        )
+        await send_story_at_index(update, context, 0)
 
     except Exception as e:
-        await status.edit_text(
-            "❌ Could not load stories.\n\n"
-            f"{type(e).__name__}: {str(e)[:500]}"
-        )
+        await query.edit_message_text(f"❌ Could not load stories: {type(e).__name__}: {e}")
 
-        print(
-            f"STORY LOAD ERROR: "
-            f"{type(e).__name__}: {e}"
-        )
-# ─── STORY TOOLS (open to all authenticated users) ───
-async def fetch_all_stories_feed(update, context):
-    """GetAllStoriesRequest — sends the session account's full story feed."""
-    query = update.callback_query
-    status = await query.message.reply_text("⏳ Loading stories feed…")
-    try:
-        if GetAllStoriesRequest is None:
-            await status.edit_text("❌ Stories not supported in this Telethon version.")
-            return
-        result = await telethon_client(GetAllStoriesRequest())
-        peer_stories = getattr(result, 'peer_stories', []) or []
-        if not peer_stories:
-            await status.edit_text("📭 No stories in the feed right now.")
-            return
-        await status.edit_text(f"✅ Found {len(peer_stories)} peer(s) with stories. Sending…")
-        sent = 0
-        for ps in peer_stories[:20]:
-            peer = getattr(ps, 'peer', None)
-            stories = getattr(ps, 'stories', []) or []
-            for story in stories[:3]:
-                try:
-                    media_bytes = BytesIO()
-                    await telethon_client.download_media(story.media, file=media_bytes)
-                    media_bytes.seek(0)
-                    caption = f"🌐 Story from {peer}\nStory ID: {story.id}"
-                    if getattr(story, 'photo', None):
-                        await query.message.reply_photo(photo=media_bytes, caption=caption)
-                    else:
-                        await query.message.reply_video(video=media_bytes, caption=caption)
-                    sent += 1
-                    await asyncio.sleep(0.4)
-                except Exception as inner:
-                    print(f"Story send error: {inner}")
-        await status.edit_text(f"✅ Feed done. Sent {sent} stories.")
-    except Exception as e:
-        await status.edit_text(f"❌ Failed: {type(e).__name__}: {str(e)[:500]}")
-
-
-async def handle_current_story_viewers(update, context):
-    query = update.callback_query
-
-    await query.answer("Loading viewers...")
-
-    entity = context.user_data.get("story_entity")
-    story_id = context.user_data.get("current_story_id")
-
-    if not entity:
-        await query.message.reply_text(
-            "❌ Story owner was not found."
-        )
-        return
-
-    if not story_id:
-        await query.message.reply_text(
-            "❌ Current story was not found."
-        )
-        return
-
-    if GetStoryViewsListRequest is None:
-        await query.message.reply_text(
-            "❌ Your Telethon version does not support story viewers."
-        )
-        return
-
-    status = await query.message.reply_text(
-        "⏳ Fetching who viewed this story..."
-    )
-
-    try:
-
-        result = await telethon_client(
-            GetStoryViewsListRequest(
-                peer=entity,
-                id=story_id,
-                offset="",
-                limit=100
-            )
-        )
-
-        views_count = getattr(
-            result,
-            "views_count",
-            0
-        )
-
-        views = getattr(
-            result,
-            "views",
-            []
-        ) or []
-
-        if not views:
-
-            await status.edit_text(
-                f"👁 WHO VIEWED STORY\n\n"
-                f"Story ID: {story_id}\n"
-                f"Total views: {views_count}\n\n"
-                f"ℹ️ Telegram did not return a detailed viewer list."
-            )
-
-            return
-
-        lines = [
-            "👁 WHO VIEWED THIS STORY",
-            "",
-            f"🆔 Story ID: {story_id}",
-            f"👁 Total views: {views_count}",
-            ""
-        ]
-
-        for i, view in enumerate(views, 1):
-
-            try:
-
-                user_id = getattr(
-                    view,
-                    "user_id",
-                    None
-                )
-
-                user = None
-
-                if user_id:
-                    try:
-                        user = await telethon_client.get_entity(
-                            user_id
-                        )
-                    except Exception:
-                        pass
-
-                first_name = (
-                    getattr(user, "first_name", "")
-                    if user else ""
-                ) or ""
-
-                last_name = (
-                    getattr(user, "last_name", "")
-                    if user else ""
-                ) or ""
-
-                name = f"{first_name} {last_name}".strip()
-
-                if not name:
-                    name = f"User {user_id}"
-
-                username = (
-                    getattr(user, "username", None)
-                    if user else None
-                )
-
-                username_text = (
-                    f"@{username}"
-                    if username
-                    else "no username"
-                )
-
-                # Viewer timestamp
-                view_date = getattr(
-                    view,
-                    "date",
-                    None
-                )
-
-                if view_date:
-
-                    try:
-                        view_time = view_date.strftime(
-                            "%Y-%m-%d %H:%M"
-                        )
-                    except Exception:
-                        view_time = str(view_date)
-
-                else:
-                    view_time = "time unavailable"
-
-                lines.append(
-                    f"{i}. 👤 {name}\n"
-                    f"   🔗 {username_text}\n"
-                    f"   🕒 Viewed: {view_time}"
-                )
-
-            except Exception:
-
-                lines.append(
-                    f"{i}. 👤 Unknown viewer"
-                )
-
-        output = "\n".join(lines)
-
-        # Telegram message limit
-        for start in range(0, len(output), 4000):
-
-            await query.message.reply_text(
-                output[start:start + 4000]
-            )
-
-        await status.edit_text(
-            "✅ Viewer list loaded."
-        )
-
-    except Exception as e:
-
-        await status.edit_text(
-            "❌ Failed to load viewers.\n\n"
-            f"{type(e).__name__}: {str(e)[:500]}"
-        )
-
-async def handle_current_story_reactions(update, context):
-    query = update.callback_query
-
-    await query.answer("Loading reactions...")
-
-    entity = context.user_data.get("story_entity")
-    story_id = context.user_data.get("current_story_id")
-
-    if not entity:
-        await query.message.reply_text(
-            "❌ Story owner was not found."
-        )
-        return
-
-    if not story_id:
-        await query.message.reply_text(
-            "❌ Current story was not found."
-        )
-        return
-
-    if GetStoryReactionsListRequest is None:
-        await query.message.reply_text(
-            "❌ Your Telethon version does not support story reactions."
-        )
-        return
-
-    status = await query.message.reply_text(
-        "⏳ Fetching reactions..."
-    )
-
-    try:
-
-        result = await telethon_client(
-            GetStoryReactionsListRequest(
-                peer=entity,
-                id=story_id,
-                limit=100
-            )
-        )
-
-        reactions = getattr(
-            result,
-            "reactions",
-            []
-        ) or []
-
-        count = getattr(
-            result,
-            "count",
-            0
-        )
-
-        if not reactions:
-
-            await status.edit_text(
-                f"❤️ REACTIONS\n\n"
-                f"Story ID: {story_id}\n"
-                f"Total reactions: {count}\n\n"
-                f"ℹ️ No detailed reaction list returned."
-            )
-
-            return
-
-        lines = [
-            "❤️ REACTIONS ON THIS STORY",
-            "",
-            f"🆔 Story ID: {story_id}",
-            f"❤️ Total reactions: {count}",
-            ""
-        ]
-
-        for i, reaction_item in enumerate(
-            reactions,
-            1
-        ):
-
-            try:
-
-                peer_id = getattr(
-                    reaction_item,
-                    "peer_id",
-                    None
-                )
-
-                user_id = getattr(
-                    peer_id,
-                    "user_id",
-                    peer_id
-                )
-
-                user = None
-
-                if user_id:
-
-                    try:
-                        user = await telethon_client.get_entity(
-                            user_id
-                        )
-                    except Exception:
-                        pass
-
-                first_name = (
-                    getattr(user, "first_name", "")
-                    if user else ""
-                ) or ""
-
-                last_name = (
-                    getattr(user, "last_name", "")
-                    if user else ""
-                ) or ""
-
-                name = (
-                    f"{first_name} {last_name}"
-                    .strip()
-                )
-
-                if not name:
-                    name = f"User {user_id}"
-
-                username = (
-                    getattr(user, "username", None)
-                    if user else None
-                )
-
-                username_text = (
-                    f"@{username}"
-                    if username
-                    else "no username"
-                )
-
-                reaction = getattr(
-                    reaction_item,
-                    "reaction",
-                    None
-                )
-
-                emoji = "❤️"
-
-                if reaction:
-
-                    if hasattr(
-                        reaction,
-                        "emoticon"
-                    ):
-                        emoji = reaction.emoticon
-
-                    elif hasattr(
-                        reaction,
-                        "document_id"
-                    ):
-                        emoji = "🎨"
-
-                lines.append(
-                    f"{i}. {emoji} {name}\n"
-                    f"   🔗 {username_text}"
-                )
-
-            except Exception:
-
-                lines.append(
-                    f"{i}. ❤️ Reaction"
-                )
-
-        output = "\n".join(lines)
-
-        for start in range(
-            0,
-            len(output),
-            4000
-        ):
-
-            await query.message.reply_text(
-                output[start:start + 4000]
-            )
-
-        await status.edit_text(
-            "✅ Reaction list loaded."
-        )
-
-    except Exception as e:
-
-        await status.edit_text(
-            "❌ Failed to load reactions.\n\n"
-            f"{type(e).__name__}: {str(e)[:500]}"
-        )
 
 async def send_story_at_index(update, context, index):
     query = update.callback_query
-
-    stories = context.user_data.get(
-        "stories_list",
-        []
-    )
-
-    entity = context.user_data.get(
-        "story_entity"
-    )
-
-    if not stories:
-        await query.message.reply_text(
-            "❌ No stories are loaded."
-        )
+    stories = context.user_data.get("stories_list", [])
+    if not stories or index < 0 or index >= len(stories):
+        await query.edit_message_text("❌ No more stories.")
         return
 
-    if entity is None:
-        await query.message.reply_text(
-            "❌ Story owner was not found."
-        )
-        return
-
-    # Check index
-    if index < 0 or index >= len(stories):
-        await query.answer(
-            "📭 No more stories.",
-            show_alert=True
-        )
-        return
-
+    # Store current index
+    context.user_data["story_index"] = index
     story = stories[index]
     total = len(stories)
 
-    # Save current story
-    context.user_data["story_index"] = index
-    context.user_data["current_story_id"] = story.id
-
-    # -----------------------------------------
-    # DELETE PREVIOUS STORY MESSAGE
-    # -----------------------------------------
-
-    old_message_id = context.user_data.get(
-        "story_message_id"
-    )
-
-    if old_message_id:
-        try:
-            await context.bot.delete_message(
-                chat_id=query.message.chat_id,
-                message_id=old_message_id
-            )
-        except Exception as e:
-            print(
-                f"Could not delete old story: {e}"
-            )
-
-    # -----------------------------------------
-    # BUILD NAVIGATION BUTTONS
-    # -----------------------------------------
-
-    buttons = []
-
-    navigation = []
-
+    # Build navigation buttons
+    nav = []
     if index > 0:
-        navigation.append(
-            InlineKeyboardButton(
-                "⬅️ Previous",
-                callback_data=f"story_nav_{index - 1}"
-            )
-        )
-
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"story_nav_{index-1}"))
     if index < total - 1:
-        navigation.append(
-            InlineKeyboardButton(
-                "Next ➡️",
-                callback_data=f"story_nav_{index + 1}"
-            )
-        )
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"story_nav_{index+1}"))
+    nav.append(InlineKeyboardButton("⬅️ Back", callback_data="profile"))
 
-    if navigation:
-        buttons.append(navigation)
+    kb = InlineKeyboardMarkup([nav])
 
-    # Story information
-    buttons.append([
-        InlineKeyboardButton(
-            "👁 Who Viewed",
-            callback_data="story_current_viewers"
-        ),
-        InlineKeyboardButton(
-            "❤️ Reactions",
-            callback_data="story_current_reactions"
-        )
-    ])
+    # Download and send the story media
+    media_bytes = BytesIO()
+    await telethon_client.download_media(story.media, file=media_bytes)
+    media_bytes.seek(0)
 
-    buttons.append([
-        InlineKeyboardButton(
-            "⬅️ Back to Profile",
-            callback_data="profile"
-        )
-    ])
+    caption = f"📖 Story {index+1}/{total}"
 
-    keyboard = InlineKeyboardMarkup(buttons)
-
-    # -----------------------------------------
-    # DOWNLOAD STORY
-    # -----------------------------------------
-
-    try:
-        media_bytes = BytesIO()
-
-        downloaded = await telethon_client.download_media(
-            story.media,
-            file=media_bytes
-        )
-
-        if not downloaded:
-            await query.message.reply_text(
-                "❌ Could not download this story."
-            )
-            return
-
-        media_bytes.seek(0)
-
-        # -----------------------------------------
-        # STORY DATE
-        # -----------------------------------------
-
-        story_date = getattr(
-            story,
-            "date",
-            None
-        )
-
-        if story_date:
-            try:
-                date_text = story_date.strftime(
-                    "%Y-%m-%d %H:%M"
-                )
-            except Exception:
-                date_text = str(story_date)
+    # Detect media type and send
+    if story.media and hasattr(story.media, 'photo'):
+        await query.message.reply_photo(photo=media_bytes, caption=caption, reply_markup=kb)
+    elif story.media and hasattr(story.media, 'document'):
+        mime = getattr(story.media.document, 'mime_type', '')
+        if 'video' in mime:
+            await query.message.reply_video(video=media_bytes, caption=caption, reply_markup=kb)
         else:
-            date_text = "Unknown"
-
-        # -----------------------------------------
-        # OWNER NAME
-        # -----------------------------------------
-
-        first_name = getattr(
-            entity,
-            "first_name",
-            ""
-        ) or ""
-
-        last_name = getattr(
-            entity,
-            "last_name",
-            ""
-        ) or ""
-
-        username = getattr(
-            entity,
-            "username",
-            None
-        )
-
-        owner_name = (
-            f"{first_name} {last_name}"
-        ).strip()
-
-        if not owner_name:
-            owner_name = (
-                f"@{username}"
-                if username
-                else "Unknown"
-            )
-
-        # -----------------------------------------
-        # CAPTION
-        # -----------------------------------------
-
-        caption = (
-            f"📖 STORY {index + 1}/{total}\n\n"
-            f"👤 {owner_name}\n"
-            f"🆔 Story ID: {story.id}\n"
-            f"🕒 Posted: {date_text}"
-        )
-
-        # -----------------------------------------
-        # SEND STORY
-        # -----------------------------------------
-
-        sent_message = None
-
-        media = getattr(
-            story,
-            "media",
-            None
-        )
-
-        # PHOTO
-        if media and hasattr(
-            media,
-            "photo"
-        ):
-            sent_message = await query.message.reply_photo(
-                photo=media_bytes,
-                caption=caption,
-                reply_markup=keyboard
-            )
-
-        # DOCUMENT / VIDEO
-        elif media and hasattr(
-            media,
-            "document"
-        ):
-            document = media.document
-
-            mime_type = getattr(
-                document,
-                "mime_type",
-                ""
-            ) or ""
-
-            if mime_type.startswith(
-                "video/"
-            ):
-                sent_message = await query.message.reply_video(
-                    video=media_bytes,
-                    caption=caption,
-                    reply_markup=keyboard
-                )
-            else:
-                sent_message = await query.message.reply_document(
-                    document=media_bytes,
-                    caption=caption,
-                    reply_markup=keyboard
-                )
-
-        else:
-            sent_message = await query.message.reply_document(
-                document=media_bytes,
-                caption=caption,
-                reply_markup=keyboard
-            )
-
-        # Save the Telegram message ID
-        if sent_message:
-            context.user_data[
-                "story_message_id"
-            ] = sent_message.message_id
-
-        try:
-            await query.answer(
-                f"Story {index + 1}/{total}"
-            )
-        except Exception:
-            pass
-
-    except Exception as e:
-
-        print(
-            f"STORY DISPLAY ERROR: "
-            f"{type(e).__name__}: {e}"
-        )
-
-        await query.message.reply_text(
-            "❌ Could not display this story.\n\n"
-            f"{type(e).__name__}: "
-            f"{str(e)[:500]}"
-        )
-# --- SAFE PUBLIC TELEGRAM SEARCH ---
-# IMPORTANT:
-# telethon_client is a single Telegram account/session.
-# Therefore this search MUST NOT expose that account's private history.
-# This implementation only accepts publicly identifiable peers
-# (public username required) for message results.
+            await query.message.reply_document(document=media_bytes, caption=caption, reply_markup=kb)
+    else:
+        await query.message.reply_document(document=media_bytes, caption=caption, reply_markup=kb)
+# --- FAST GLOBAL TELEGRAM SEARCH ---
 #
-# If you want each bot user to search THEIR OWN Telegram account,
-# you need a separate authorized Telethon session for each user.
-#
-# This version prevents admin/private-chat leakage while keeping
-# Telegram global public search functionality.
+# This version implements true Telegram-side pagination, correct peer-ID
+# handling, and avoids race conditions by using a unique search ID.
 
 SEARCH_PAGE_SIZE = 8
 SEARCH_GLOBAL_LIMIT = 100
-SEARCH_MAX_FETCH = 5000
+SEARCH_MAX_FETCH = 500  # Fetch up to 500 results to fill multiple pages
+SEARCH_JOINED_CACHE_SECONDS = 300  # Reduced to 5 minutes for fresher data
 
 
 def _search_peer_marked_id(entity):
+    """Return Telegram's marked peer ID safely using utils.get_peer_id."""
     try:
         return int(get_peer_id(entity))
     except Exception:
+        # Only fallback if entity is None or missing ID attributes entirely
         value = getattr(entity, "id", None)
         return int(value) if value is not None else None
 
 
 def _search_peer_kind(entity):
+    """Classify a Telegram peer as channel/group/user/bot."""
     if entity is None:
         return "unknown"
-
     if getattr(entity, "bot", False):
         return "bot"
-
+    # Telethon Channel represents both broadcast channels and supergroups.
     if hasattr(entity, "broadcast"):
         return "channel" if getattr(entity, "broadcast", False) else "group"
-
+    # Basic Telegram groups are represented by Chat.
     if entity.__class__.__name__ == "Chat":
         return "group"
-
     if hasattr(entity, "first_name") or hasattr(entity, "username"):
         return "user"
-
     return "unknown"
 
 
 def _search_peer_name(entity):
     if entity is None:
         return "Unknown"
-
     title = getattr(entity, "title", None)
     if title:
         return str(title).strip()
-
     first = (getattr(entity, "first_name", None) or "").strip()
     last = (getattr(entity, "last_name", None) or "").strip()
-
     name = f"{first} {last}".strip()
-
     return name or "Unknown"
 
 
-def _search_is_public_peer(entity):
-    """
-    SECURITY RULE:
-
-    Only allow entities that have a public Telegram username.
-
-    This prevents the admin Telethon session from exposing:
-    - private groups
-    - private channels
-    - private conversations
-    - private users
-    - admin-only chats
-    """
-
-    if entity is None:
-        return False
-
-    username = getattr(entity, "username", None)
-
-    if not username:
-        return False
-
-    username = str(username).strip()
-
-    if not username:
-        return False
-
-    return True
-
-
 def _search_peer_link(entity):
-    """
-    Only generate public username links.
-
-    We intentionally DO NOT generate t.me/c/... links here because
-    those can point to private/internal Telegram chats.
-    """
-
-    if not _search_is_public_peer(entity):
-        return None
-
     username = getattr(entity, "username", None)
-
     if username:
         return f"https://t.me/{username}"
-
     return None
 
 
 def _search_message_link(entity, message_id):
-    """
-    Message links are generated only for public username-based chats.
-    """
-
-    if not _search_is_public_peer(entity):
-        return None
-
     username = getattr(entity, "username", None)
-
-    if username and message_id:
+    if username:
         return f"https://t.me/{username}/{message_id}"
-
+    marked_id = _search_peer_marked_id(entity)
+    if marked_id is not None and marked_id < -1000000000000:
+        internal_id = str(abs(marked_id))[3:]
+        return f"https://t.me/c/{internal_id}/{message_id}"
     return None
 
 
 def _search_message_type(message):
     if getattr(message, "photo", None):
         return "photo"
-
     if getattr(message, "video", None):
         return "video"
-
     if getattr(message, "voice", None):
         return "voice"
-
     if getattr(message, "audio", None):
         return "audio"
-
     if getattr(message, "gif", None):
         return "gif"
-
     if getattr(message, "document", None):
         return "document"
-
     text = (getattr(message, "message", None) or "").strip()
-
     if re.search(r"https?://|t\.me/|www\.", text, re.I):
         return "link"
-
     return "text"
 
 
 def _search_content(message):
     text = (getattr(message, "message", None) or "").strip()
-
     if text:
         return re.sub(r"\s+", " ", text)[:180]
-
     media_type = _search_message_type(message)
-
     labels = {
         "photo": "📷 Photo",
         "video": "🎬 Video",
@@ -3416,14 +2593,44 @@ def _search_content(message):
         "link": "🔗 Link",
         "text": "💬 Message",
     }
-
     return labels.get(media_type, "💬 Message")
+
+
+async def _get_joined_peer_ids(context):
+    """Cache joined peer IDs, throwing a clear error if it fails on a cold cache."""
+    now = time.monotonic()
+    cached_at = context.application.bot_data.get("search_joined_cache_at", 0.0)
+    cached_ids = context.application.bot_data.get("search_joined_ids")
+    if cached_ids is not None and now - cached_at < SEARCH_JOINED_CACHE_SECONDS:
+        return set(cached_ids)
+
+    joined = set()
+    try:
+        # No limit here to guarantee complete exclusion coverage
+        async for dialog in telethon_client.iter_dialogs():
+            entity = getattr(dialog, "entity", None)
+            if entity is None:
+                continue
+            kind = _search_peer_kind(entity)
+            if kind in {"group", "channel"}:
+                marked = _search_peer_marked_id(entity)
+                if marked is not None:
+                    joined.add(marked)
+    except Exception as exc:
+        # If we have an old cache, use it, otherwise loudly fail
+        if cached_ids is not None:
+            print(f"[Search] Cache refresh failed, using old cache: {exc}")
+            return set(cached_ids)
+        raise RuntimeError(f"Could not load joined chats for exclusion: {exc}")
+
+    context.application.bot_data["search_joined_ids"] = joined
+    context.application.bot_data["search_joined_cache_at"] = now
+    return joined
 
 
 def _search_peer_from_result(peer_id, peer_map):
     if peer_id is None:
         return None
-
     try:
         return peer_map.get(int(peer_id))
     except Exception:
@@ -3432,60 +2639,40 @@ def _search_peer_from_result(peer_id, peer_map):
 
 async def fetch_search(update, context, query):
     query = (query or "").strip()
-
     if not query:
-        await update.message.reply_text(
-            "🔎 Please enter a keyword, for example: Logic mid"
-        )
+        await update.message.reply_text("🔎 Please enter a keyword, for example: Logic mid")
         return
 
+    # Reset stale search data and create a unique session ID to prevent race conditions
     search_id = uuid.uuid4().hex[:8]
-
-    # ---------------------------------------------------------
-    # USER-SPECIFIC SEARCH STATE
-    # ---------------------------------------------------------
-
-    context.user_data["search_id"] = search_id
     context.user_data.pop("search_results", None)
     context.user_data.pop("search_query", None)
     context.user_data.pop("search_filter", None)
     context.user_data.pop("search_page", None)
-
-    context.user_data["search_next_rate"] = 0
-    context.user_data["search_next_peer"] = types.InputPeerEmpty()
-    context.user_data["search_next_id"] = 0
+    context.user_data["search_id"] = search_id
 
     status_msg = await update.message.reply_text(
-        f"🔎 Searching public Telegram content for: "
-        f"<b>{html.escape(query)}</b>\n"
-        "🌐 Public channels and public groups only",
+        f"🔎 Searching Telegram globally for: <b>{html.escape(query)}</b>\n"
+        "⚡ Server-side search • excluding your joined groups/channels",
         parse_mode=ParseMode.HTML,
     )
 
     started = time.monotonic()
-
     try:
-        all_peer_entities = {}
+        joined_ids = await _get_joined_peer_ids(context)
+        peer_map = {}
         results = []
         seen = set()
-
-        fetched = 0
-        global_rank = 0
+        joined_hidden = 0
 
         offset_rate = 0
         offset_peer = types.InputPeerEmpty()
         offset_id = 0
+        fetched = 0
+        global_rank = 0  # To preserve Telegram's natural order
 
-        # -----------------------------------------------------
-        # TELEGRAM GLOBAL SEARCH
-        #
-        # NOTE:
-        # telethon_client is still the admin/account session.
-        # The security boundary below is _search_is_public_peer().
-        # -----------------------------------------------------
-
+        # True pagination loop
         while fetched < SEARCH_MAX_FETCH:
-
             global_result = await telethon_client(
                 functions.messages.SearchGlobalRequest(
                     q=query,
@@ -3499,103 +2686,43 @@ async def fetch_search(update, context, query):
                 )
             )
 
-            # -------------------------------------------------
-            # COLLECT ENTITIES
-            # -------------------------------------------------
-
-            entities = (
-                list(getattr(global_result, "chats", []) or [])
-                +
-                list(getattr(global_result, "users", []) or [])
-            )
-
-            for entity in entities:
+            # Build peer map only once per batch
+            for entity in list(getattr(global_result, "chats", []) or []) + list(getattr(global_result, "users", []) or []):
                 marked = _search_peer_marked_id(entity)
+                if marked is not None:
+                    peer_map[marked] = entity
 
-                if marked is None:
-                    continue
-
-                # SECURITY:
-                # Store ONLY public entities.
-                if not _search_is_public_peer(entity):
-                    continue
-
-                all_peer_entities[marked] = entity
-
-            batch_messages = list(
-                getattr(global_result, "messages", []) or []
-            )
-
+            batch_messages = list(getattr(global_result, "messages", []) or [])
             if not batch_messages:
                 break
 
-            # -------------------------------------------------
-            # PROCESS MESSAGES
-            # -------------------------------------------------
-
             for message in batch_messages:
-
-                marked_peer = _search_peer_marked_id(
-                    getattr(message, "peer_id", None)
-                )
-
-                if marked_peer is None:
-                    continue
-
-                entity = _search_peer_from_result(
-                    marked_peer,
-                    all_peer_entities
-                )
+                marked_peer = _search_peer_marked_id(message.peer_id)
+                entity = _search_peer_from_result(marked_peer, peer_map)
 
                 if entity is None:
                     continue
 
-                # -------------------------------------------------
-                # CRITICAL SECURITY CHECK
-                #
-                # If the entity is not public, NEVER display it.
-                #
-                # This is what prevents private/admin history
-                # from being shown to bot users.
-                # -------------------------------------------------
-
-                if not _search_is_public_peer(entity):
-                    continue
-
                 peer_kind = _search_peer_kind(entity)
 
-                if peer_kind not in {
-                    "channel",
-                    "group",
-                    "bot",
-                    "user",
-                }:
+                # Exclusion for joined groups/channels (counts accurately)
+                if marked_peer in joined_ids and peer_kind in {"group", "channel"}:
+                    joined_hidden += 1
                     continue
 
+                # Include users/private chats now (matching UI text)
                 message_id = getattr(message, "id", None)
-
                 if not message_id:
                     continue
 
-                key = (
-                    marked_peer,
-                    int(message_id),
-                )
-
+                key = (marked_peer, int(message_id))
                 if key in seen:
                     continue
-
                 seen.add(key)
 
                 media_type = _search_message_type(message)
-
-                link = _search_message_link(
-                    entity,
-                    message_id
-                )
-
-                global_rank += 1
-
+                link = _search_message_link(entity, message_id)
+                global_rank += 1  # Higher rank = earlier in Telegram's response
                 results.append({
                     "kind": "message",
                     "type": media_type,
@@ -3608,121 +2735,41 @@ async def fetch_search(update, context, query):
                     "title": _search_peer_name(entity),
                     "username": getattr(entity, "username", None),
                     "date": getattr(message, "date", None),
-                    "rank": global_rank,
+                    "score": global_rank,
                 })
 
-            # -------------------------------------------------
-            # PAGINATION
-            # -------------------------------------------------
-
-            next_rate = getattr(
-                global_result,
-                "next_rate",
-                0
-            )
-
-            context.user_data["search_next_rate"] = next_rate
-
-            if batch_messages:
-
-                last_message = batch_messages[-1]
-
-                context.user_data["search_next_peer"] = (
-                    getattr(
-                        last_message,
-                        "peer_id",
-                        types.InputPeerEmpty()
-                    )
-                )
-
-                context.user_data["search_next_id"] = (
-                    getattr(
-                        last_message,
-                        "id",
-                        0
-                    )
-                )
-
-            if not next_rate:
+            # Use the next offsets provided by Telegram, or break if no more
+            next_offset = getattr(global_result, "next_offset", None)
+            if next_offset is not None:
+                offset_rate = getattr(next_offset, "rate", 0)
+                offset_peer = getattr(next_offset, "peer", types.InputPeerEmpty())
+                offset_id = getattr(next_offset, "q_id", 0)
+            else:
                 break
-
-            last_message = batch_messages[-1]
-
-            offset_peer = getattr(
-                last_message,
-                "peer_id",
-                types.InputPeerEmpty()
-            )
-
-            offset_id = getattr(
-                last_message,
-                "id",
-                0
-            )
-
-            offset_rate = next_rate
 
             fetched += len(batch_messages)
 
-            await asyncio.sleep(0.2)
-
-        # -----------------------------------------------------
-        # ADD PUBLIC PEER RESULTS
-        # -----------------------------------------------------
-
-        for marked, entity in all_peer_entities.items():
-
-            if not _search_is_public_peer(entity):
-                continue
-
+        # Expose public peers returned by the search, but only if not already in messages
+        for entity in list(getattr(global_result, "chats", []) or []) + list(getattr(global_result, "users", []) or []):
             kind = _search_peer_kind(entity)
-
-            if kind not in {
-                "group",
-                "channel",
-                "bot",
-                "user",
-            }:
+            marked = _search_peer_marked_id(entity)
+            if kind in {"group", "channel"} and marked in joined_ids:
+                continue
+            if kind not in {"group", "channel", "bot", "user"}:
                 continue
 
-            if any(
-                r["peer_id"] == marked
-                for r in results
-            ):
+            # Skip if this peer is already represented by a message result
+            if any(r["peer_id"] == marked for r in results):
                 continue
 
             name = _search_peer_name(entity)
-
-            username = getattr(
-                entity,
-                "username",
-                None
-            )
-
+            username = getattr(entity, "username", None)
             peer_link = _search_peer_link(entity)
-
-            if not peer_link:
-                continue
-
-            peer_key = (
-                "peer",
-                marked
-            )
-
+            peer_key = ("peer", marked)
             if peer_key in seen:
                 continue
-
             seen.add(peer_key)
-
             global_rank += 1
-
-            icon = {
-                "bot": "🤖",
-                "channel": "📢",
-                "group": "👥",
-                "user": "👤",
-            }.get(kind, "🔹")
-
             results.append({
                 "kind": "peer",
                 "type": kind,
@@ -3731,425 +2778,83 @@ async def fetch_search(update, context, query):
                 "entity": entity,
                 "message": None,
                 "link": peer_link,
-                "content": f"{icon} {name}",
+                "content": f"{('🤖' if kind == 'bot' else '📢' if kind == 'channel' else '👥' if kind == 'group' else '👤')} {name}"
+                            + (f"  @{username}" if username else ""),
                 "title": name,
                 "username": username,
                 "date": None,
-                "rank": global_rank,
+                "score": global_rank,
             })
 
-        # -----------------------------------------------------
-        # RACE CONDITION PROTECTION
-        # -----------------------------------------------------
-
-        if context.user_data.get("search_id") != search_id:
-            return
-
-        # -----------------------------------------------------
-        # NO RESULTS
-        # -----------------------------------------------------
-
         if not results:
-
             await status_msg.edit_text(
-                f"❌ No public results found for "
-                f"<b>{html.escape(query)}</b>.",
+                f"❌ No public results found for <b>{html.escape(query)}</b>.\n\n"
+                "The search intentionally hides results from groups/channels you already joined.",
                 parse_mode=ParseMode.HTML,
             )
-
             return
 
-        # -----------------------------------------------------
-        # SORT RESULTS
-        # -----------------------------------------------------
+        # Messages come first (lower scores due to earlier rank), but peers are mixed naturally
+        # Since global_rank increases sequentially, sorting by score preserves Telegram's order.
+        results.sort(key=lambda item: item.get("score", 0), reverse=False)
 
-        results.sort(
-            key=lambda item: item.get("rank", 0)
-        )
-
-        # -----------------------------------------------------
-        # SAVE ONLY TO THIS BOT USER'S SESSION
-        # -----------------------------------------------------
-
-        context.user_data["search_results"] = results[:5000]
+        # Cap memory usage
+        context.user_data["search_results"] = results[:500]
         context.user_data["search_query"] = query
         context.user_data["search_filter"] = "all"
         context.user_data["search_page"] = 1
-        context.user_data["search_elapsed"] = round(
-            time.monotonic() - started,
-            2
-        )
+        context.user_data["search_joined_hidden"] = joined_hidden
+        context.user_data["search_elapsed"] = round(time.monotonic() - started, 2)
 
         await status_msg.delete()
-
-        await display_search_page(
-            update,
-            context,
-            1,
-            "all"
-        )
+        await display_search_page(update, context, 1, "all")
 
     except FloodWaitError as e:
-
         await status_msg.edit_text(
-            f"⏳ Telegram rate limit. "
-            f"Please wait {e.seconds} seconds and try again."
+            f"⏳ Telegram rate limit. Please wait {e.seconds} seconds and try again."
         )
-
     except Exception as e:
-
-        print(
-            f"[Search] Global search failed: "
-            f"{type(e).__name__}: {e}"
-        )
-
+        print(f"[Search] Global search failed: {type(e).__name__}: {e}")
         await status_msg.edit_text(
-            f"❌ Search failed: "
-            f"<code>{html.escape(type(e).__name__)}</code>\n\n"
+            f"❌ Search failed: <code>{html.escape(type(e).__name__)}</code>\n\n"
             f"{html.escape(str(e)[:700])}",
             parse_mode=ParseMode.HTML,
         )
 
 
-async def load_more_results(update, context):
-    """
-    Load the next public-search batch.
-
-    IMPORTANT:
-    Never fetch an entity and then automatically trust it.
-    Every entity is checked with _search_is_public_peer().
-    """
-
-    q = update.callback_query
-
-    await q.answer()
-
-    query = context.user_data.get("search_query")
-
-    if not query:
-        return
-
-    offset_rate = context.user_data.get(
-        "search_next_rate",
-        0
-    )
-
-    offset_peer = context.user_data.get(
-        "search_next_peer",
-        types.InputPeerEmpty()
-    )
-
-    offset_id = context.user_data.get(
-        "search_next_id",
-        0
-    )
-
-    status = await q.message.reply_text(
-        "📥 Loading more public results..."
-    )
-
-    try:
-
-        global_result = await telethon_client(
-            functions.messages.SearchGlobalRequest(
-                q=query,
-                filter=types.InputMessagesFilterEmpty(),
-                min_date=0,
-                max_date=0,
-                offset_rate=offset_rate,
-                offset_peer=offset_peer,
-                offset_id=offset_id,
-                limit=SEARCH_GLOBAL_LIMIT,
-            )
-        )
-
-        # -----------------------------------------------------
-        # BUILD ENTITY MAP FROM THIS RESPONSE
-        # -----------------------------------------------------
-
-        peer_map = {}
-
-        entities = (
-            list(getattr(global_result, "chats", []) or [])
-            +
-            list(getattr(global_result, "users", []) or [])
-        )
-
-        for entity in entities:
-
-            if not _search_is_public_peer(entity):
-                continue
-
-            marked = _search_peer_marked_id(entity)
-
-            if marked is None:
-                continue
-
-            peer_map[marked] = entity
-
-        new_results = []
-
-        existing_results = context.user_data.get(
-            "search_results",
-            []
-        )
-
-        existing_keys = set()
-
-        for r in existing_results:
-
-            message = r.get("message")
-
-            if message is not None:
-                existing_keys.add(
-                    (
-                        r.get("peer_id"),
-                        getattr(message, "id", None)
-                    )
-                )
-            else:
-                existing_keys.add(
-                    (
-                        r.get("peer_id"),
-                        "peer"
-                    )
-                )
-
-        batch_messages = list(
-            getattr(global_result, "messages", []) or []
-        )
-
-        for message in batch_messages:
-
-            marked_peer = _search_peer_marked_id(
-                getattr(message, "peer_id", None)
-            )
-
-            if marked_peer is None:
-                continue
-
-            entity = peer_map.get(marked_peer)
-
-            # -------------------------------------------------
-            # If entity is missing, DO NOT blindly fetch it.
-            # A get_entity() call could retrieve a private entity
-            # belonging to the admin account.
-            # -------------------------------------------------
-
-            if entity is None:
-                continue
-
-            # -------------------------------------------------
-            # CRITICAL SECURITY CHECK
-            # -------------------------------------------------
-
-            if not _search_is_public_peer(entity):
-                continue
-
-            peer_kind = _search_peer_kind(entity)
-
-            if peer_kind not in {
-                "channel",
-                "group",
-                "bot",
-                "user",
-            }:
-                continue
-
-            message_id = getattr(
-                message,
-                "id",
-                None
-            )
-
-            if not message_id:
-                continue
-
-            key = (
-                marked_peer,
-                message_id
-            )
-
-            if key in existing_keys:
-                continue
-
-            existing_keys.add(key)
-
-            media_type = _search_message_type(
-                message
-            )
-
-            link = _search_message_link(
-                entity,
-                message_id
-            )
-
-            if not link:
-                continue
-
-            new_results.append({
-                "kind": "message",
-                "type": media_type,
-                "peer_type": peer_kind,
-                "peer_id": marked_peer,
-                "entity": entity,
-                "message": message,
-                "link": link,
-                "content": _search_content(message),
-                "title": _search_peer_name(entity),
-                "username": getattr(
-                    entity,
-                    "username",
-                    None
-                ),
-                "date": getattr(
-                    message,
-                    "date",
-                    None
-                ),
-                "rank": (
-                    len(existing_results)
-                    +
-                    len(new_results)
-                ),
-            })
-
-        if new_results:
-
-            context.user_data["search_results"] = (
-                existing_results
-                +
-                new_results
-            )
-
-        # -----------------------------------------------------
-        # UPDATE PAGINATION
-        # -----------------------------------------------------
-
-        next_rate = getattr(
-            global_result,
-            "next_rate",
-            0
-        )
-
-        context.user_data["search_next_rate"] = next_rate
-
-        if batch_messages:
-
-            last_message = batch_messages[-1]
-
-            context.user_data["search_next_peer"] = (
-                getattr(
-                    last_message,
-                    "peer_id",
-                    types.InputPeerEmpty()
-                )
-            )
-
-            context.user_data["search_next_id"] = (
-                getattr(
-                    last_message,
-                    "id",
-                    0
-                )
-            )
-
-        await status.delete()
-
-        await display_search_page(
-            update,
-            context,
-            1,
-            context.user_data.get(
-                "search_filter",
-                "all"
-            )
-        )
-
-    except FloodWaitError as e:
-
-        await status.edit_text(
-            f"⏳ Rate limit. Wait {e.seconds}s."
-        )
-
-    except Exception as e:
-
-        await status.edit_text(
-            f"❌ Error: "
-            f"{html.escape(str(e)[:700])}",
-            parse_mode=ParseMode.HTML
-        )
-
-
 def _search_filter_match(item, filter_type):
-
     if filter_type == "all":
         return True
-
     if filter_type == "messages":
         return item.get("kind") == "message"
-
-    if filter_type == "peers":
-        return item.get("kind") == "peer"
-
     if filter_type == "photos":
         return item.get("type") == "photo"
-
     if filter_type == "videos":
         return item.get("type") == "video"
-
     if filter_type == "files":
         return item.get("type") == "document"
-
     if filter_type == "gifs":
         return item.get("type") == "gif"
-
     if filter_type == "audio":
-        return item.get("type") in {
-            "audio",
-            "voice"
-        }
-
+        return item.get("type") in {"audio", "voice"}
     if filter_type == "links":
         return item.get("type") == "link"
-
     if filter_type == "channels":
-        return (
-            item.get("peer_type") == "channel"
-            and
-            item.get("kind") == "peer"
-        )
-
+        return item.get("peer_type") == "channel"
     if filter_type == "groups":
-        return (
-            item.get("peer_type") == "group"
-            and
-            item.get("kind") == "peer"
-        )
-
+        return item.get("peer_type") == "group"
     if filter_type == "bots":
-        return (
-            item.get("peer_type") == "bot"
-            and
-            item.get("kind") == "peer"
-        )
-
+        return item.get("peer_type") == "bot"
     if filter_type == "users":
-        return (
-            item.get("peer_type") == "user"
-            and
-            item.get("kind") == "peer"
-        )
-
+        return item.get("peer_type") == "user"
     return True
 
 
 def _search_filter_buttons(results, active):
-
+    """Create only filters that actually have results. This is dynamic."""
     definitions = [
         ("all", "🔎 All"),
         ("messages", "💬 Messages"),
-        ("peers", "👥 Peers"),
         ("photos", "📷 Photos"),
         ("videos", "🎬 Videos"),
         ("files", "📄 Files"),
@@ -4163,667 +2868,127 @@ def _search_filter_buttons(results, active):
     ]
 
     counts = {}
-
     for filter_type, _ in definitions:
-
-        counts[filter_type] = sum(
-            1
-            for item in results
-            if _search_filter_match(
-                item,
-                filter_type
-            )
-        )
+        counts[filter_type] = sum(1 for item in results if _search_filter_match(item, filter_type))
 
     available = []
-
     for filter_type, label in definitions:
-
-        if (
-            filter_type == "all"
-            or
-            counts[filter_type] > 0
-        ):
-
-            shown = (
-                f"{label} "
-                f"({counts[filter_type]})"
-            )
-
+        if filter_type == "all" or counts[filter_type] > 0:
+            shown = f"{label} ({counts[filter_type]})"
             if filter_type == active:
                 shown = f"✅ {shown}"
-
-            available.append(
-                (
-                    filter_type,
-                    shown
-                )
-            )
+            available.append((filter_type, shown))
 
     rows = []
-
-    for i in range(
-        0,
-        len(available),
-        3
-    ):
-
-        row = []
-
-        for filter_type, label in available[i:i + 3]:
-
-            row.append(
-                InlineKeyboardButton(
-                    label,
-                    callback_data=f"sf_{filter_type}"
-                )
-            )
-
-        rows.append(row)
-
+    for i in range(0, len(available), 3):
+        rows.append([
+            InlineKeyboardButton(label, callback_data=f"sf_{filter_type}")
+            for filter_type, label in available[i:i + 3]
+        ])
     return rows, counts
 
 
-async def display_search_page(
-    update,
-    context,
-    page,
-    filter_type=None
-):
-
+async def display_search_page(update, context, page, filter_type=None):
     callback = update.callback_query
-
     if callback:
         await callback.answer()
 
-    if not context.user_data.get(
-        "search_results"
-    ):
-
-        if callback:
-
-            await callback.message.reply_text(
-                "❌ Search session expired. "
-                "Please search again."
-            )
-
-        else:
-
-            await update.message.reply_text(
-                "❌ Search session expired. "
-                "Please search again."
-            )
-
+    # Guard against race conditions from other searches
+    if not context.user_data.get("search_results"):
+        await update.message.reply_text("❌ Search session expired. Please search again.")
         return
 
-    results = context.user_data.get(
-        "search_results",
-        []
-    )
+    results = context.user_data.get("search_results", [])
+    search_query = context.user_data.get("search_query", "")
+    active = filter_type or context.user_data.get("search_filter", "all")
 
-    search_query = context.user_data.get(
-        "search_query",
-        ""
-    )
-
-    active = (
-        filter_type
-        or
-        context.user_data.get(
-            "search_filter",
-            "all"
-        )
-    )
-
-    filtered = [
-        item
-        for item in results
-        if _search_filter_match(
-            item,
-            active
-        )
-    ]
-
+    filtered = [item for item in results if _search_filter_match(item, active)]
     per_page = SEARCH_PAGE_SIZE
-
     total_results = len(filtered)
-
-    total_pages = max(
-        1,
-        (
-            total_results
-            +
-            per_page
-            -
-            1
-        )
-        //
-        per_page
-    )
-
-    page = max(
-        1,
-        min(
-            int(page),
-            total_pages
-        )
-    )
-
+    total_pages = max(1, (total_results + per_page - 1) // per_page)
+    page = max(1, min(int(page), total_pages))
     context.user_data["search_page"] = page
     context.user_data["search_filter"] = active
 
-    start = (
-        page - 1
-    ) * per_page
+    start = (page - 1) * per_page
+    page_items = filtered[start:start + per_page]
 
-    page_items = filtered[
-        start:start + per_page
-    ]
-
-    elapsed = context.user_data.get(
-        "search_elapsed",
-        0
-    )
+    elapsed = context.user_data.get("search_elapsed", 0)
+    joined_hidden = context.user_data.get("search_joined_hidden", 0)
 
     lines = [
         "<blockquote>",
-        "<b>🌐 PUBLIC TELEGRAM SEARCH</b>",
-        (
-            f"🔎 <b>"
-            f"{html.escape(search_query)}"
-            f"</b>"
-        ),
-        (
-            f"⚡ {elapsed}s"
-        ),
+        "<b>🌐 GLOBAL TELEGRAM SEARCH</b>",
+        f"🔎 <b>{html.escape(search_query)}</b>",
+        f"⚡ {elapsed}s • hidden joined results: {joined_hidden}",
         "",
     ]
 
     if not page_items:
-
-        lines.append(
-            "<i>No results in this filter.</i>"
-        )
-
+        lines.append("<i>No results in this filter.</i>")
     else:
-
-        for index, item in enumerate(
-            page_items,
-            start=start + 1
-        ):
-
-            peer_name = html.escape(
-                item.get("title")
-                or
-                "Unknown"
-            )
-
-            username = item.get(
-                "username"
-            )
-
-            username_text = (
-                f" @{html.escape(username)}"
-                if username
-                else ""
-            )
-
+        for index, item in enumerate(page_items, start=start + 1):
+            peer_name = html.escape(item.get("title") or "Unknown")
+            username = item.get("username")
+            username_text = f" @{html.escape(username)}" if username else ""
             icon = {
-                "photo": "📷",
-                "video": "🎬",
-                "document": "📄",
-                "gif": "🎞️",
-                "audio": "🎵",
-                "voice": "🎤",
-                "link": "🔗",
-                "bot": "🤖",
-                "channel": "📢",
-                "group": "👥",
-                "user": "👤",
-                "text": "💬",
-            }.get(
-                item.get("type"),
-                "🔹"
-            )
+                "photo": "📷", "video": "🎬", "document": "📄", "gif": "🎞️",
+                "audio": "🎵", "voice": "🎤", "link": "🔗", "bot": "🤖",
+                "channel": "📢", "group": "👥", "user": "👤", "text": "💬",
+            }.get(item.get("type"), "🔹")
 
-            content = html.escape(
-                item.get("content")
-                or
-                ""
-            )
-
+            content = html.escape(item.get("content") or "")
             if len(content) > 180:
-                content = (
-                    content[:177]
-                    +
-                    "..."
-                )
+                content = content[:177] + "..."
 
-            link = item.get("link")
-
-            # -------------------------------------------------
-            # SECURITY:
-            # Never manufacture t.me/c/... links.
-            # -------------------------------------------------
-
-            if link:
-
+            if item.get("link"):
                 lines.append(
-                    f"<b>{index}.</b> "
-                    f"{icon} "
-                    f"<a href=\""
-                    f"{html.escape(link, quote=True)}"
-                    f"\">"
-                    f"{peer_name}"
-                    f"{username_text}"
-                    f"</a>\n"
-                    f"{content}\n"
+                    f"<b>{index}.</b> {icon} <a href=\"{html.escape(item['link'], quote=True)}\">"
+                    f"{peer_name}{username_text}</a>\n{content}\n"
                 )
-
             else:
-
                 lines.append(
-                    f"<b>{index}.</b> "
-                    f"{icon} "
-                    f"<b>"
-                    f"{peer_name}"
-                    f"{username_text}"
-                    f"</b>\n"
-                    f"{content}\n"
+                    f"<b>{index}.</b> {icon} <b>{peer_name}{username_text}</b>\n{content}\n"
                 )
 
-    lines.append(
-        f"Page {page}/{total_pages} "
-        f"• {total_results} results"
-    )
-
-    lines.append(
-        "🌐 Public Telegram content only"
-    )
-
+    lines.append(f"Page {page}/{total_pages} • {total_results} results")
     lines.append("</blockquote>")
-
     text = "\n".join(lines)
 
-    kb, counts = _search_filter_buttons(
-        results,
-        active
-    )
+    kb, counts = _search_filter_buttons(results, active)
 
     nav = []
-
     if page > 1:
-
-        nav.append(
-            InlineKeyboardButton(
-                "⬅️ Prev",
-                callback_data=(
-                    f"search_page_{page - 1}"
-                )
-            )
-        )
-
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"search_page_{page - 1}"))
     if page < total_pages:
-
-        nav.append(
-            InlineKeyboardButton(
-                "Next ➡️",
-                callback_data=(
-                    f"search_page_{page + 1}"
-                )
-            )
-        )
-
-    if (
-        context.user_data.get(
-            "search_next_rate",
-            0
-        ) != 0
-        and
-        len(results) < SEARCH_MAX_FETCH
-    ):
-
-        nav.append(
-            InlineKeyboardButton(
-                "📥 Load More",
-                callback_data="search_load_more"
-            )
-        )
-
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"search_page_{page + 1}"))
     if nav:
         kb.append(nav)
 
     kb.append([
-        InlineKeyboardButton(
-            "🔄 New Search",
-            callback_data="search"
-        ),
-        InlineKeyboardButton(
-            "⬅️ Back",
-            callback_data="more"
-        ),
+        InlineKeyboardButton("🔄 New Search", callback_data="search"),
+        InlineKeyboardButton("⬅️ Back", callback_data="more"),
     ])
-
     markup = InlineKeyboardMarkup(kb)
 
     if callback:
-
         try:
-
             await callback.edit_message_text(
                 text,
                 reply_markup=markup,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
-
         except Exception as exc:
-
-            if (
-                "message is not modified"
-                not in str(exc).lower()
-            ):
+            if "message is not modified" not in str(exc).lower():
                 raise
-
     else:
-
         await update.message.reply_text(
             text,
             reply_markup=markup,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
-
-
-# --- FRIEND SEARCH ---
-# This function is unrelated to the global-search privacy issue.
-# It is kept separate from the search implementation above.
-
-async def fetch_friends(update, context, text):
-
-    parts = text.split()
-
-    if len(parts) < 2:
-
-        await update.message.reply_text(
-            "⚠️ Use: @group @user"
-        )
-
-        return
-
-    try:
-
-        group_entity = await telethon_client.get_entity(
-            parts[0]
-        )
-
-        target_user = await telethon_client.get_entity(
-            parts[1]
-        )
-
-        messages = await telethon_client.get_messages(
-            group_entity,
-            limit=500
-        )
-
-        reply_data = {}
-
-        for m in messages:
-
-            if (
-                m.sender_id == target_user.id
-                and
-                m.reply_to_msg_id
-            ):
-
-                try:
-
-                    reply_to_msg = (
-                        await telethon_client.get_messages(
-                            group_entity,
-                            ids=m.reply_to_msg_id
-                        )
-                    )
-
-                    if (
-                        reply_to_msg
-                        and
-                        reply_to_msg.sender_id
-                    ):
-
-                        sender_id = (
-                            reply_to_msg.sender_id
-                        )
-
-                        if sender_id not in reply_data:
-
-                            reply_data[sender_id] = {
-                                "count": 0,
-                                "date": str(m.date),
-                            }
-
-                            try:
-
-                                sender_entity = (
-                                    await telethon_client.get_entity(
-                                        sender_id
-                                    )
-                                )
-
-                                first_name = (
-                                    getattr(
-                                        sender_entity,
-                                        "first_name",
-                                        ""
-                                    )
-                                    or
-                                    ""
-                                )
-
-                                last_name = (
-                                    getattr(
-                                        sender_entity,
-                                        "last_name",
-                                        ""
-                                    )
-                                    or
-                                    ""
-                                )
-
-                                reply_data[sender_id]["name"] = (
-                                    f"{first_name} "
-                                    f"{last_name}"
-                                ).strip()
-
-                            except Exception:
-
-                                reply_data[sender_id]["name"] = (
-                                    "Unknown"
-                                )
-
-                        reply_data[sender_id]["count"] += 1
-
-                except Exception:
-                    pass
-
-        sorted_replies = sorted(
-            reply_data.items(),
-            key=lambda x: x[1]["count"],
-            reverse=True
-        )[:10]
-
-        text = (
-            "<blockquote>"
-            "Replies them in the groups:\n"
-            "when - to whom (total times)\n"
-        )
-
-        for sid, data in sorted_replies:
-
-            text += (
-                f"|{data['date'][:5]} - "
-                f"{html.escape(data['name'])} "
-                f"({data['count']})\n"
-            )
-
-        text += "</blockquote>"
-
-        await update.message.reply_text(
-            text,
-            parse_mode=ParseMode.HTML
-        )
-
-    except Exception as e:
-
-        await update.message.reply_text(
-            f"❌ Error: "
-            f"{html.escape(str(e)[:700])}"
-        )
-# --- FRIEND SEARCH ---
-# This function is unrelated to the global-search privacy issue.
-# It is kept separate from the search implementation above.
-
-async def fetch_friends(update, context, text):
-
-    parts = text.split()
-
-    if len(parts) < 2:
-
-        await update.message.reply_text(
-            "⚠️ Use: @group @user"
-        )
-
-        return
-
-    try:
-
-        group_entity = await telethon_client.get_entity(
-            parts[0]
-        )
-
-        target_user = await telethon_client.get_entity(
-            parts[1]
-        )
-
-        messages = await telethon_client.get_messages(
-            group_entity,
-            limit=500
-        )
-
-        reply_data = {}
-
-        for m in messages:
-
-            if (
-                m.sender_id == target_user.id
-                and
-                m.reply_to_msg_id
-            ):
-
-                try:
-
-                    reply_to_msg = (
-                        await telethon_client.get_messages(
-                            group_entity,
-                            ids=m.reply_to_msg_id
-                        )
-                    )
-
-                    if (
-                        reply_to_msg
-                        and
-                        reply_to_msg.sender_id
-                    ):
-
-                        sender_id = (
-                            reply_to_msg.sender_id
-                        )
-
-                        if sender_id not in reply_data:
-
-                            reply_data[sender_id] = {
-                                "count": 0,
-                                "date": str(m.date),
-                            }
-
-                            try:
-
-                                sender_entity = (
-                                    await telethon_client.get_entity(
-                                        sender_id
-                                    )
-                                )
-
-                                first_name = (
-                                    getattr(
-                                        sender_entity,
-                                        "first_name",
-                                        ""
-                                    )
-                                    or
-                                    ""
-                                )
-
-                                last_name = (
-                                    getattr(
-                                        sender_entity,
-                                        "last_name",
-                                        ""
-                                    )
-                                    or
-                                    ""
-                                )
-
-                                reply_data[sender_id]["name"] = (
-                                    f"{first_name} "
-                                    f"{last_name}"
-                                ).strip()
-
-                            except Exception:
-
-                                reply_data[sender_id]["name"] = (
-                                    "Unknown"
-                                )
-
-                        reply_data[sender_id]["count"] += 1
-
-                except Exception:
-                    pass
-
-        sorted_replies = sorted(
-            reply_data.items(),
-            key=lambda x: x[1]["count"],
-            reverse=True
-        )[:10]
-
-        text = (
-            "<blockquote>"
-            "Replies them in the groups:\n"
-            "when - to whom (total times)\n"
-        )
-
-        for sid, data in sorted_replies:
-
-            text += (
-                f"|{data['date'][:5]} - "
-                f"{html.escape(data['name'])} "
-                f"({data['count']})\n"
-            )
-
-        text += "</blockquote>"
-
-        await update.message.reply_text(
-            text,
-            parse_mode=ParseMode.HTML
-        )
-
-    except Exception as e:
-
-        await update.message.reply_text(
-            f"❌ Error: "
-            f"{html.escape(str(e)[:700])}"
-        )
-# --- Preserving your original fetch_friends function ---
 async def fetch_friends(update, context, text):
     parts = text.split(" ")
     if len(parts) < 2: await update.message.reply_text("⚠️ Use: @group @user"); return
@@ -4851,6 +3016,7 @@ async def fetch_friends(update, context, text):
         text += "</blockquote>"
         await update.message.reply_text(text, parse_mode=ParseMode.HTML)
     except Exception as e: await update.message.reply_text(f"❌ Error: {e}")
+
 async def fetch_names(update, context, target):
     try:
         entity = await telethon_client.get_entity(target)
@@ -4883,14 +3049,10 @@ async def inbox_listener(event):
             await process_message_manager_incoming(event)
         except Exception as e:
             print(f"Message Manager Error: {e}")
+
 # MESSAGE MANAGER 
 # The manager is a gatekeeper for private messages received by the connected
 # Telethon user account. It does not change Telegram's native block list.
-#
-# Available to EVERY authenticated bot user (not only admins).
-# NOTE: The underlying Telethon session is a single shared account, so the
-# rules below are GLOBAL — every user who opens the manager edits the same
-# ruleset. Forwarding of incoming private messages was intentionally removed.
 PTB_BOT = None
 MM_DB_ID = 1
 
@@ -4983,6 +3145,7 @@ def mm_main_kb():
         [InlineKeyboardButton(f'💬 Messaging: {state}', callback_data='mm_toggle')],
         [InlineKeyboardButton('🚫 Block Messages', callback_data='mm_block'), InlineKeyboardButton('🔎 Filter Messages', callback_data='mm_filter')],
         [InlineKeyboardButton('📋 Active Rules', callback_data='mm_rules'), InlineKeyboardButton('👥 Blocked Users', callback_data='mm_blocked')],
+        [InlineKeyboardButton('📩 Forwarding', callback_data='mm_forwarding')],
         [InlineKeyboardButton('⬅️ Back', callback_data='more')]
     ])
 
@@ -5002,7 +3165,7 @@ async def mm_block_menu(update, context):
         [InlineKeyboardButton('📋 Blocked Users', callback_data='mm_blocked')],
         [InlineKeyboardButton('⬅️ Back', callback_data='message_manager')]
     ])
-    await update.callback_query.edit_message_text('🚫 BLOCK MESSAGES\n\n'+status+'\n\nBlock rules silently delete incoming messages.', reply_markup=kb)
+    await update.callback_query.edit_message_text('🚫 BLOCK MESSAGES\n\n'+status+'\n\nBlock rules stop forwarding and silently delete incoming messages.', reply_markup=kb)
 
 async def mm_filter_menu(update, context):
     r=mm_get_rules()
@@ -5022,17 +3185,17 @@ def mm_is_video(event):
     return bool(getattr(event,'video',None)) or (getattr(event,'document',None) is not None and str(getattr(getattr(event,'document',None),'mime_type','')).startswith('video/'))
 
 def mm_reason(event, user_id, text):
-    r=mm_get_rules()
+    r=mm_get_rules(); now=time.time()
     # Owner/admins are never blocked by manager rules.
     if user_id in ADMIN_IDS: return None
-    # Never block the bot itself (prevents loop).
+    # Never block the bot itself (prevents loop)
     try:
         me = telethon_client.loop.run_until_complete(telethon_client.get_me())
         if user_id == me.id:
             return None
     except Exception:
         pass
-    # Explicitly ignore the bot's own ID (PTSS: 8958561939).
+    # 🛑 NEW: Explicitly ignore the bot's own ID (PTSS: 8958561939)
     if user_id == 8958561939: return None
     until=float(r.get('block_everyone_until',0))
     if mm_active(until): return f'Block everyone ({mm_left(until)})'
@@ -5059,8 +3222,50 @@ async def mm_refuse(event, reason):
         print('Manager revoke error:', e)
     # NOTE: No response message is sent.
 
+def mm_message_preview(event):
+    text=(getattr(event,'raw_text','') or '').strip()
+    if text: return text[:1500]
+    if getattr(event,'photo',None): return '🖼️ Photo'
+    if getattr(event,'video',None): return '🎥 Video'
+    if getattr(event,'voice',None): return '🎤 Voice message'
+    if getattr(event,'audio',None): return '🎵 Audio'
+    if getattr(event,'document',None): return '📄 Document'
+    return '📎 Media message'
+
+# --- FIX 5: Exclude bot's own ID from forwarding and deduplicate admin list. ---
+async def mm_forward(event):
+    if not ADMIN_IDS: print('Message Manager: ADMIN_IDS is empty; forwarding skipped.'); return
+    try:
+        bot_me = await telethon_client.get_me()
+        bot_id = bot_me.id
+    except Exception:
+        bot_id = None
+
+    admin_list = list(set(ADMIN_IDS))
+    if bot_id:
+        admin_list = [aid for aid in admin_list if aid != bot_id]
+    if not admin_list:
+        print('Message Manager: No valid admin recipients after filtering.')
+        return
+
+    sender=await event.get_sender()
+    name=' '.join(x for x in [getattr(sender,'first_name',''),getattr(sender,'last_name','')] if x).strip() or 'Unknown'
+    username=getattr(sender,'username',None)
+    header=f'📩 NEW MESSAGE\n\n👤 From: {name}\n🆔 User ID: {sender.id}\n🔗 Username: @{username}' if username else f'📩 NEW MESSAGE\n\n👤 From: {name}\n🆔 User ID: {sender.id}\n🔗 Username: N/A'
+    preview=mm_message_preview(event)
+    for admin_id in admin_list:
+        try:
+            if PTB_BOT:
+                kb=InlineKeyboardMarkup([[InlineKeyboardButton('💬 Reply',callback_data=f'mm_reply|{sender.id}'), InlineKeyboardButton('🚫 Block User',callback_data=f'mm_block_from_message|{sender.id}')]])
+                await PTB_BOT.send_message(admin_id, header+'\n\n'+preview[:3500], reply_markup=kb)
+            else:
+                await telethon_client.send_message(admin_id, header+'\n\n👇 Original message:\n'+preview)
+            if getattr(event,'media',None):
+                await telethon_client.send_file(admin_id, event.media, caption='📎 Original media')
+        except Exception as e:
+            print(f'Message Manager forwarding error to {admin_id}: {e}')
+
 # --- FIX 6: Ignore events sent by the bot itself (kills infinite loops). ---
-# Forwarding was removed: incoming allowed messages are simply left alone.
 async def process_message_manager_incoming(event):
     if not event.is_private or event.out: return False
     try:
@@ -5070,22 +3275,21 @@ async def process_message_manager_incoming(event):
     except Exception:
         pass
     try:
-        sender=await event.get_sender()
-        # Ignore any bot messages (prevents spam from bot itself).
+        sender=await event.get_sender(); 
+        # 🛑 NEW: Ignore any bot messages (prevents spam from bot itself)
         if getattr(sender, 'bot', False):
             return False
-
+        
         uid=sender.id; text=event.raw_text or ''
         reason=mm_reason(event,uid,text)
         if reason:
             await mm_refuse(event,reason)
             return True
-        # No forward, no report — the message is simply allowed through.
+        await mm_forward(event)
         return True
     except Exception as e:
         print('Message Manager incoming error:',e)
         return False
-
 async def mm_active_rules(update, context):
     r=mm_get_rules(); lines=['📋 ACTIVE RULES','']
     lines.append('💬 Messaging: '+('🟢 ON' if r['messaging'] else '🔴 OFF'))
@@ -5143,7 +3347,7 @@ async def mm_set_rule_duration(update, context, kind, value):
         if keyword: r['keyword_rules'][keyword]=until
         else: await q.answer('Keyword no longer exists',show_alert=True); return
     mm_save(r)
-    for _key in ('mm_input','mm_duration_kind'): context.user_data.pop(_key,None)
+    for _key in ('mm_input','mm_duration_kind','mm_reply_to'): context.user_data.pop(_key,None)
     await q.answer('Saved')
     if kind=='everyone': await mm_block_menu(update,context)
     elif kind in {'links','videos'}: await mm_filter_menu(update,context)
@@ -5152,12 +3356,9 @@ async def mm_set_rule_duration(update, context, kind, value):
 
 async def handle_mm_callback(update, context, data):
     q=update.callback_query; uid=update.effective_user.id
-    # All authenticated users can use the manager — no admin-only gate.
-    if not is_authenticated(uid):
-        await q.answer('Please authenticate first with /start', show_alert=True)
-        return True
+    if not is_authenticated(uid) or not is_admin(uid): await q.answer('Admin only',show_alert=True); return True
     if data=='message_manager':
-        for _key in ('mm_input','mm_duration_kind'): context.user_data.pop(_key,None)
+        for _key in ('mm_input','mm_duration_kind','mm_reply_to'): context.user_data.pop(_key,None)
         await q.answer(); await mm_show(update,context); return True
     if data=='mm_toggle':
         r=mm_get_rules(); r['messaging']=0 if r['messaging'] else 1; mm_save(r); await q.answer('Messaging '+('ON' if r['messaging'] else 'OFF')); await mm_show(update,context); return True
@@ -5166,6 +3367,9 @@ async def handle_mm_callback(update, context, data):
     if data=='mm_rules': await q.answer(); await mm_active_rules(update,context); return True
     if data=='mm_blocked': await q.answer(); await mm_show_blocked(update,context); return True
     if data=='mm_filters': await q.answer(); await mm_show_filters(update,context); return True
+    if data=='mm_forwarding':
+        await q.answer(); admins=', '.join(map(str,ADMIN_IDS)) or 'NONE'
+        await q.edit_message_text('📩 FORWARDING\n\nIncoming private messages are forwarded to these ADMIN_IDS:\n'+admins+'\n\nThe connected Telethon account must be able to message those IDs, and each admin should start this bot to receive Bot API controls.',reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Back',callback_data='message_manager')]])); return True
     if data in {'mm_block_everyone','mm_filter_links','mm_filter_videos'}:
         await q.answer(); prefix={'mm_block_everyone':'mm_dur|everyone','mm_filter_links':'mm_dur|links','mm_filter_videos':'mm_dur|videos'}[data]
         await q.edit_message_text('⏱️ Choose duration:',reply_markup=mm_duration_kb(prefix)); return True
@@ -5191,6 +3395,12 @@ async def handle_mm_callback(update, context, data):
         token=data.split('|',1)[1]; r=mm_get_rules(); key=next((k for k in r['keyword_rules'] if hashlib.sha1(k.encode()).hexdigest()[:10]==token),None)
         if key: r['keyword_rules'].pop(key,None); mm_save(r)
         await q.answer('Keyword removed'); await mm_show_filters(update,context); return True
+    if data=='mm_block_from_message':
+        target=data.split('|',1)[1] if '|' in data else ''
+    if data.startswith('mm_block_from_message|'):
+        target=data.split('|',1)[1]; context.user_data['mm_duration_kind']='user:'+target; await q.answer(); await q.edit_message_text(f'🚫 Block user {target}\n\nChoose duration:',reply_markup=mm_duration_kb('mm_dur|user:'+target)); return True
+    if data.startswith('mm_reply|'):
+        target=data.split('|',1)[1]; context.user_data['mm_reply_to']=int(target); context.user_data['mm_input']='reply'; await q.answer(); await q.message.reply_text(f'💬 Reply mode enabled for user {target}. Send your reply text.'); return True
     return False
 
 async def handle_mm_input(update, context):
@@ -5216,7 +3426,15 @@ async def handle_mm_input(update, context):
                 key=next((k for k in r['keyword_rules'] if hashlib.sha1(k.encode()).hexdigest()[:10]==token),None)
             if key: r['keyword_rules'][key]=until
         mm_save(r); context.user_data.pop('mm_input',None); await update.message.reply_text('✅ Manager rule saved.'); return True
+    if mode=='reply':
+        target=context.user_data.get('mm_reply_to')
+        if not target: context.user_data.pop('mm_input',None); return True
+        try:
+            await telethon_client.send_message(int(target),text); await update.message.reply_text('✅ Reply sent to the user.')
+        except Exception as e: await update.message.reply_text(f'❌ Reply failed: {e}')
+        context.user_data.pop('mm_input',None); context.user_data.pop('mm_reply_to',None); return True
     return False
+    
 # QR CODE
 def create_qr_image_sync(text):
     qr=qrcode.QRCode(version=None,error_correction=qrcode.constants.ERROR_CORRECT_M,box_size=10,border=4)
@@ -5354,8 +3572,6 @@ async def handle_link(update, context):
     if context.user_data.get('state') == 'awaiting_voice_en': await handle_voice_to_text(update, context, 'en-US'); return
     if context.user_data.get('state') == 'awaiting_voice_am': await handle_voice_to_text(update, context, 'am-ET'); return
     if context.user_data.get('state') == 'awaiting_video_link': await handle_video_download(update, context); return
-    if context.user_data.get('state') == 'story_tools_viewers_input': await handle_story_tools_viewers(update, context); return
-    if context.user_data.get('state') == 'story_tools_reactions_input': await handle_story_tools_reactions(update, context); return
     if context.user_data.get('state') == 'awaiting_password':
         if text == BOT_PASSWORD:
             add_authenticated_user(user_id); context.user_data['state'] = None
