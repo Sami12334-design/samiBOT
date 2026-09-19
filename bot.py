@@ -90,7 +90,7 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS user_history (user_id INTEGER, username TEXT, first_name TEXT, last_name TEXT, date TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS message_manager_rules (id INTEGER PRIMARY KEY CHECK (id=1), messaging INTEGER DEFAULT 1, block_everyone_until REAL DEFAULT 0, blocked_users TEXT DEFAULT '{}', filter_links_until REAL DEFAULT 0, filter_videos_until REAL DEFAULT 0, keyword_rules TEXT DEFAULT '{}')''')
     c.execute("INSERT OR IGNORE INTO message_manager_rules (id) VALUES (1)")
-        c.execute('''CREATE TABLE IF NOT EXISTS auto_responder (
+    c.execute('''CREATE TABLE IF NOT EXISTS auto_responder (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         trigger_text TEXT NOT NULL,
         response_text TEXT NOT NULL,
@@ -686,7 +686,7 @@ async def menu_callback(update, context):
         await display_search_page(update, context, page, filter_type)
         return
 
-    if data == "inbox":
+ if data == "inbox":
         await show_inbox(update, context)
         return
     if data.startswith("inbox_open_"):
@@ -702,10 +702,27 @@ async def menu_callback(update, context):
         else:
             keyboard = [[InlineKeyboardButton("👤 Profile", callback_data="profile")], [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")], [InlineKeyboardButton("➕ More Commands", callback_data="more")]]
         await query.message.reply_text("🤖 TELEGRAM ASSISTANT", reply_markup=InlineKeyboardMarkup(keyboard))
-    elif data == "more":
-        kb = [[InlineKeyboardButton("🔎 Search", callback_data="search"), InlineKeyboardButton("📊 Statistics", callback_data="stats")], [InlineKeyboardButton("📄 PDF Fetch", callback_data="pdf_fetch")], [InlineKeyboardButton("🔄 Converter", callback_data="converter")], [InlineKeyboardButton("🎬 Video Downloader", callback_data="video_downloader")]]
+     elif data == "more":
+        kb = [
+            [InlineKeyboardButton("🔎 Search", callback_data="search"),
+             InlineKeyboardButton("🤖 Auto Responder", callback_data="auto_responder")],
+            [InlineKeyboardButton("📄 PDF Fetch", callback_data="pdf_fetch")],
+            [InlineKeyboardButton("🔄 Converter", callback_data="converter")],
+            [InlineKeyboardButton("🎬 Video Downloader", callback_data="video_downloader")],
+        ]
         if is_admin(user_id):
-            admin_buttons = [[InlineKeyboardButton("💬 Message Manager", callback_data="message_manager")], [InlineKeyboardButton("🔔 Track", callback_data="track"), InlineKeyboardButton("🔗 Names", callback_data="names")], [InlineKeyboardButton("👥 Groups", callback_data="groups"), InlineKeyboardButton("💬 Messages", callback_data="messages")], [InlineKeyboardButton("🔎 Analysis", callback_data="analysis"), InlineKeyboardButton("📢 Channels", callback_data="channels")], [InlineKeyboardButton("👍 Reputation", callback_data="rep"), InlineKeyboardButton("👥 Friends", callback_data="friends")], [InlineKeyboardButton("🔄 Reactions", callback_data="reactions"), InlineKeyboardButton("🎁 Gifts", callback_data="gifts")], [InlineKeyboardButton("📤 Share", callback_data="share"), InlineKeyboardButton("🔵 Words Frequency", callback_data="words")], [InlineKeyboardButton("👥 Common Groups", callback_data="common")], [InlineKeyboardButton("📢 Broadcast", callback_data="broadcast")]]
+            admin_buttons = [
+                [InlineKeyboardButton("💬 Message Manager", callback_data="message_manager")],
+                [InlineKeyboardButton("📊 Statistics", callback_data="stats")],
+                [InlineKeyboardButton("🔔 Track", callback_data="track"), InlineKeyboardButton("🔗 Names", callback_data="names")],
+                [InlineKeyboardButton("👥 Groups", callback_data="groups"), InlineKeyboardButton("💬 Messages", callback_data="messages")],
+                [InlineKeyboardButton("🔎 Analysis", callback_data="analysis"), InlineKeyboardButton("📢 Channels", callback_data="channels")],
+                [InlineKeyboardButton("👍 Reputation", callback_data="rep"), InlineKeyboardButton("👥 Friends", callback_data="friends")],
+                [InlineKeyboardButton("🔄 Reactions", callback_data="reactions"), InlineKeyboardButton("🎁 Gifts", callback_data="gifts")],
+                [InlineKeyboardButton("📤 Share", callback_data="share"), InlineKeyboardButton("🔵 Words Frequency", callback_data="words")],
+                [InlineKeyboardButton("👥 Common Groups", callback_data="common")],
+                [InlineKeyboardButton("📢 Broadcast", callback_data="broadcast")],
+            ]
             kb = admin_buttons + kb
         kb.append([InlineKeyboardButton("⬅️ Back", callback_data="main_menu")])
         await query.message.reply_text("➕ MORE COMMANDS", reply_markup=InlineKeyboardMarkup(kb))
@@ -3907,7 +3924,7 @@ async def handle_link(update, context):
         else:
             await update.message.reply_text("❌ Incorrect password. Please try again.")
         return
-     if context.user_data.get('state') == 'ar_awaiting_trigger':
+    if context.user_data.get('state') == 'ar_awaiting_trigger':
         if not is_authenticated(user_id):
             await update.message.reply_text("🔐 Password required.")
             return
