@@ -90,6 +90,15 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS user_history (user_id INTEGER, username TEXT, first_name TEXT, last_name TEXT, date TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS message_manager_rules (id INTEGER PRIMARY KEY CHECK (id=1), messaging INTEGER DEFAULT 1, block_everyone_until REAL DEFAULT 0, blocked_users TEXT DEFAULT '{}', filter_links_until REAL DEFAULT 0, filter_videos_until REAL DEFAULT 0, keyword_rules TEXT DEFAULT '{}')''')
     c.execute("INSERT OR IGNORE INTO message_manager_rules (id) VALUES (1)")
+        c.execute('''CREATE TABLE IF NOT EXISTS auto_responder (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        trigger_text TEXT NOT NULL,
+        response_text TEXT NOT NULL,
+        match_type TEXT NOT NULL DEFAULT 'exact',
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_by INTEGER,
+        created_at TEXT
+    )''')
     conn.commit()
     conn.close()
 
@@ -152,7 +161,87 @@ def get_user_history(user_id):
     rows = c.fetchall()
     conn.close()
     return rows
+# ─────────────────────────────────────────────────────────────
+# AUTO-RESPONDER  (all authenticated users)
+# ─────────────────────────────────────────────────────────────
+AR_MAX_RULES = 200
 
+def ar_add_rule(trigger, response, match_type, user_id):
+    trigger = (trigger or "").strip()
+    response = (response or "").strip()
+    if not trigger or not response:
+        return None
+    conn = sqlite3.connect('bot_data.db')
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM auto_responder")
+    if c.fetchone()[0] >= AR_MAX_RULES:
+        conn.close()
+        return None
+    c.execute(
+        "INSERT INTO auto_responder (trigger_text, response_text, match_type, enabled, created_by, created_at) "
+        "VALUES (?, ?, ?, 1, ?, ?)",
+        (trigger, response, match_type, user_id, str(datetime.now()))
+    )
+    rule_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return rule_id
+
+def ar_get_rules():
+    conn = sqlite3.connect('bot_data.db')
+    c = conn.cursor()
+    c.execute("SELECT id, trigger_text, response_text, match_type, enabled, created_by, created_at "
+              "FROM auto_responder ORDER BY id DESC")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def ar_delete_rule(rule_id):
+    conn = sqlite3.connect('bot_data.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM auto_responder WHERE id=?", (rule_id,))
+    conn.commit()
+    conn.close()
+
+def ar_find_reply(text):
+    text = (text or "").strip()
+    if not text:
+        return None
+    text_l = text.lower()
+    conn = sqlite3.connect('bot_data.db')
+    c = conn.cursor()
+    c.execute("SELECT trigger_text, response_text, match_type FROM auto_responder WHERE enabled=1")
+    rows = c.fetchall()
+    conn.close()
+    for trigger, response, match_type in rows:
+        t = (trigger or "").strip().lower()
+        if not t:
+            continue
+        if match_type == "exact" and text_l == t:
+            return response
+        if match_type == "contains" and t in text_l:
+            return response
+        if match_type == "startswith" and text_l.startswith(t):
+            return response
+    return None
+
+def stats_counts():
+    conn = sqlite3.connect('bot_data.db')
+    c = conn.cursor()
+    out = {}
+    for label, q in (
+        ("users", "SELECT COUNT(*) FROM users"),
+        ("inbox", "SELECT COUNT(*) FROM inbox"),
+        ("history", "SELECT COUNT(*) FROM user_history"),
+        ("ar_rules", "SELECT COUNT(*) FROM auto_responder"),
+    ):
+        try:
+            c.execute(q)
+            out[label] = c.fetchone()[0]
+        except Exception:
+            out[label] = 0
+    conn.close()
+    return out
 def parse_tg_link(text):
     comment_pattern = r'https?://t\.me/([a-zA-Z0-9_]+)/(\d+)/(\d+)'
     match = re.search(comment_pattern, text)
@@ -362,6 +451,178 @@ async def restart_command(update, context):
     except Exception:
         pass
     os.execv(sys.executable, [sys.executable] + sys.argv)
+async def show_statistics(update, context):
+    q = update.callback_query
+    await q.answer()
+    s = stats_counts()
+    text = (
+        "📊 <b>BOT STATISTICS</b>\n\n"
+        f"👥 Total authenticated bot users: <b>{s['users']}</b>\n"
+        f"📥 Inbox messages stored: <b>{s['inbox']}</b>\n"
+        f"🗂️ Profile history entries: <b>{s['history']}</b>\n"
+        f"🤖 Auto-responder rules: <b>{s['ar_rules']}</b>\n"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh", callback_data="stats")],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
+    ])
+    try:
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    except Exception:
+        await q.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+def ar_main_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add Rule", callback_data="ar_add")],
+        [InlineKeyboardButton("📋 View Rules", callback_data="ar_list")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="more")],
+    ])
+
+async def ar_show_menu(update, context):
+    q = update.callback_query
+    await q.answer()
+    text = (
+        "🤖 <b>AUTO RESPONDER</b>\n\n"
+        "Set up automatic replies for private messages received by the connected "
+        "Telegram account.\n\n"
+        "<b>Example:</b>\n"
+        "• Trigger: <code>hi</code>\n"
+        "• Response: <code>Hello! How can I help you?</code>\n\n"
+        "Every authenticated user of this bot can add their own rules."
+    )
+    try:
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=ar_main_kb())
+    except Exception:
+        await q.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=ar_main_kb())
+
+async def ar_start_add(update, context):
+    q = update.callback_query
+    await q.answer()
+    for k in ("ar_trigger", "ar_response"):
+        context.user_data.pop(k, None)
+    context.user_data['state'] = 'ar_awaiting_trigger'
+    await q.edit_message_text(
+        "➕ <b>ADD AUTO-RESPONSE RULE</b>\n\n"
+        "Step 1/3 — Send the <b>trigger</b> (the message that someone will send).\n\n"
+        "Example: <code>hi</code>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ar_cancel")]]),
+    )
+
+async def ar_handle_trigger(update, context):
+    if context.user_data.get('state') != 'ar_awaiting_trigger':
+        return
+    trigger = (update.message.text or "").strip()
+    if not trigger or len(trigger) > 200:
+        await update.message.reply_text("❌ Trigger must be 1–200 characters.")
+        return
+    context.user_data['ar_trigger'] = trigger
+    context.user_data['state'] = 'ar_awaiting_response'
+    await update.message.reply_text(
+        f"✅ Trigger saved: <code>{html.escape(trigger)}</code>\n\n"
+        "Step 2/3 — Send the <b>response</b> that the bot will reply with.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ar_cancel")]]),
+    )
+
+async def ar_handle_response(update, context):
+    if context.user_data.get('state') != 'ar_awaiting_response':
+        return
+    response = (update.message.text or "").strip()
+    if not response or len(response) > 3000:
+        await update.message.reply_text("❌ Response must be 1–3000 characters.")
+        return
+    context.user_data['ar_response'] = response
+    context.user_data['state'] = 'ar_awaiting_match_type'
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎯 Exact match", callback_data="ar_match|exact")],
+        [InlineKeyboardButton("🔍 Contains", callback_data="ar_match|contains")],
+        [InlineKeyboardButton("▶️ Starts with", callback_data="ar_match|startswith")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="ar_cancel")],
+    ])
+    await update.message.reply_text(
+        "Step 3/3 — Choose how the trigger should match incoming messages.\n\n"
+        "• <b>Exact</b> — message equals the trigger\n"
+        "• <b>Contains</b> — message contains the trigger anywhere\n"
+        "• <b>Starts with</b> — message begins with the trigger",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
+
+async def ar_save_rule(update, context, match_type):
+    q = update.callback_query
+    await q.answer()
+    trigger = context.user_data.get('ar_trigger')
+    response = context.user_data.get('ar_response')
+    if not trigger or not response:
+        await q.edit_message_text(
+            "❌ Session expired. Please start over.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="auto_responder")]]),
+        )
+        return
+    rule_id = ar_add_rule(trigger, response, match_type, update.effective_user.id)
+    context.user_data.pop('ar_trigger', None)
+    context.user_data.pop('ar_response', None)
+    context.user_data['state'] = None
+    if rule_id is None:
+        await q.edit_message_text(
+            "❌ Could not save the rule (rule limit reached or invalid input).",
+            reply_markup=ar_main_kb(),
+        )
+        return
+    await q.edit_message_text(
+        f"✅ <b>Rule #{rule_id} saved!</b>\n\n"
+        f"Trigger: <code>{html.escape(trigger)}</code>\n"
+        f"Match: <b>{match_type}</b>\n"
+        f"Response: {html.escape(response[:500])}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Add Another", callback_data="ar_add")],
+            [InlineKeyboardButton("📋 View Rules", callback_data="ar_list")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="auto_responder")],
+        ]),
+    )
+
+async def ar_show_list(update, context):
+    q = update.callback_query
+    await q.answer()
+    rules = ar_get_rules()
+    if not rules:
+        await q.edit_message_text(
+            "📋 <b>AUTO-RESPONSE RULES</b>\n\nNo rules saved yet.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Add Rule", callback_data="ar_add")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="auto_responder")],
+            ]),
+        )
+        return
+    lines = ["📋 <b>AUTO-RESPONSE RULES</b>", ""]
+    kb = []
+    for rid, trigger, response, match_type, enabled, _uid, _ts in rules[:30]:
+        mark = "🟢" if enabled else "🔴"
+        lines.append(
+            f"{mark} <b>#{rid}</b> [{match_type}]\n"
+            f"Trigger: <code>{html.escape(trigger)}</code>\n"
+            f"Response: {html.escape(response[:120])}\n"
+        )
+        kb.append([InlineKeyboardButton(f"🗑️ Delete #{rid}", callback_data=f"ar_delete|{rid}")])
+    kb.append([InlineKeyboardButton("➕ Add Rule", callback_data="ar_add")])
+    kb.append([InlineKeyboardButton("⬅️ Back", callback_data="auto_responder")])
+    await q.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+
+async def ar_delete(update, context, rule_id):
+    q = update.callback_query
+    await q.answer("Deleted")
+    ar_delete_rule(rule_id)
+    await ar_show_list(update, context)
+
+async def ar_cancel(update, context):
+    q = update.callback_query
+    await q.answer()
+    context.user_data.pop('ar_trigger', None)
+    context.user_data.pop('ar_response', None)
+    context.user_data['state'] = None
+    await ar_show_menu(update, context)
 
 async def menu_callback(update, context):
     query = update.callback_query
@@ -377,12 +638,36 @@ async def menu_callback(update, context):
     if not (data.startswith("mm_") or data == "message_manager"):
         for _key in ("mm_input", "mm_duration_kind", "mm_reply_to", "mm_keyword_tokens"):
             context.user_data.pop(_key, None)
+    if not data.startswith("ar_") and data != "auto_responder":
+        if context.user_data.get('state') in ('ar_awaiting_trigger', 'ar_awaiting_response', 'ar_awaiting_match_type'):
+            context.user_data['state'] = None
+            context.user_data.pop('ar_trigger', None)
+            context.user_data.pop('ar_response', None)
     if data.startswith("mm_") or data in {"message_manager"}:
         if await handle_mm_callback(update, context, data): return
     if data.startswith("vd_"):
         await handle_video_callback(update, context, data)
         return
-
+    if data == "auto_responder":
+        await ar_show_menu(update, context); return
+    if data == "ar_add":
+        await ar_start_add(update, context); return
+    if data == "ar_list":
+        await ar_show_list(update, context); return
+    if data == "ar_cancel":
+        await ar_cancel(update, context); return
+    if data.startswith("ar_match|"):
+        await ar_save_rule(update, context, data.split("|", 1)[1]); return
+    if data.startswith("ar_delete|"):
+        try:
+            rid = int(data.split("|", 1)[1])
+        except ValueError:
+            await query.answer("Invalid rule", show_alert=True); return
+        await ar_delete(update, context, rid); return
+    if data == "stats":
+        if not is_admin(user_id):
+            await query.answer("🔒 Admin only", show_alert=True); return
+        await show_statistics(update, context); return
     # Dynamic search filter buttons. They are created from the actual result
     # types, so a filter is shown only when it has matching results.
     if data.startswith("sf_"):
@@ -3036,20 +3321,61 @@ async def fetch_names(update, context, target):
         text += "</blockquote>"
         await update.message.reply_text(text, parse_mode=ParseMode.HTML)
     except Exception as e: await update.message.reply_text(f"❌ Error: {e}")
+async def process_auto_responder(event):
+    if not event.is_private or event.out:
+        return
+    text = event.raw_text or ""
+    if not text.strip():
+        return
+    try:
+        sender = await event.get_sender()
+        if sender is None:
+            return
+        if getattr(sender, 'bot', False):
+            return
+        me = await telethon_client.get_me()
+        if sender.id == me.id:
+            return
+    except Exception:
+        return
+
+    try:
+        reply = ar_find_reply(text)
+    except Exception as e:
+        print(f"Auto-responder lookup error: {e}")
+        return
+    if not reply:
+        return
+    try:
+        await event.reply(reply)
+    except Exception as e:
+        print(f"Auto-responder reply error: {e}")
+
 
 @telethon_client.on(events.NewMessage(incoming=True))
 async def inbox_listener(event):
     if event.is_private and not event.out:
         try:
             sender = await event.get_sender()
-            add_inbox_message(event.chat_id, sender.id, getattr(sender, 'first_name', 'Unknown'), getattr(sender, 'username', 'N/A'), event.raw_text if event.raw_text else "", get_media_type(event), str(event.date))
+            add_inbox_message(
+                event.chat_id, sender.id,
+                getattr(sender, 'first_name', 'Unknown'),
+                getattr(sender, 'username', 'N/A'),
+                event.raw_text if event.raw_text else "",
+                get_media_type(event), str(event.date)
+            )
         except Exception as e:
             print(f"Inbox Error: {e}")
+
         try:
             await process_message_manager_incoming(event)
         except Exception as e:
             print(f"Message Manager Error: {e}")
 
+        try:
+            await process_auto_responder(event)
+        except Exception as e:
+            print(f"Auto-Responder Error: {e}")
 # MESSAGE MANAGER 
 # The manager is a gatekeeper for private messages received by the connected
 # Telethon user account. It does not change Telegram's native block list.
@@ -3581,8 +3907,16 @@ async def handle_link(update, context):
         else:
             await update.message.reply_text("❌ Incorrect password. Please try again.")
         return
-    if not is_authenticated(user_id):
-        await update.message.reply_text("🔐 Password required. Please run /start and authenticate first."); return
+     if context.user_data.get('state') == 'ar_awaiting_trigger':
+        if not is_authenticated(user_id):
+            await update.message.reply_text("🔐 Password required.")
+            return
+        await ar_handle_trigger(update, context); return
+    if context.user_data.get('state') == 'ar_awaiting_response':
+        if not is_authenticated(user_id):
+            await update.message.reply_text("🔐 Password required.")
+            return
+        await ar_handle_response(update, context); return
     if context.user_data.get('reply_to'):
         target_chat = context.user_data['reply_to']
         try:
