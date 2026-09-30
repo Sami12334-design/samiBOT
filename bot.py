@@ -686,7 +686,7 @@ async def menu_callback(update, context):
         await display_search_page(update, context, page, filter_type)
         return
 
- if data == "inbox":
+   if data == "inbox":
         await show_inbox(update, context)
         return
     if data.startswith("inbox_open_"):
