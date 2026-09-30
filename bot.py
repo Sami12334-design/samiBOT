@@ -2727,21 +2727,44 @@ async def fetch_profile(update, context, target):
 
 
 def _story_items_from_result(result):
-    """Return a plain list of StoryItem objects from Telethon story responses."""
+    """Safely unwrap Telethon story responses into a real Python list.
+
+    Telethon can return stories.PeerStories, whose .stories field contains
+    the actual StoryItem vector.  Never call len() on the response wrapper.
+    """
+    if result is None:
+        return []
+
+    # Normal response: stories.PeerStories -> .stories -> StoryItem vector.
     container = getattr(result, "stories", None)
     if container is None:
         return []
-    nested = getattr(container, "stories", None)
-    if nested is not None:
-        try:
-            return list(nested)
-        except TypeError:
-            return []
+
+    # Some Telethon response wrappers add another .stories layer. Unwrap
+    # only a few layers defensively so this stays safe across versions.
+    for _ in range(3):
+        if isinstance(container, (list, tuple)):
+            try:
+                return list(container)
+            except Exception:
+                return []
+
+        nested = getattr(container, "stories", None)
+        if nested is None or nested is container:
+            break
+        container = nested
+
     if isinstance(container, (list, tuple)):
-        return list(container)
+        try:
+            return list(container)
+        except Exception:
+            return []
+
+    # Telethon vectors are iterable, but avoid len() entirely because
+    # PeerStories itself is not a sized collection.
     try:
-        return list(container)
-    except TypeError:
+        return [item for item in container]
+    except (TypeError, AttributeError):
         return []
 
 def _story_keyboard(index, total):
