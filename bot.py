@@ -2729,7 +2729,7 @@ async def fetch_profile(update, context, target):
         await update.message.reply_text(f"❌ Error: {type(e).__name__}: {e}")
 
 
-async def _story_items_from_result(result):
+def _story_items_from_result(result):
     """Return a plain list of StoryItem objects from Telethon story responses."""
     container = getattr(result, "stories", None)
     if container is None:
@@ -2910,7 +2910,7 @@ async def send_story_at_index(update,context,index):
     media=getattr(story,"media",None)
 
     if media is None:
-        await query.message.edit_text(caption,reply_markup=await _story_keyboard(index,total)); return
+        await query.message.edit_text(caption,reply_markup=_story_keyboard(index,total)); return
 
     tmp=tempfile.NamedTemporaryFile(prefix="story_",delete=False)
     tmp_path=tmp.name; tmp.close()
@@ -2931,7 +2931,7 @@ async def send_story_at_index(update,context,index):
         if file_size>50*1024*1024:
             raise ValueError("This story is too large for Telegram's bot upload limit. The automatic video compression could not reduce it enough.")
 
-        keyboard=await _story_keyboard(index,total)
+        keyboard=_story_keyboard(index,total)
         edited=False
         with open(upload_path,"rb") as media_file:
             try:
@@ -2977,7 +2977,7 @@ async def send_story_at_index(update,context,index):
     except Exception as e:
         print(f"Story media error: {type(e).__name__}: {e}")
         await query.answer("This story could not be displayed.",show_alert=True)
-        try: await query.message.edit_reply_markup(reply_markup=await _story_keyboard(index,total))
+        try: await query.message.edit_reply_markup(reply_markup=_story_keyboard(index,total))
         except Exception: pass
     finally:
         try: os.remove(tmp_path)
