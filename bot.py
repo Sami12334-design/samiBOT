@@ -2767,15 +2767,43 @@ def _story_caption(story,index,total):
     if raw: return f"{header}\n\n{raw}",len(raw)>850
     return header,False
 
+def _story_is_video(media):
+    document=getattr(media,"document",None)
+    mime=str(getattr(document,"mime_type","") or "").lower()
+    return "video" in mime or getattr(media,"video",None) is not None
+
+def _compress_story_video_sync(source_path):
+    """Best-effort fallback for videos larger than the Bot API upload limit."""
+    target_path=source_path + ".compressed.mp4"
+    try:
+        ffmpeg=imageio_ffmpeg.get_ffmpeg_exe()
+        # Two-pass is unnecessary here: use a conservative CRF and cap the
+        # bitrate so common large stories can be brought under the limit.
+        cmd=[
+            ffmpeg,"-y","-i",source_path,
+            "-c:v","libx264","-preset","veryfast","-crf","30",
+            "-c:a","aac","-b:a","96k","-movflags","+faststart",
+            "-fs","49M",target_path
+        ]
+        subprocess.run(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=900,check=True)
+        if os.path.exists(target_path) and os.path.getsize(target_path)>0:
+            return target_path
+    except Exception as e:
+        print(f"Story video compression failed: {type(e).__name__}: {e}")
+    try:
+        if os.path.exists(target_path): os.remove(target_path)
+    except Exception: pass
+    return None
+
 def _story_media_input(media,file_obj,caption):
     document=getattr(media,"document",None)
     mime=str(getattr(document,"mime_type","") or "").lower()
     if getattr(media,"photo",None) is not None:
         return InputMediaPhoto(media=file_obj,caption=caption)
     if "video" in mime or getattr(media,"video",None) is not None:
-        return InputMediaVideo(media=file_obj,caption=caption,supports_streaming=True,show_caption_above_media=True)
+        return InputMediaVideo(media=file_obj,caption=caption,supports_streaming=True)
     if "gif" in mime or getattr(media,"gif",None) is not None:
-        return InputMediaAnimation(media=file_obj,caption=caption,show_caption_above_media=True)
+        return InputMediaAnimation(media=file_obj,caption=caption)
     return InputMediaDocument(media=file_obj,caption=caption)
 
 async def restore_story_profile(update,context):
@@ -2863,13 +2891,22 @@ async def send_story_at_index(update,context,index):
         downloaded=await telethon_client.download_media(media,file=tmp_path)
         if not downloaded or not os.path.exists(tmp_path) or os.path.getsize(tmp_path)==0:
             raise RuntimeError("Telegram returned an empty story file")
+        upload_path=tmp_path
+        compressed_path=None
         file_size=os.path.getsize(tmp_path)
+        if file_size>50*1024*1024 and _story_is_video(media):
+            status=await asyncio.to_thread(_compress_story_video_sync,tmp_path)
+            if status:
+                compressed_path=status
+                upload_path=status
+                file_size=os.path.getsize(status)
+
         if file_size>50*1024*1024:
-            raise ValueError("This story is larger than Telegram's standard 50 MB bot upload limit. A Local Bot API server is required for larger files.")
+            raise ValueError("This story is too large for Telegram's bot upload limit. The automatic video compression could not reduce it enough.")
 
         keyboard=await _story_keyboard(index,total)
         edited=False
-        with open(tmp_path,"rb") as media_file:
+        with open(upload_path,"rb") as media_file:
             try:
                 await query.message.edit_media(media=_story_media_input(media,media_file,media_caption),
                                                reply_markup=keyboard)
@@ -2878,7 +2915,7 @@ async def send_story_at_index(update,context,index):
                 print(f"Story edit fallback: {type(edit_error).__name__}: {edit_error}")
 
         if not edited:
-            with open(tmp_path,"rb") as media_file:
+            with open(upload_path,"rb") as media_file:
                 document=getattr(media,"document",None)
                 mime=str(getattr(document,"mime_type","") or "").lower()
                 if getattr(media,"photo",None) is not None:
@@ -2917,6 +2954,10 @@ async def send_story_at_index(update,context,index):
         except Exception: pass
     finally:
         try: os.remove(tmp_path)
+        except Exception: pass
+        try:
+            if "compressed_path" in locals() and compressed_path and os.path.exists(compressed_path):
+                os.remove(compressed_path)
         except Exception: pass
 
 # --- FAST GLOBAL TELEGRAM SEARCH ---
