@@ -22,7 +22,8 @@ import cv2
 from datetime import datetime, timedelta
 from flask import Flask
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageChops
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
+                      InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAnimation)
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
 from telethon import TelegramClient, events, functions, types
@@ -833,15 +834,22 @@ async def menu_callback(update, context):
         except Exception: page=1
         await handle_posts_pagination(update, context, page)
         return
-    elif data.startswith("story_"):
+    # Story controls: navigation must be checked BEFORE the generic story action.
+    elif data == "story_start":
         await handle_story_view(update, context)
         return
     elif data.startswith("story_nav_"):
         try:
-            idx = int(data.split("_")[2])
+            idx = int(data.split("_", 2)[2])
             await send_story_at_index(update, context, idx)
-        except Exception:
-            await query.answer("Invalid navigation", show_alert=True)
+        except (ValueError, IndexError):
+            await query.answer("Invalid story navigation.", show_alert=True)
+        return
+    elif data == "story_refresh":
+        await handle_story_view(update, context, refresh=True)
+        return
+    elif data == "story_back":
+        await restore_story_profile(update, context)
         return
 # --- PHOTO EDITING ---
 def build_edit_keyboard(page=1):
@@ -2721,78 +2729,196 @@ async def fetch_profile(update, context, target):
         await update.message.reply_text(f"❌ Error: {type(e).__name__}: {e}")
 
 
-async def handle_story_view(update, context):
-    query = update.callback_query
-    await query.answer("Loading stories…")
+async def _story_keyboard(index, total):
+    """Build compact, predictable story navigation controls."""
+    row=[]
+    if index>0: row.append(InlineKeyboardButton("⬅️ Back",callback_data=f"story_nav_{index-1}"))
+    if index<total-1: row.append(InlineKeyboardButton("Next ➡️",callback_data=f"story_nav_{index+1}"))
+    controls=[row] if row else []
+    controls.append([InlineKeyboardButton("🔄 Refresh",callback_data="story_refresh"),InlineKeyboardButton("👤 Profile",callback_data="story_back")])
+    return InlineKeyboardMarkup(controls)
 
-    entity = context.user_data.get("story_entity")
+def _story_is_active(story):
+    if getattr(story,"deleted",False) or getattr(story,"expired",False): return False
+    expire_date=getattr(story,"expire_date",None)
+    if expire_date:
+        try:
+            now=datetime.now(expire_date.tzinfo) if getattr(expire_date,"tzinfo",None) else datetime.now()
+            if expire_date<=now: return False
+        except Exception: pass
+    return True
+
+def _story_sort_key(story):
+    story_date=getattr(story,"date",None)
+    try: return story_date.timestamp() if story_date else float(getattr(story,"id",0))
+    except Exception: return float(getattr(story,"id",0))
+
+def _story_caption(story,index,total):
+    raw=getattr(story,"caption",None)
+    if raw is None: raw=getattr(story,"message",None)
+    raw=str(raw or "").strip()
+    story_date=getattr(story,"date",None)
+    date_text=""
+    if story_date:
+        try: date_text=story_date.strftime("%d %b %Y • %H:%M")
+        except Exception: date_text=str(story_date)
+    header=f"📖 Story {index+1}/{total}"
+    if date_text: header+=f" • {date_text}"
+    if raw: return f"{header}\n\n{raw}",len(raw)>850
+    return header,False
+
+def _story_media_input(media,file_obj,caption):
+    document=getattr(media,"document",None)
+    mime=str(getattr(document,"mime_type","") or "").lower()
+    if getattr(media,"photo",None) is not None:
+        return InputMediaPhoto(media=file_obj,caption=caption)
+    if "video" in mime or getattr(media,"video",None) is not None:
+        return InputMediaVideo(media=file_obj,caption=caption,supports_streaming=True,show_caption_above_media=True)
+    if "gif" in mime or getattr(media,"gif",None) is not None:
+        return InputMediaAnimation(media=file_obj,caption=caption,show_caption_above_media=True)
+    return InputMediaDocument(media=file_obj,caption=caption)
+
+async def restore_story_profile(update,context):
+    query=update.callback_query
+    entity=context.user_data.get("story_entity")
     if not entity:
-        await query.edit_message_text("❌ No profile selected. Please search a user again.")
-        return
-
-    # Check if the stories API is available
-    if GetPeerStoriesRequest is None:
-        await query.edit_message_text("❌ Stories are not supported in this version (missing Telethon story modules).")
-        return
-
+        await query.answer("Profile expired. Please search again.",show_alert=True); return
     try:
-        # Fetch the peer stories
-        result = await telethon_client(GetPeerStoriesRequest(peer=entity))
-        stories = result.stories
-
-        if not stories:
-            await query.edit_message_text("📭 No stories found for this user.")
-            return
-
-        # Store stories and start with the first one (index 0)
-        context.user_data["stories_list"] = stories
-        context.user_data["story_index"] = 0
-        await send_story_at_index(update, context, 0)
-
+        first=getattr(entity,"first_name","") or ""; last=getattr(entity,"last_name","") or ""
+        name=f"{first} {last}".strip() or getattr(entity,"title","Unknown")
+        username=getattr(entity,"username",None); about=getattr(entity,"about",None) or "No bio"
+        text=(f"<blockquote><b>{html.escape(name)}</b>\n"
+              f"@{html.escape(username or 'N/A')}\n\n{html.escape(about)}\n\nID: {entity.id}</blockquote>")
+        kb=InlineKeyboardMarkup([[InlineKeyboardButton("👁 View Story",callback_data="story_start")],
+                                 [InlineKeyboardButton("⬅️ Back",callback_data="more")]])
+        try:
+            await query.edit_message_caption(caption=text,parse_mode=ParseMode.HTML,reply_markup=kb)
+        except Exception:
+            await query.edit_message_text("👤 <b>Profile</b>\n\nUse <b>View Story</b> to load the latest stories again.",
+                                          parse_mode=ParseMode.HTML,reply_markup=kb)
     except Exception as e:
-        await query.edit_message_text(f"❌ Could not load stories: {type(e).__name__}: {e}")
+        await query.answer(f"Could not return to profile: {type(e).__name__}",show_alert=True); return
+    context.user_data.pop("stories_list",None); context.user_data.pop("story_index",None)
+    await query.answer()
 
+async def handle_story_view(update,context,refresh=False):
+    query=update.callback_query
+    await query.answer("Refreshing stories…" if refresh else "Loading stories…")
+    entity=context.user_data.get("story_entity")
+    if not entity:
+        await query.edit_message_text("❌ No profile selected. Please search a user again."); return
+    if GetPeerStoriesRequest is None:
+        await query.edit_message_text("❌ Telegram Stories support is unavailable in this Telethon installation."); return
+    try:
+        result=await telethon_client(GetPeerStoriesRequest(peer=entity))
+        stories=[story for story in (getattr(result,"stories",None) or []) if _story_is_active(story)]
+        stories.sort(key=_story_sort_key,reverse=True)
+        if not stories:
+            kb=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh",callback_data="story_refresh")],
+                                     [InlineKeyboardButton("👤 Profile",callback_data="story_back")]])
+            try:
+                await query.edit_message_caption(caption="📭 <b>No active stories</b>\n\nThis profile has no currently available stories.",
+                                                  parse_mode=ParseMode.HTML,reply_markup=kb)
+            except Exception:
+                await query.edit_message_text("📭 <b>No active stories</b>\n\nThis profile has no currently available stories.",
+                                              parse_mode=ParseMode.HTML,reply_markup=kb)
+            return
+        context.user_data["stories_list"]=stories
+        context.user_data["story_index"]=0
+        await send_story_at_index(update,context,0)
+    except FloodWaitError as e:
+        await query.edit_message_text(f"⏳ Telegram temporarily rate-limited story loading.\n\nPlease try again in about {e.seconds} seconds.")
+    except (ChannelPrivateError,UsernameNotOccupiedError):
+        await query.edit_message_text("🔒 Stories are unavailable for this profile.")
+    except Exception as e:
+        print(f"Story load error: {type(e).__name__}: {e}")
+        await query.edit_message_text("❌ Could not load stories right now.\n\n"
+                                      "The profile may have restricted stories, the story may have expired, "
+                                      "or Telegram may have temporarily rejected the request.",
+                                      reply_markup=InlineKeyboardMarkup([
+                                          [InlineKeyboardButton("🔄 Refresh",callback_data="story_refresh")],
+                                          [InlineKeyboardButton("👤 Profile",callback_data="story_back")]]))
 
-async def send_story_at_index(update, context, index):
-    query = update.callback_query
-    stories = context.user_data.get("stories_list", [])
-    if not stories or index < 0 or index >= len(stories):
-        await query.edit_message_text("❌ No more stories.")
-        return
+async def send_story_at_index(update,context,index):
+    query=update.callback_query
+    stories=context.user_data.get("stories_list",[])
+    if not stories:
+        await query.answer("Stories expired. Refreshing…")
+        await handle_story_view(update,context,refresh=True); return
+    if index<0 or index>=len(stories):
+        await query.answer("No more stories.",show_alert=True); return
 
-    # Store current index
-    context.user_data["story_index"] = index
-    story = stories[index]
-    total = len(stories)
+    story=stories[index]; total=len(stories)
+    context.user_data["story_index"]=index
+    caption,long_caption=_story_caption(story,index,total)
+    media_caption=caption[:1024]
+    media=getattr(story,"media",None)
 
-    # Build navigation buttons
-    nav = []
-    if index > 0:
-        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"story_nav_{index-1}"))
-    if index < total - 1:
-        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"story_nav_{index+1}"))
-    nav.append(InlineKeyboardButton("⬅️ Back", callback_data="profile"))
+    if media is None:
+        await query.message.edit_text(caption,reply_markup=await _story_keyboard(index,total)); return
 
-    kb = InlineKeyboardMarkup([nav])
+    tmp=tempfile.NamedTemporaryFile(prefix="story_",delete=False)
+    tmp_path=tmp.name; tmp.close()
+    try:
+        downloaded=await telethon_client.download_media(media,file=tmp_path)
+        if not downloaded or not os.path.exists(tmp_path) or os.path.getsize(tmp_path)==0:
+            raise RuntimeError("Telegram returned an empty story file")
+        file_size=os.path.getsize(tmp_path)
+        if file_size>50*1024*1024:
+            raise ValueError("This story is larger than Telegram's standard 50 MB bot upload limit. A Local Bot API server is required for larger files.")
 
-    # Download and send the story media
-    media_bytes = BytesIO()
-    await telethon_client.download_media(story.media, file=media_bytes)
-    media_bytes.seek(0)
+        keyboard=await _story_keyboard(index,total)
+        edited=False
+        with open(tmp_path,"rb") as media_file:
+            try:
+                await query.message.edit_media(media=_story_media_input(media,media_file,media_caption),
+                                               reply_markup=keyboard)
+                edited=True
+            except Exception as edit_error:
+                print(f"Story edit fallback: {type(edit_error).__name__}: {edit_error}")
 
-    caption = f"📖 Story {index+1}/{total}"
+        if not edited:
+            with open(tmp_path,"rb") as media_file:
+                document=getattr(media,"document",None)
+                mime=str(getattr(document,"mime_type","") or "").lower()
+                if getattr(media,"photo",None) is not None:
+                    sent=await query.message.reply_photo(photo=media_file,caption=media_caption,reply_markup=keyboard)
+                elif "video" in mime:
+                    try:
+                        sent=await query.message.reply_video(video=media_file,caption=media_caption,supports_streaming=True,reply_markup=keyboard)
+                    except Exception:
+                        media_file.seek(0)
+                        sent=await query.message.reply_document(document=media_file,caption=media_caption,reply_markup=keyboard)
+                elif "gif" in mime:
+                    sent=await query.message.reply_animation(animation=media_file,caption=media_caption,reply_markup=keyboard)
+                else:
+                    sent=await query.message.reply_document(document=media_file,caption=media_caption,reply_markup=keyboard)
+            try: await query.message.delete()
+            except Exception: pass
+            context.user_data["story_message_id"]=sent.message_id
 
-    # Detect media type and send
-    if story.media and hasattr(story.media, 'photo'):
-        await query.message.reply_photo(photo=media_bytes, caption=caption, reply_markup=kb)
-    elif story.media and hasattr(story.media, 'document'):
-        mime = getattr(story.media.document, 'mime_type', '')
-        if 'video' in mime:
-            await query.message.reply_video(video=media_bytes, caption=caption, reply_markup=kb)
-        else:
-            await query.message.reply_document(document=media_bytes, caption=caption, reply_markup=kb)
-    else:
-        await query.message.reply_document(document=media_bytes, caption=caption, reply_markup=kb)
+        old_caption_id=context.user_data.pop("story_caption_message_id",None)
+        if old_caption_id:
+            try: await context.bot.delete_message(query.message.chat_id,old_caption_id)
+            except Exception: pass
+        if long_caption:
+            full_caption=str(getattr(story,"caption",None) or getattr(story,"message",None) or "").strip()
+            if len(full_caption)>850:
+                extra=await context.bot.send_message(chat_id=query.message.chat_id,text=f"📝 Full caption:\n\n{full_caption}")
+                context.user_data["story_caption_message_id"]=extra.message_id
+    except ValueError as e:
+        await query.answer(str(e)[:190],show_alert=True)
+    except FloodWaitError as e:
+        await query.answer(f"Telegram asks us to wait {e.seconds}s.",show_alert=True)
+    except Exception as e:
+        print(f"Story media error: {type(e).__name__}: {e}")
+        await query.answer("This story could not be displayed.",show_alert=True)
+        try: await query.message.edit_reply_markup(reply_markup=await _story_keyboard(index,total))
+        except Exception: pass
+    finally:
+        try: os.remove(tmp_path)
+        except Exception: pass
+
 # --- FAST GLOBAL TELEGRAM SEARCH ---
 #
 # This version implements true Telegram-side pagination, correct peer-ID
