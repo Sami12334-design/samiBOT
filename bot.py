@@ -702,7 +702,7 @@ async def menu_callback(update, context):
         else:
             keyboard = [[InlineKeyboardButton("👤 Profile", callback_data="profile")], [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")], [InlineKeyboardButton("➕ More Commands", callback_data="more")]]
         await query.message.reply_text("🤖 TELEGRAM ASSISTANT", reply_markup=InlineKeyboardMarkup(keyboard))
-     elif data == "more":
+    elif data == "more":
         kb = [
             [InlineKeyboardButton("🔎 Search", callback_data="search"),
              InlineKeyboardButton("🤖 Auto Responder", callback_data="auto_responder")],
