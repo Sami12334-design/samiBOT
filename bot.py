@@ -2729,7 +2729,25 @@ async def fetch_profile(update, context, target):
         await update.message.reply_text(f"❌ Error: {type(e).__name__}: {e}")
 
 
-async def _story_keyboard(index, total):
+async def _story_items_from_result(result):
+    """Return a plain list of StoryItem objects from Telethon story responses."""
+    container = getattr(result, "stories", None)
+    if container is None:
+        return []
+    nested = getattr(container, "stories", None)
+    if nested is not None:
+        try:
+            return list(nested)
+        except TypeError:
+            return []
+    if isinstance(container, (list, tuple)):
+        return list(container)
+    try:
+        return list(container)
+    except TypeError:
+        return []
+
+def _story_keyboard(index, total):
     """Build compact, predictable story navigation controls."""
     row=[]
     if index>0: row.append(InlineKeyboardButton("⬅️ Back",callback_data=f"story_nav_{index-1}"))
@@ -2841,7 +2859,8 @@ async def handle_story_view(update,context,refresh=False):
         await query.edit_message_text("❌ Telegram Stories support is unavailable in this Telethon installation."); return
     try:
         result=await telethon_client(GetPeerStoriesRequest(peer=entity))
-        stories=[story for story in (getattr(result,"stories",None) or []) if _story_is_active(story)]
+        story_items=_story_items_from_result(result)
+        stories=[story for story in story_items if _story_is_active(story)]
         stories.sort(key=_story_sort_key,reverse=True)
         if not stories:
             kb=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh",callback_data="story_refresh")],
@@ -2872,6 +2891,12 @@ async def handle_story_view(update,context,refresh=False):
 async def send_story_at_index(update,context,index):
     query=update.callback_query
     stories=context.user_data.get("stories_list",[])
+    if not isinstance(stories, list):
+        try:
+            stories=list(stories)
+        except TypeError:
+            stories=[]
+        context.user_data["stories_list"]=stories
     if not stories:
         await query.answer("Stories expired. Refreshing…")
         await handle_story_view(update,context,refresh=True); return
