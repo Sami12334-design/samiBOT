@@ -2781,9 +2781,11 @@ def _compress_story_video_sync(source_path):
         # bitrate so common large stories can be brought under the limit.
         cmd=[
             ffmpeg,"-y","-i",source_path,
+            "-vf","scale=min(640,iw):-2",
             "-c:v","libx264","-preset","veryfast","-crf","30",
+            "-maxrate","900k","-bufsize","1800k",
             "-c:a","aac","-b:a","96k","-movflags","+faststart",
-            "-fs","49M",target_path
+            target_path
         ]
         subprocess.run(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=900,check=True)
         if os.path.exists(target_path) and os.path.getsize(target_path)>0:
