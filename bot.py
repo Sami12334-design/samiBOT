@@ -1808,11 +1808,24 @@ async def handle_voice_to_text(update, context, language):
 VIDEO_MAX_UPLOAD = 50 * 1024 * 1024
 VIDEO_QUALITIES = [1080, 720, 480, 360, 240]
 PIPED_APIS = [
+    # Keep several independently hosted instances because public Piped
+    # instances can temporarily fail or be rate-limited.
     "https://pipedapi.kavin.rocks",
+    "https://pipedapi.tokhmi.xyz",
+    "https://pipedapi.moomoo.me",
+    "https://pipedapi.syncpundit.io",
+    "https://api-piped.mha.fi",
+    "https://piped-api.garudalinux.org",
+    "https://pipedapi.rivo.lol",
     "https://pipedapi.leptons.xyz",
-    "https://pipedapi.nosebs.ru",
+    "https://piped-api.lunar.icu",
+    "https://pipedapi.colinslegacy.com",
+    "https://yapi.vyper.me",
+    "https://piped-api.cfe.re",
+    "https://pipedapi.r4fo.com",
     "https://piped-api.privacy.com.de",
     "https://pipedapi.adminforge.de",
+    "https://api.piped.yt",
 ]
 TIKWM_API = "https://www.tikwm.com/api/"
 
@@ -1887,10 +1900,30 @@ def ytdlp_base_options():
                           "Chrome/147.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.8",
         },
-        # Current yt-dlp supports remote EJS components. They help keep
-        # YouTube extraction working when challenge scripts change.
+        # Current yt-dlp uses EJS to solve YouTube's JavaScript challenges.
+        # GitHub is the last-resort source for the EJS scripts when the Python
+        # package does not already contain a compatible copy.
         "remote_components": {"ejs:github"},
     }
+    # PaaS images may not ship Deno, yt-dlp's default JS runtime. Explicitly
+    # enable whichever supported runtime is actually installed.
+    for runtime_name in ("deno", "node", "qjs", "bun"):
+        runtime_path = shutil.which(runtime_name)
+        if runtime_name == "node" and not runtime_path:
+            runtime_path = shutil.which("nodejs")
+        if runtime_path:
+            options["js_runtimes"] = {runtime_name: runtime_path}
+            break
+
+    # YouTube is rotating which player clients expose downloadable formats.
+    # Keep normal defaults, plus clients that can still expose formats without
+    # requiring a separate PO-token provider when available.
+    options["extractor_args"] = {
+        "youtube": {
+            "player_client": ["android_vr", "tv_simply", "default", "web_safari"]
+        }
+    }
+
     cookies = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
     if cookies and os.path.isfile(cookies):
         options["cookiefile"] = cookies
@@ -1901,8 +1934,6 @@ def ytdlp_base_options():
 
 def extract_ytdlp_info(url: str):
     opts = ytdlp_base_options()
-    # Let current yt-dlp select its working YouTube player client. If one
-    # client is blocked, yt-dlp can try another supported client.
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 
