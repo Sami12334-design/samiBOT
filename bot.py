@@ -46,14 +46,14 @@ import imageio_ffmpeg
 import qrcode
 
 try:
-    from telethon.tl.functions.stories import (
-        GetPeerStoriesRequest,
-        GetStoriesByIDRequest,
-        GetPinnedStoriesRequest,
-    )
+    from telethon.tl.functions.stories import GetPeerStoriesRequest, GetStoriesByIDRequest
 except ImportError:
     GetPeerStoriesRequest = None
     GetStoriesByIDRequest = None
+
+try:
+    from telethon.tl.functions.stories import GetPinnedStoriesRequest
+except ImportError:
     GetPinnedStoriesRequest = None
 
 app = Flask(__name__)
