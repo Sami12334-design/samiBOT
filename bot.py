@@ -1907,22 +1907,33 @@ def ytdlp_base_options():
         # package does not already contain a compatible copy.
         "remote_components": {"ejs:github"},
     }
-    # PaaS images may not ship Deno, yt-dlp's default JS runtime. Explicitly
-    # enable whichever supported runtime is actually installed.
-    for runtime_name in ("deno", "node", "qjs", "bun"):
-        runtime_path = shutil.which(runtime_name)
-        if runtime_name == "node" and not runtime_path:
-            runtime_path = shutil.which("nodejs")
-        if runtime_path:
-            options["js_runtimes"] = {runtime_name: runtime_path}
-            break
+    # Render/PaaS images often do not have a JS runtime on PATH. The
+    # official "deno" Python package ships the Deno binary, so use it when
+    # available before falling back to system runtimes.
+    runtime_path = shutil.which("deno")
+    if not runtime_path:
+        try:
+            import deno as deno_pkg
+            runtime_path = deno_pkg.find_deno_bin()
+        except Exception:
+            runtime_path = None
+    if runtime_path:
+        options["js_runtimes"] = {"deno": runtime_path}
+    else:
+        for runtime_name in ("node", "qjs", "bun"):
+            runtime_path = shutil.which(runtime_name)
+            if runtime_name == "node" and not runtime_path:
+                runtime_path = shutil.which("nodejs")
+            if runtime_path:
+                options["js_runtimes"] = {runtime_name: runtime_path}
+                break
 
-    # YouTube is rotating which player clients expose downloadable formats.
-    # Keep normal defaults, plus clients that can still expose formats without
-    # requiring a separate PO-token provider when available.
+    # Prefer clients that currently avoid the GVS PO-token requirement.
+    # web_embedded is useful for videos that permit embedding; web_safari can
+    # expose HLS formats when normal GVS formats are blocked.
     options["extractor_args"] = {
         "youtube": {
-            "player_client": ["android_vr", "tv_simply", "default", "web_safari"]
+            "player_client": ["android_vr", "web_embedded", "web_safari"]
         }
     }
 
@@ -1937,7 +1948,7 @@ def ytdlp_base_options():
 def extract_ytdlp_info(url: str):
     # YouTube changes which Innertube client is usable. Try each independently
     # instead of combining clients into one request configuration.
-    clients = ["android_vr", "tv_simply", "default", "web_safari", "mweb"]
+    clients = ["android_vr", "web_embedded", "web_safari", "tv", "default"]
     errors = []
     for client in clients:
         opts = ytdlp_base_options()
@@ -1968,7 +1979,7 @@ def build_ytdlp_format(height=None, audio=False, platform="unknown"):
 
 def ytdlp_download(url: str, output_dir: str, *, height=None, audio=False, title_hint="video"):
     platform = video_platform(url)
-    clients = ["android_vr", "tv_simply", "default", "web_safari", "mweb"] if platform == "youtube" else [None]
+    clients = ["android_vr", "web_embedded", "web_safari", "tv", "default"] if platform == "youtube" else [None]
     errors = []
     for client in clients:
         try:
@@ -2249,15 +2260,25 @@ def extract_download_options(url: str):
             vid = youtube_video_id(normalized)
             if not vid:
                 raise RuntimeError(f"YouTube extraction failed: {first_error}")
+            fallback_errors = []
             try:
                 piped = piped_metadata(vid)
                 source = "piped"
                 fallback_meta = piped
-            except Exception:
-                inv, inv_api = invidious_metadata(vid)
-                source = "invidious"
-                fallback_meta = invidious_to_piped_meta(inv)
-                fallback_meta["_invidious_api"] = inv_api
+            except Exception as piped_error:
+                fallback_errors.append(str(piped_error))
+                try:
+                    inv, inv_api = invidious_metadata(vid)
+                    source = "invidious"
+                    fallback_meta = invidious_to_piped_meta(inv)
+                    fallback_meta["_invidious_api"] = inv_api
+                except Exception as invidious_error:
+                    fallback_errors.append(str(invidious_error))
+                    raise RuntimeError(
+                        "YouTube extraction failed. "
+                        f"yt-dlp: {first_error}; "
+                        f"fallbacks: {' | '.join(fallback_errors)}"
+                    )
             heights = sorted({int(s.get("height")) for s in fallback_meta.get("videoStreams") or [] if s.get("height")}, reverse=True)
             qualities = [q for q in VIDEO_QUALITIES if any(h >= q for h in heights)]
             if not qualities and heights:
