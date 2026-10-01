@@ -3135,7 +3135,7 @@ def _search_message_type(message):
     if getattr(message, "document", None):
         return "document"
     text = (getattr(message, "message", None) or "").strip()
-    if re.search(r"https?://|t\\.me/|www\\.", text, re.I):
+    if re.search(r"https?://|t\.me/|www\.", text, re.I):
         return "link"
     return "text"
 
@@ -3143,7 +3143,7 @@ def _search_message_type(message):
 def _search_content(message):
     text = (getattr(message, "message", None) or "").strip()
     if text:
-        return re.sub(r"\\s+", " ", text)[:180]
+        return re.sub(r"\s+", " ", text)[:180]
     media_type = _search_message_type(message)
     labels = {
         "photo": "📷 Photo",
@@ -3172,8 +3172,8 @@ def _search_public_entity(entity):
 
 
 def _search_terms(query):
-    normalized = re.sub(r"\\s+", " ", (query or "").strip().lower())
-    raw_tokens = re.findall(r"[\\w@#]+", normalized, flags=re.UNICODE)
+    normalized = re.sub(r"\s+", " ", (query or "").strip().lower())
+    raw_tokens = re.findall(r"[\w@#]+", normalized, flags=re.UNICODE)
     tokens = []
     for token in raw_tokens:
         token = token.lstrip("@#").strip()
@@ -3190,7 +3190,7 @@ def _search_relevance_score(query, entity, message):
     showing whatever happened to arrive first from the server.
     """
     normalized, tokens = _search_terms(query)
-    content = re.sub(r"\\s+", " ", (getattr(message, "message", None) or "").strip().lower())
+    content = re.sub(r"\s+", " ", (getattr(message, "message", None) or "").strip().lower())
     title = _search_peer_name(entity).lower()
     username = (getattr(entity, "username", None) or "").lower().lstrip("@")
 
@@ -3207,7 +3207,7 @@ def _search_relevance_score(query, entity, message):
         if token in content:
             matched += 1
             score += 180
-            if re.search(r"\\b" + re.escape(token) + r"\\b", content):
+            if re.search(r"\b" + re.escape(token) + r"\\b", content):
                 score += 100
         if token in title:
             score += 220
@@ -3251,7 +3251,7 @@ async def _search_global_batch(query, offset_rate, offset_peer, offset_id):
 
 
 async def fetch_search(update, context, query):
-    query = re.sub(r"\\s+", " ", (query or "").strip())
+    query = re.sub(r"\s+", " ", (query or "").strip())
     if not query:
         await update.message.reply_text("🔎 Please enter a keyword, for example: Logic mid")
         return
@@ -3262,8 +3262,8 @@ async def fetch_search(update, context, query):
     context.user_data["search_id"] = search_id
 
     status_msg = await update.message.reply_text(
-        f"🔎 Searching Telegram globally for: <b>{html.escape(query)}</b>\\n"
-        "🌐 Public results only • private/admin-only chats are excluded\\n"
+        f"🔎 Searching Telegram globally for: <b>{html.escape(query)}</b>\n"
+        "🌐 Public results only • private/admin-only chats are excluded\n"
         "⚡ Ranking results by query relevance",
         parse_mode=ParseMode.HTML,
     )
@@ -3409,7 +3409,7 @@ async def fetch_search(update, context, query):
 
         if not results:
             await status_msg.edit_text(
-                f"❌ No public Telegram results found for <b>{html.escape(query)}</b>.\\n\\n"
+                f"❌ No public Telegram results found for <b>{html.escape(query)}</b>.\n\n"
                 "Private/admin-only chats are intentionally excluded from global search.",
                 parse_mode=ParseMode.HTML,
             )
@@ -3447,7 +3447,7 @@ async def fetch_search(update, context, query):
     except Exception as e:
         print(f"[Search] Global public search failed: {type(e).__name__}: {e}")
         await status_msg.edit_text(
-            f"❌ Search failed: <code>{html.escape(type(e).__name__)}</code>\\n\\n"
+            f"❌ Search failed: <code>{html.escape(type(e).__name__)}</code>\n\n"
             f"{html.escape(str(e)[:700])}",
             parse_mode=ParseMode.HTML,
         )
