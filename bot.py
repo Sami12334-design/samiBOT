@@ -1085,8 +1085,8 @@ async def handle_photo_edit_selection(update, context, data):
         filter_name = "Original"
         description = "No changes applied."
     elif data == "edit_hd":
-        # Natural-looking HD enhancement: upscale, reduce noise, recover local
-        # contrast, and sharpen edges without aggressively inventing detail.
+        # High-clarity enhancement. Upscale first, then clean luminance noise,
+        # enhance local contrast, and sharpen fine detail while limiting halos.
         src = img.convert("RGB")
         max_dim = 5000
         scale = min(2.0, max_dim / max(src.size))
@@ -1097,26 +1097,27 @@ async def handle_photo_edit_selection(update, context, data):
 
         try:
             arr = np.asarray(src)
-            # Denoise gently in YCrCb so colour edges stay clean.
             ycrcb = cv2.cvtColor(arr, cv2.COLOR_RGB2YCrCb)
             y, cr, cb = cv2.split(ycrcb)
-            y = cv2.fastNlMeansDenoising(y, None, h=5, templateWindowSize=7, searchWindowSize=21)
-            # Adaptive local contrast, with restrained strength to avoid halos.
-            clahe = cv2.createCLAHE(clipLimit=1.6, tileGridSize=(8, 8))
+            # Noise reduction before contrast/sharpening prevents grain amplification.
+            y = cv2.fastNlMeansDenoising(
+                y, None, h=6, templateWindowSize=7, searchWindowSize=21
+            )
+            # Moderate adaptive contrast improves detail in shadows and highlights.
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
             y = clahe.apply(y)
             clean = cv2.cvtColor(cv2.merge((y, cr, cb)), cv2.COLOR_YCrCb2RGB)
             img = Image.fromarray(clean)
-        except (ImportError, AttributeError, cv2.error):
-            img = ImageOps.autocontrast(src, cutoff=0.5)
+        except (ImportError, AttributeError, cv2.error, ValueError):
+            img = ImageOps.autocontrast(src, cutoff=0.4)
 
-        # Mild tonal and colour tuning, followed by detail-aware sharpening.
-        img = ImageEnhance.Color(img).enhance(1.06)
-        img = ImageEnhance.Contrast(img).enhance(1.04)
-        img = ImageEnhance.Brightness(img).enhance(1.01)
-        img = img.filter(ImageFilter.UnsharpMask(radius=1.5, percent=115, threshold=3))
-        img = ImageEnhance.Sharpness(img).enhance(1.08)
+        # Two-pass, restrained sharpening: micro-contrast plus edge definition.
+        img = ImageEnhance.Color(img).enhance(1.04)
+        img = ImageEnhance.Contrast(img).enhance(1.05)
+        img = img.filter(ImageFilter.UnsharpMask(radius=1.2, percent=145, threshold=2))
+        img = img.filter(ImageFilter.UnsharpMask(radius=2.2, percent=65, threshold=4))
         filter_name = f"HD Pro • {nw}×{nh}"
-        description = "Enhanced resolution, gentle noise reduction, balanced local contrast, and natural edge sharpening."
+        description = "High-clarity upscale with luminance denoising, adaptive local contrast, and two-pass detail sharpening."
 
     elif data == "edit_vivid":
         img = ImageEnhance.Contrast(img).enhance(1.3)
