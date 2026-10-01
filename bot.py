@@ -1808,24 +1808,26 @@ async def handle_voice_to_text(update, context, language):
 VIDEO_MAX_UPLOAD = 50 * 1024 * 1024
 VIDEO_QUALITIES = [1080, 720, 480, 360, 240]
 PIPED_APIS = [
-    # Keep several independently hosted instances because public Piped
-    # instances can temporarily fail or be rate-limited.
-    "https://pipedapi.kavin.rocks",
-    "https://pipedapi.tokhmi.xyz",
-    "https://pipedapi.moomoo.me",
-    "https://pipedapi.syncpundit.io",
-    "https://api-piped.mha.fi",
-    "https://piped-api.garudalinux.org",
-    "https://pipedapi.rivo.lol",
-    "https://pipedapi.leptons.xyz",
-    "https://piped-api.lunar.icu",
-    "https://pipedapi.colinslegacy.com",
-    "https://yapi.vyper.me",
-    "https://piped-api.cfe.re",
-    "https://pipedapi.r4fo.com",
-    "https://piped-api.privacy.com.de",
-    "https://pipedapi.adminforge.de",
-    "https://api.piped.yt",
+    "https://pipedapi.kavin.rocks", "https://pipedapi.tokhmi.xyz",
+    "https://pipedapi.moomoo.me", "https://pipedapi.syncpundit.io",
+    "https://api-piped.mha.fi", "https://piped-api.garudalinux.org",
+    "https://pipedapi.rivo.lol", "https://pipedapi.leptons.xyz",
+    "https://piped-api.lunar.icu", "https://pipedapi.colinslegacy.com",
+    "https://yapi.vyper.me", "https://piped-api.cfe.re",
+    "https://pipedapi.r4fo.com", "https://piped-api.privacy.com.de",
+    "https://pipedapi.adminforge.de", "https://api.piped.yt",
+]
+PIPED_SSL_CONTEXT = __import__("ssl")._create_unverified_context()
+
+# Public instances from the maintained Invidious instance list.
+INVIDIOUS_APIS = [
+    "https://inv.nadeko.net", "https://invidious.nerdvpn.de",
+    "https://yt.chocolatemoo53.com", "https://invidious.tiekoetter.com",
+    "https://yewtu.be", "https://yt.artemislena.eu",
+    "https://invidious.flokinet.to", "https://invidious.privacydev.net",
+    "https://iv.melmac.space", "https://inv.tux.pizza",
+    "https://invidious.protokolla.fi", "https://invidious.private.coffee",
+    "https://yt.drgnz.club", "https://iv.datura.network",
 ]
 TIKWM_API = "https://www.tikwm.com/api/"
 
@@ -1995,7 +1997,7 @@ def piped_get_json(url: str):
             "Accept": "application/json,text/plain,*/*",
         },
     )
-    with urllib.request.urlopen(request, timeout=20) as response:
+    with urllib.request.urlopen(request, timeout=20, context=PIPED_SSL_CONTEXT) as response:
         return __import__("json").load(response)
 
 
@@ -2033,7 +2035,7 @@ def choose_piped_audio_stream(streams):
     return valid[0]
 
 
-def download_url_to_file(url: str, path: str, headers=None):
+def download_url_to_file(url: str, path: str, headers=None, ssl_context=None):
     request = urllib.request.Request(
         url,
         headers=headers or {
@@ -2041,7 +2043,8 @@ def download_url_to_file(url: str, path: str, headers=None):
             "Accept": "*/*",
         },
     )
-    with urllib.request.urlopen(request, timeout=30) as response, open(path, "wb") as dst:
+    opener = (urllib.request.urlopen(request, timeout=30, context=ssl_context) if ssl_context is not None else urllib.request.urlopen(request, timeout=30))
+    with opener as response, open(path, "wb") as dst:
         while True:
             chunk = response.read(1024 * 1024)
             if not chunk:
@@ -2076,7 +2079,7 @@ def download_from_piped(meta, output_dir: str, *, height=None, audio=False):
             raise RuntimeError("YouTube fallback has no audio stream")
         raw = os.path.join(output_dir, "audio.m4a")
         mp3 = os.path.join(output_dir, "audio.mp3")
-        download_url_to_file(stream["url"], raw)
+        download_url_to_file(stream["url"], raw, ssl_context=PIPED_SSL_CONTEXT)
         ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
         result = subprocess.run([
             ffmpeg, "-y", "-i", raw,
@@ -2091,7 +2094,7 @@ def download_from_piped(meta, output_dir: str, *, height=None, audio=False):
     if not stream:
         raise RuntimeError("YouTube fallback has no video stream")
     video_raw = os.path.join(output_dir, "video.bin")
-    download_url_to_file(stream["url"], video_raw)
+    download_url_to_file(stream["url"], video_raw, ssl_context=PIPED_SSL_CONTEXT)
     mime = (stream.get("mimeType") or "").lower()
     has_audio = not bool(stream.get("videoOnly")) or mime.startswith("video/mp4") and not stream.get("videoOnly")
     if has_audio:
@@ -2113,11 +2116,48 @@ def download_from_piped(meta, output_dir: str, *, height=None, audio=False):
         raise RuntimeError("YouTube fallback video is video-only and no audio stream was found")
     audio_raw = os.path.join(output_dir, "audio.bin")
     final = os.path.join(output_dir, "video.mp4")
-    download_url_to_file(audio_stream["url"], audio_raw)
+    download_url_to_file(audio_stream["url"], audio_raw, ssl_context=PIPED_SSL_CONTEXT)
     ffmpeg_merge(video_raw, audio_raw, final)
     os.unlink(video_raw)
     os.unlink(audio_raw)
     return {"path": final, "title": title}
+
+
+def invidious_get_json(url: str):
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,*/*"})
+    with urllib.request.urlopen(request, timeout=20, context=PIPED_SSL_CONTEXT) as response:
+        return __import__("json").load(response)
+
+
+def invidious_metadata(video_id: str):
+    errors = []
+    for api in INVIDIOUS_APIS:
+        try:
+            data = invidious_get_json(f"{api}/api/v1/videos/{urllib.parse.quote(video_id)}?hl=en")
+            if data.get("videoId") and (data.get("formatStreams") or data.get("adaptiveFormats")):
+                return data, api
+            errors.append(f"{api}: no streams")
+        except Exception as exc:
+            errors.append(f"{api}: {exc}")
+    raise RuntimeError("All YouTube fallback services failed: " + " | ".join(errors[:8]))
+
+
+def invidious_to_piped_meta(meta):
+    videos, audios = [], []
+    for s in (meta.get("formatStreams") or []):
+        q = s.get("qualityLabel") or ""
+        m = re.search(r"(\d+)", str(q))
+        if s.get("url") and m:
+            videos.append({"url": s["url"], "height": int(m.group(1)), "videoOnly": False, "mimeType": s.get("type") or ""})
+    for s in (meta.get("adaptiveFormats") or []):
+        typ = (s.get("type") or "").lower()
+        q = s.get("qualityLabel") or s.get("resolution") or ""
+        m = re.search(r"(\d+)", str(q))
+        if s.get("url") and "video/" in typ and m:
+            videos.append({"url": s["url"], "height": int(m.group(1)), "videoOnly": True, "mimeType": typ})
+        elif s.get("url") and "audio/" in typ:
+            audios.append({"url": s["url"], "bitrate": s.get("bitrate") or 0, "mimeType": typ})
+    return {"title": meta.get("title") or "YouTube video", "videoStreams": videos, "audioStreams": audios}
 
 
 def tikwm_get_data(url: str):
@@ -2181,12 +2221,20 @@ def extract_download_options(url: str):
             vid = youtube_video_id(normalized)
             if not vid:
                 raise RuntimeError(f"YouTube extraction failed: {first_error}")
-            piped = piped_metadata(vid)
-            heights = sorted({int(s.get("height")) for s in piped.get("videoStreams") or [] if s.get("height")}, reverse=True)
+            try:
+                piped = piped_metadata(vid)
+                source = "piped"
+                fallback_meta = piped
+            except Exception:
+                inv, inv_api = invidious_metadata(vid)
+                source = "invidious"
+                fallback_meta = invidious_to_piped_meta(inv)
+                fallback_meta["_invidious_api"] = inv_api
+            heights = sorted({int(s.get("height")) for s in fallback_meta.get("videoStreams") or [] if s.get("height")}, reverse=True)
             qualities = [q for q in VIDEO_QUALITIES if any(h >= q for h in heights)]
             if not qualities and heights:
                 qualities = [max(heights)]
-            return {"source": "piped", "platform": platform, "url": normalized, "title": piped.get("title") or "YouTube video", "qualities": qualities or [720], "audio": bool(piped.get("audioStreams")), "piped": piped}
+            return {"source": source, "platform": platform, "url": normalized, "title": fallback_meta.get("title") or "YouTube video", "qualities": qualities or [720], "audio": bool(fallback_meta.get("audioStreams")), "piped": fallback_meta}
         if platform == "tiktok":
             data = tikwm_get_data(normalized)
             qualities = []
@@ -2299,7 +2347,7 @@ async def handle_video_callback(update, context, data):
         def do_download():
             if job["source"] == "ytdlp":
                 return ytdlp_download(job["url"], output_dir, height=quality, audio=audio, title_hint=job.get("title", "video"))
-            if job["source"] == "piped":
+            if job["source"] in {"piped", "invidious"}:
                 return download_from_piped(job["piped"], output_dir, height=quality, audio=audio)
             if job["source"] == "tikwm":
                 return tikwm_download(job["url"], output_dir, quality=quality, audio=audio)
@@ -2358,7 +2406,7 @@ async def handle_video_callback(update, context, data):
 def do_download_for_quality(job, output_dir, quality):
     if job["source"] == "ytdlp":
         return ytdlp_download(job["url"], output_dir, height=quality, audio=False, title_hint=job.get("title", "video"))
-    if job["source"] == "piped":
+    if job["source"] in {"piped", "invidious"}:
         return download_from_piped(job["piped"], output_dir, height=quality, audio=False)
     if job["source"] == "tikwm":
         return tikwm_download(job["url"], output_dir, quality="hd" if quality >= 720 else "sd", audio=False)
