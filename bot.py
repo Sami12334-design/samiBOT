@@ -3207,7 +3207,7 @@ def _search_relevance_score(query, entity, message):
         if token in content:
             matched += 1
             score += 180
-            if re.search(r"\b" + re.escape(token) + r"\\b", content):
+            if re.search(r"\b" + re.escape(token) + r"\b", content):
                 score += 100
         if token in title:
             score += 220
