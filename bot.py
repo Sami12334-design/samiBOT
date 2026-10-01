@@ -1929,14 +1929,14 @@ def ytdlp_base_options():
                 options["js_runtimes"] = {runtime_name: {"path": runtime_path}}
                 break
 
-    # Prefer clients that currently avoid the GVS PO-token requirement.
-    # web_embedded is useful for videos that permit embedding; web_safari can
-    # expose HLS formats when normal GVS formats are blocked.
-    options["extractor_args"] = {
-        "youtube": {
-            "player_client": ["android_vr", "web_embedded", "web_safari"]
-        }
-    }
+    # IMPORTANT: Do not force a hard-coded YouTube player client here.
+    # Current yt-dlp has its own adaptive client strategy (currently starting
+    # with visionos/web) and may add fallbacks based on the video's state.
+    # Forcing old clients was the direct cause of the repeated
+    # "Failed to extract any player response" errors in this bot.
+    # Client-specific fallbacks are handled in extract_ytdlp_info/ytdlp_download
+    # only after yt-dlp's native default strategy has had a chance.
+    options["extractor_retries"] = 1
 
     cookies = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
     if cookies and os.path.isfile(cookies):
@@ -1947,13 +1947,20 @@ def ytdlp_base_options():
 
 
 def extract_ytdlp_info(url: str):
-    # YouTube changes which Innertube client is usable. Try each independently
-    # instead of combining clients into one request configuration.
-    clients = ["android_vr", "web_embedded", "web_safari", "tv", "default"]
+    # First let the installed yt-dlp use its CURRENT native YouTube strategy.
+    # This is important: recent yt-dlp versions dynamically choose clients
+    # (currently visionos/web) and add fallbacks based on playability.
+    #
+    # Only if that native strategy fails do we try a small set of known
+    # no-PO-token / fallback clients. android_vr is intentionally NOT forced:
+    # current yt-dlp marks its GVS formats as PO-token-sensitive.
+    clients = ["default", "tv", "web_embedded", "tv_simply"]
     errors = []
+
     for client in clients:
         opts = ytdlp_base_options()
-        opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+        if client != "default":
+            opts["extractor_args"] = {"youtube": {"player_client": [client]}}
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -1962,7 +1969,8 @@ def extract_ytdlp_info(url: str):
                 return info
         except Exception as exc:
             errors.append(f"{client}: {exc}")
-    raise RuntimeError("YouTube yt-dlp clients failed: " + " | ".join(errors[-5:]))
+
+    raise RuntimeError("YouTube yt-dlp clients failed: " + " | ".join(errors[-4:]))
 
 
 def build_ytdlp_format(height=None, audio=False, platform="unknown"):
@@ -1980,12 +1988,15 @@ def build_ytdlp_format(height=None, audio=False, platform="unknown"):
 
 def ytdlp_download(url: str, output_dir: str, *, height=None, audio=False, title_hint="video"):
     platform = video_platform(url)
-    clients = ["android_vr", "web_embedded", "web_safari", "tv", "default"] if platform == "youtube" else [None]
+    # Native/default strategy first. The old implementation started with
+    # android_vr/web_embedded/web_safari, which is exactly the pattern that is
+    # now failing on the user's Render deployment.
+    clients = ["default", "tv", "web_embedded", "tv_simply"] if platform == "youtube" else [None]
     errors = []
     for client in clients:
         try:
             opts = ytdlp_base_options()
-            if client:
+            if client and client != "default":
                 opts["extractor_args"] = {"youtube": {"player_client": [client]}}
             opts.update({
                 "format": build_ytdlp_format(height, audio, platform),
@@ -2029,7 +2040,7 @@ def ytdlp_download(url: str, output_dir: str, *, height=None, audio=False, title
     raise RuntimeError("All YouTube yt-dlp clients failed: " + " | ".join(errors[-5:]))
 
 
-def piped_get_json(url: str):
+def piped_get_json(url: str, timeout=8):
     request = urllib.request.Request(
         url,
         headers={
@@ -2037,21 +2048,46 @@ def piped_get_json(url: str):
             "Accept": "application/json,text/plain,*/*",
         },
     )
-    with urllib.request.urlopen(request, timeout=20, context=PIPED_SSL_CONTEXT) as response:
+    with urllib.request.urlopen(request, timeout=timeout, context=PIPED_SSL_CONTEXT) as response:
         return __import__("json").load(response)
 
 
-def piped_metadata(video_id: str):
+def _parallel_first_json(urls, loader, label):
+    """Try independent public YouTube APIs concurrently and stop waiting once one works."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     errors = []
-    for api in PIPED_APIS:
-        try:
-            data = piped_get_json(f"{api}/streams/{urllib.parse.quote(video_id)}")
-            if data.get("videoStreams") or data.get("audioStreams"):
-                return data
-            errors.append(f"{api}: no streams")
-        except Exception as exc:
-            errors.append(f"{api}: {exc}")
-    raise RuntimeError("All YouTube fallback services failed: " + " | ".join(errors[:3]))
+    # Keep concurrency deliberately small: this is a fallback, not a flooder.
+    with ThreadPoolExecutor(max_workers=min(4, len(urls))) as pool:
+        futures = {pool.submit(loader, url): url for url in urls}
+        for future in as_completed(futures):
+            api = futures[future]
+            try:
+                data = future.result()
+                if data:
+                    return data, api
+                errors.append(f"{api}: empty response")
+            except Exception as exc:
+                errors.append(f"{api}: {exc}")
+    raise RuntimeError(
+        f"All {label} fallback services failed: " + " | ".join(errors[:8])
+    )
+
+
+def piped_metadata(video_id: str):
+    urls = [
+        f"{api}/streams/{urllib.parse.quote(video_id)}"
+        for api in PIPED_APIS[:8]
+    ]
+
+    def load(url):
+        data = piped_get_json(url, timeout=8)
+        if not (data.get("videoStreams") or data.get("audioStreams")):
+            raise RuntimeError("no streams")
+        return data
+
+    data, _api = _parallel_first_json(urls, load, "Piped")
+    return data
 
 
 def choose_piped_video_stream(streams, target_height):
@@ -2163,23 +2199,28 @@ def download_from_piped(meta, output_dir: str, *, height=None, audio=False):
     return {"path": final, "title": title}
 
 
-def invidious_get_json(url: str):
-    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,*/*"})
-    with urllib.request.urlopen(request, timeout=20, context=PIPED_SSL_CONTEXT) as response:
+def invidious_get_json(url: str, timeout=8):
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,*/*"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout, context=PIPED_SSL_CONTEXT) as response:
         return __import__("json").load(response)
 
 
 def invidious_metadata(video_id: str):
-    errors = []
-    for api in INVIDIOUS_APIS:
-        try:
-            data = invidious_get_json(f"{api}/api/v1/videos/{urllib.parse.quote(video_id)}?hl=en")
-            if data.get("videoId") and (data.get("formatStreams") or data.get("adaptiveFormats")):
-                return data, api
-            errors.append(f"{api}: no streams")
-        except Exception as exc:
-            errors.append(f"{api}: {exc}")
-    raise RuntimeError("All YouTube fallback services failed: " + " | ".join(errors[:8]))
+    urls = [
+        f"{api}/api/v1/videos/{urllib.parse.quote(video_id)}?hl=en"
+        for api in INVIDIOUS_APIS[:8]
+    ]
+
+    def load(url):
+        data = invidious_get_json(url, timeout=8)
+        if not (data.get("videoId") and (data.get("formatStreams") or data.get("adaptiveFormats"))):
+            raise RuntimeError("no streams")
+        return data
+
+    return _parallel_first_json(urls, load, "Invidious")
 
 
 def invidious_to_piped_meta(meta):
