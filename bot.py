@@ -3994,6 +3994,8 @@ async def fetch_search(update, context, query):
 def _search_filter_match(item, filter_type):
     if filter_type == "all":
         return True
+    if filter_type == "exact":
+        return True
     if filter_type == "messages":
         return item.get("kind") == "message"
     if filter_type == "photos":
