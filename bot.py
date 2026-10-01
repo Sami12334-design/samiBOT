@@ -5030,14 +5030,26 @@ def _common_group_name(chat):
     return (getattr(chat, "title", None) or "Unnamed group").strip()
 
 
-def _common_group_link(chat):
-    """Return a safe clickable Telegram link without creating/inventing invites."""
+async def _common_group_link(chat):
+    """Return a real link; private groups use a recent message deep-link."""
     username = (getattr(chat, "username", None) or "").strip().lstrip("@")
     if username:
         return f"https://t.me/{username}"
-    marked = _common_group_marked_id(chat)
-    if marked is not None:
-        return f"tg://openmessage?chat_id={marked}"
+
+    # Telegram does not expose a universal HTTP URL for a private group
+    # without a username. If the connected account can read the group, a
+    # tg://openmessage link can open it when paired with a real message ID.
+    try:
+        latest = await asyncio.wait_for(
+            telethon_client.get_messages(chat, limit=1),
+            timeout=4,
+        )
+        message_id = int(getattr(latest, "id", 0) or 0)
+        chat_id = int(getattr(chat, "id", 0) or 0)
+        if message_id and chat_id:
+            return f"tg://openmessage?chat_id={chat_id}&message_id={message_id}"
+    except Exception:
+        pass
     return None
 
 
@@ -5298,7 +5310,7 @@ async def show_common_groups(update, context, page=0):
     else:
         for index, chat in enumerate(shown, start=start + 1):
             title = html.escape(_common_group_name(chat))
-            link = _common_group_link(chat)
+            link = await _common_group_link(chat)
             if link:
                 lines.append(
                     f'{index}. <a href="{html.escape(link, quote=True)}">👥 {title}</a>'
