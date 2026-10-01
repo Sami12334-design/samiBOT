@@ -6151,7 +6151,7 @@ async def main():
     bot_app.add_handler(CommandHandler("setphoto", set_bot_photo))
     bot_app.add_handler(CommandHandler("restart", restart_command))
     bot_app.add_handler(CallbackQueryHandler(menu_callback))
-    bot_app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, safety_group_monitor), group=0)
+    bot_app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, safety_group_monitor), group=-1)
     async def photo_router(update, context):
         if context.user_data.get('state') == 'qr_scan':
             await handle_qr_photo(update, context); return
