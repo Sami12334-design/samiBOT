@@ -2714,6 +2714,13 @@ async def fetch_profile(update, context, target):
         context.user_data["profile_entity"] = entity
         context.user_data["post_entity"] = entity
         context.user_data["story_entity"] = entity
+
+        # Profile visits are tracked only when the lookup target is one of the
+        # configured admins. This is a bot-level visit metric, not a Telegram
+        # profile-view API (Telegram does not expose arbitrary profile viewers).
+        if is_admin(int(getattr(entity, "id", 0) or 0)):
+            record_profile_visit(entity.id, update.effective_user)
+
         save_user_history(entity.id, getattr(entity, "username", None), getattr(entity, "first_name", ""), getattr(entity, "last_name", ""))
 
         first_name = getattr(entity, "first_name", "") or ""
@@ -2790,6 +2797,338 @@ async def fetch_profile(update, context, target):
 
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {type(e).__name__}: {e}")
+
+
+
+async def show_profile_visitors(update, context):
+    query = update.callback_query
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await query.answer("🔒 Admin only", show_alert=True)
+        return
+    await query.answer("Loading profile visitors…")
+    rows = get_profile_visits(user_id)
+    if not rows:
+        text = (
+            "👀 <b>WHO VISITED MY PROFILE</b>\n\n"
+            "No visits have been recorded through the bot yet.\n\n"
+            "<i>This tracks users who open your Telegram profile through this bot's Profile lookup. "
+            "Telegram itself does not provide a general profile-viewer list.</i>"
+        )
+    else:
+        lines = [
+            "👀 <b>WHO VISITED MY PROFILE</b>",
+            "",
+            f"Total unique visitors: <b>{len(rows)}</b>",
+            "",
+        ]
+        for idx, (visitor_id, username, first_name, last_name, first_seen, last_seen, count) in enumerate(rows, 1):
+            name = f"{first_name or ''} {last_name or ''}".strip() or "Unknown user"
+            handle = f"@{username}" if username else f"ID {visitor_id}"
+            lines.append(
+                f"<b>{idx}.</b> {html.escape(name)} — {html.escape(handle)}\n"
+                f"🕒 Last visit: {html.escape(str(last_seen))} • Visits: {count}"
+            )
+        lines.append("")
+        lines.append("<i>Only visits made through this bot's Profile lookup are recorded.</i>")
+        text = "\n".join(lines)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh", callback_data="profile_visitors")],
+        [InlineKeyboardButton("📖 Who Viewed My Stories", callback_data="story_viewers")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="more")],
+    ])
+    try:
+        await query.edit_message_text(text[:4096], parse_mode=ParseMode.HTML, reply_markup=kb)
+    except Exception:
+        await query.message.reply_text(text[:4096], parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+def _story_reaction_text(reaction):
+    if reaction is None:
+        return ""
+    emoticon = getattr(reaction, "emoticon", None)
+    if emoticon:
+        return str(emoticon)
+    document_id = getattr(reaction, "document_id", None)
+    if document_id:
+        return f"custom emoji {document_id}"
+    return "reaction"
+
+
+def _story_view_user_name(user):
+    if user is None:
+        return "Unknown user"
+    first = getattr(user, "first_name", None) or ""
+    last = getattr(user, "last_name", None) or ""
+    name = f"{first} {last}".strip()
+    username = getattr(user, "username", None)
+    if username:
+        return f"{name or 'User'} (@{username})"
+    return name or f"User {getattr(user, 'id', 'unknown')}"
+
+
+def _story_view_time(value):
+    if value is None:
+        return "Unknown time"
+    try:
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(value).strftime("%d %b %Y • %H:%M:%S")
+        return value.strftime("%d %b %Y • %H:%M:%S")
+    except Exception:
+        return str(value)
+
+
+async def _load_owned_story_posts():
+    """Load the connected Telegram account's active + archived stories."""
+    me = await telethon_client.get_me()
+    if me is None:
+        return []
+
+    stories = []
+    if GetPeerStoriesRequest is not None:
+        try:
+            active = await telethon_client(GetPeerStoriesRequest(peer=me))
+            stories.extend(_story_items_from_result(active))
+        except Exception as e:
+            print(f"[Story viewers] Active story fetch skipped: {type(e).__name__}: {e}")
+
+    if GetStoriesArchiveRequest is not None:
+        offset_id = 0
+        for _ in range(20):
+            try:
+                archived = await telethon_client(
+                    GetStoriesArchiveRequest(peer=me, offset_id=offset_id, limit=100)
+                )
+            except Exception as e:
+                print(f"[Story viewers] Archive fetch stopped: {type(e).__name__}: {e}")
+                break
+            batch = _story_items_from_result(archived)
+            if not batch:
+                break
+            stories.extend(batch)
+            ids = [int(getattr(item, "id", 0) or 0) for item in batch]
+            oldest = min([x for x in ids if x > 0], default=0)
+            if not oldest or oldest == offset_id:
+                break
+            offset_id = oldest
+
+    unique = {}
+    for story in stories:
+        story_id = getattr(story, "id", None)
+        if story_id is None or getattr(story, "deleted", False):
+            continue
+        unique[int(story_id)] = story
+    return sorted(unique.values(), key=_story_sort_key, reverse=True)
+
+
+async def _load_all_story_viewers(peer, story_id):
+    """Fetch every available viewer/reaction page for one owned story."""
+    if GetStoryViewsListRequest is None:
+        raise RuntimeError("This Telethon installation has no story viewer-list support.")
+
+    viewers = []
+    users_by_id = {}
+    offset = ""
+    last_offset = None
+
+    for _ in range(100):
+        result = await telethon_client(
+            GetStoryViewsListRequest(
+                peer=peer,
+                id=int(story_id),
+                offset=offset,
+                limit=100,
+            )
+        )
+        for user in list(getattr(result, "users", []) or []):
+            uid = getattr(user, "id", None)
+            if uid is not None:
+                users_by_id[int(uid)] = user
+
+        batch = list(getattr(result, "views", []) or [])
+        viewers.extend(batch)
+        next_offset = getattr(result, "next_offset", None)
+        if not next_offset or next_offset == last_offset or not batch:
+            break
+        last_offset = next_offset
+        offset = str(next_offset)
+
+    # Keep one record per user, preferring the newest interaction.
+    merged = {}
+    for view in viewers:
+        uid = getattr(view, "user_id", None)
+        if uid is None:
+            continue
+        key = int(uid)
+        existing = merged.get(key)
+        current_date = getattr(view, "date", 0) or 0
+        existing_date = getattr(existing, "date", 0) or 0 if existing else 0
+        if existing is None or current_date >= existing_date:
+            merged[key] = view
+
+    ordered = list(merged.values())
+    ordered.sort(key=lambda item: getattr(item, "date", 0) or 0, reverse=True)
+    return ordered, users_by_id
+
+
+def _story_viewer_text(story, index, total, viewers, users_by_id):
+    story_date = getattr(story, "date", None)
+    expire_date = getattr(story, "expire_date", None)
+    header = f"📖 <b>STORY {index + 1}/{total}</b> • ID {getattr(story, 'id', '?')}"
+    if story_date:
+        header += f"\n🕒 Posted: {_story_view_time(story_date)}"
+    if expire_date:
+        header += f"\n⌛ Expires: {_story_view_time(expire_date)}"
+    caption = str(getattr(story, "caption", None) or "").strip()
+    if caption:
+        header += f"\n\n📝 {html.escape(caption[:800])}"
+
+    if not viewers:
+        return header + "\n\n👁 <b>Viewers: 0</b>\n\nNo viewer records are currently available for this story."
+
+    lines = [header, "", f"👁 <b>Viewers: {len(viewers)}</b>", ""]
+    for idx, view in enumerate(viewers, 1):
+        user = users_by_id.get(int(getattr(view, "user_id", 0) or 0))
+        name = html.escape(_story_view_user_name(user))
+        when = html.escape(_story_view_time(getattr(view, "date", None)))
+        reaction = _story_reaction_text(getattr(view, "reaction", None))
+        reaction_text = f" • ❤️ {html.escape(reaction)}" if reaction else ""
+        lines.append(f"<b>{idx}.</b> {name}\n🕒 {when}{reaction_text}")
+    return "\n".join(lines)
+
+
+async def _delete_story_viewer_messages(context, chat_id):
+    message_ids = context.user_data.pop("story_viewer_message_ids", [])
+    for message_id in message_ids:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception:
+            pass
+
+
+async def show_story_viewers(update, context, index=0):
+    query = update.callback_query
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await query.answer("🔒 Admin only", show_alert=True)
+        return
+
+    await query.answer("Loading story viewers…")
+    lock = context.user_data.get("story_viewers_lock")
+    if lock is None:
+        lock = asyncio.Lock()
+        context.user_data["story_viewers_lock"] = lock
+
+    async with lock:
+        try:
+            stories = context.user_data.get("admin_story_posts")
+            if stories is None:
+                stories = await _load_owned_story_posts()
+                context.user_data["admin_story_posts"] = stories
+
+            if not stories:
+                await query.edit_message_text(
+                    "📖 <b>WHO VIEWED MY STORIES</b>\n\n"
+                    "No active or archived stories are available for the connected Telegram account.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 Refresh", callback_data="story_viewers_refresh")],
+                        [InlineKeyboardButton("⬅️ Back", callback_data="profile_visitors")],
+                    ]),
+                )
+                return
+
+            index = max(0, min(int(index), len(stories) - 1))
+            story = stories[index]
+            peer = await telethon_client.get_input_entity(await telethon_client.get_me())
+            viewers, users_by_id = await _load_all_story_viewers(peer, getattr(story, "id", 0))
+
+            await _delete_story_viewer_messages(context, query.message.chat_id)
+
+            # The media is sent separately so the viewer list can contain the
+            # full result set without hitting media-caption limits.
+            sent_ids = []
+            media_path = None
+            try:
+                media = getattr(story, "media", None)
+                if media is not None:
+                    media_path = tempfile.NamedTemporaryFile(delete=False, suffix=".bin").name
+                    await telethon_client.download_media(media, file=media_path)
+                    if os.path.exists(media_path) and os.path.getsize(media_path) > 0:
+                        media_doc = getattr(media, "document", None)
+                        mime = str(getattr(media_doc, "mime_type", "") or "").lower()
+                        caption = f"📖 Story {index + 1}/{len(stories)} • {getattr(story, 'id', '?')}"
+                        with open(media_path, "rb") as media_file:
+                            if getattr(media, "photo", None) is not None:
+                                sent = await context.bot.send_photo(query.message.chat_id, photo=media_file, caption=caption)
+                            elif "video" in mime or getattr(media, "video", None) is not None:
+                                sent = await context.bot.send_video(query.message.chat_id, video=media_file, caption=caption, supports_streaming=True)
+                            elif "gif" in mime or getattr(media, "gif", None) is not None:
+                                sent = await context.bot.send_animation(query.message.chat_id, animation=media_file, caption=caption)
+                            else:
+                                sent = await context.bot.send_document(query.message.chat_id, document=media_file, caption=caption)
+                        sent_ids.append(sent.message_id)
+            except Exception as media_error:
+                print(f"[Story viewers] Media send failed: {type(media_error).__name__}: {media_error}")
+            finally:
+                if media_path:
+                    try:
+                        os.remove(media_path)
+                    except Exception:
+                        pass
+
+            full_text = _story_viewer_text(story, index, len(stories), viewers, users_by_id)
+            # Telegram text messages are limited to 4096 characters, so split
+            # the complete viewer list into chunks while keeping navigation on
+            # the final chunk.
+            chunks = []
+            while len(full_text) > 4096:
+                cut = full_text.rfind("\n", 0, 3900)
+                if cut < 100:
+                    cut = 3900
+                chunks.append(full_text[:cut])
+                full_text = full_text[cut:].lstrip()
+            chunks.append(full_text)
+
+            for chunk in chunks:
+                sent = await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text=chunk,
+                    parse_mode=ParseMode.HTML,
+                )
+                sent_ids.append(sent.message_id)
+
+            controls = []
+            nav = []
+            if index > 0:
+                nav.append(InlineKeyboardButton("⬅️ Back Story", callback_data=f"admin_story_{index - 1}"))
+            if index < len(stories) - 1:
+                nav.append(InlineKeyboardButton("Next Story ➡️", callback_data=f"admin_story_{index + 1}"))
+            if nav:
+                controls.append(nav)
+            controls.append([
+                InlineKeyboardButton("🔄 Refresh Story", callback_data="story_viewers_refresh"),
+                InlineKeyboardButton("👀 Profile Visitors", callback_data="profile_visitors"),
+            ])
+            controls.append([InlineKeyboardButton("⬅️ Admin Menu", callback_data="more")])
+            control_msg = await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="⬆️ <b>Story viewer controls</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(controls),
+            )
+            sent_ids.append(control_msg.message_id)
+            context.user_data["story_viewer_message_ids"] = sent_ids
+            context.user_data["admin_story_index"] = index
+
+        except FloodWaitError as e:
+            await query.message.reply_text(f"⏳ Telegram rate limit. Please try again in {e.seconds} seconds.")
+        except Exception as e:
+            print(f"[Story viewers] Failed: {type(e).__name__}: {e}")
+            await query.message.reply_text(
+                f"❌ Could not load story viewers: {type(e).__name__}",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="profile_visitors")]])
+            )
 
 
 def _story_items_from_result(result):
