@@ -1935,9 +1935,22 @@ def ytdlp_base_options():
 
 
 def extract_ytdlp_info(url: str):
-    opts = ytdlp_base_options()
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
+    # YouTube changes which Innertube client is usable. Try each independently
+    # instead of combining clients into one request configuration.
+    clients = ["android_vr", "tv_simply", "default", "web_safari", "mweb"]
+    errors = []
+    for client in clients:
+        opts = ytdlp_base_options()
+        opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            if info:
+                info["__sami_youtube_client"] = client
+                return info
+        except Exception as exc:
+            errors.append(f"{client}: {exc}")
+    raise RuntimeError("YouTube yt-dlp clients failed: " + " | ".join(errors[-5:]))
 
 
 def build_ytdlp_format(height=None, audio=False, platform="unknown"):
@@ -1955,38 +1968,53 @@ def build_ytdlp_format(height=None, audio=False, platform="unknown"):
 
 def ytdlp_download(url: str, output_dir: str, *, height=None, audio=False, title_hint="video"):
     platform = video_platform(url)
-    opts = ytdlp_base_options()
-    opts.update({
-        "format": build_ytdlp_format(height, audio, platform),
-        "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
-        "merge_output_format": "mp4",
-        "overwrites": True,
-    })
-    if audio:
-        opts["postprocessors"] = [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }]
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filepath = ydl.prepare_filename(info)
-        if audio:
-            base, _ = os.path.splitext(filepath)
-            mp3_path = base + ".mp3"
-            if os.path.exists(mp3_path):
-                filepath = mp3_path
-        else:
-            # yt-dlp can change extension after merge/postprocessing.
-            if not os.path.exists(filepath):
-                stem = os.path.splitext(filepath)[0]
-                for ext in (".mp4", ".mkv", ".webm", ".mov"):
-                    if os.path.exists(stem + ext):
-                        filepath = stem + ext
-                        break
-        if not os.path.isfile(filepath):
-            raise FileNotFoundError(f"Downloaded file was not created: {title_hint}")
-        return {"path": filepath, "title": info.get("title") or title_hint, "info": info}
+    clients = ["android_vr", "tv_simply", "default", "web_safari", "mweb"] if platform == "youtube" else [None]
+    errors = []
+    for client in clients:
+        try:
+            opts = ytdlp_base_options()
+            if client:
+                opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+            opts.update({
+                "format": build_ytdlp_format(height, audio, platform),
+                "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
+                "merge_output_format": "mp4",
+                "overwrites": True,
+            })
+            if audio:
+                opts["postprocessors"] = [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }]
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filepath = ydl.prepare_filename(info)
+                if audio:
+                    base, _ = os.path.splitext(filepath)
+                    mp3_path = base + ".mp3"
+                    if os.path.exists(mp3_path):
+                        filepath = mp3_path
+                elif not os.path.exists(filepath):
+                    stem = os.path.splitext(filepath)[0]
+                    for ext in (".mp4", ".mkv", ".webm", ".mov"):
+                        if os.path.exists(stem + ext):
+                            filepath = stem + ext
+                            break
+                if not os.path.isfile(filepath):
+                    raise FileNotFoundError(f"Downloaded file was not created: {title_hint}")
+                return {"path": filepath, "title": info.get("title") or title_hint, "info": info}
+        except Exception as exc:
+            errors.append(f"{client or 'default'}: {exc}")
+            # Remove partial output before trying the next YouTube client.
+            for name in os.listdir(output_dir):
+                path = os.path.join(output_dir, name)
+                if os.path.isfile(path):
+                    try:
+                        os.unlink(path)
+                    except Exception:
+                        pass
+    raise RuntimeError("All YouTube yt-dlp clients failed: " + " | ".join(errors[-5:]))
 
 
 def piped_get_json(url: str):
