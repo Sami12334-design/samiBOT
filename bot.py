@@ -2053,22 +2053,38 @@ def piped_get_json(url: str, timeout=8):
 
 
 def _parallel_first_json(urls, loader, label):
-    """Try independent public YouTube APIs concurrently and stop waiting once one works."""
+    """Try independent public YouTube APIs concurrently without waiting on losers."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     errors = []
     # Keep concurrency deliberately small: this is a fallback, not a flooder.
-    with ThreadPoolExecutor(max_workers=min(4, len(urls))) as pool:
-        futures = {pool.submit(loader, url): url for url in urls}
+    pool = ThreadPoolExecutor(max_workers=min(4, len(urls)))
+    futures = {pool.submit(loader, url): url for url in urls}
+    try:
         for future in as_completed(futures):
             api = futures[future]
             try:
                 data = future.result()
                 if data:
+                    # Do not wait for broken/slow fallback hosts after we have
+                    # a usable response. Their worker threads are daemonized by
+                    # the executor implementation and can finish in the background.
+                    for pending in futures:
+                        if not pending.done():
+                            pending.cancel()
+                    pool.shutdown(wait=False, cancel_futures=True)
                     return data, api
                 errors.append(f"{api}: empty response")
             except Exception as exc:
                 errors.append(f"{api}: {exc}")
+    finally:
+        # At this point either all tasks finished or the successful path has
+        # already shut the pool down. Avoid blocking the bot on dead hosts.
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
     raise RuntimeError(
         f"All {label} fallback services failed: " + " | ".join(errors[:8])
     )
