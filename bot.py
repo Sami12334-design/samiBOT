@@ -4074,6 +4074,37 @@ def _search_filter_buttons(results, active, query):
     return rows, counts
 
 
+def _search_highlight_html(message, query, limit=240):
+    raw = " ".join((getattr(message, "message", None) or "").split()).strip()
+    if not raw:
+        raw = _search_content(message)
+    if not raw:
+        return ""
+    normalized = " ".join((query or "").strip().lower().split())
+    low = raw.lower()
+    pos = low.find(normalized) if normalized else -1
+    match_text = normalized
+    if pos < 0:
+        for token in normalized.split():
+            p = low.find(token)
+            if p >= 0:
+                pos = p
+                match_text = token
+                break
+    if len(raw) > limit:
+        if pos > 0:
+            start = max(0, pos - 80)
+            raw = ("…" if start > 0 else "") + raw[start:start + limit] + ("…" if start + limit < len(raw) else "")
+        else:
+            raw = raw[:limit] + "…"
+        low = raw.lower()
+        pos = low.find(match_text) if match_text else -1
+    if pos < 0:
+        return html.escape(raw)
+    end = pos + len(match_text)
+    return html.escape(raw[:pos]) + "<b>" + html.escape(raw[pos:end]) + "</b>" + html.escape(raw[end:])
+
+
 async def display_search_page(update, context, page, filter_type=None):
     callback = update.callback_query
     if callback:
@@ -4105,10 +4136,8 @@ async def display_search_page(update, context, page, filter_type=None):
     joined_hidden = context.user_data.get("search_joined_hidden", 0)
 
     lines = [
-        "<blockquote>",
-        "<b>🌐 GLOBAL TELEGRAM SEARCH</b>",
-        f"🔎 <b>{html.escape(search_query)}</b>",
-        f"⚡ {elapsed}s • hidden joined results: {joined_hidden}",
+        "<b>🌍 TELEGRAM GLOBAL SEARCH</b>",
+        f"🔎 <code>{html.escape(search_query)}</code>",
         "",
     ]
 
@@ -4125,22 +4154,22 @@ async def display_search_page(update, context, page, filter_type=None):
                 "channel": "📢", "group": "👥", "user": "👤", "text": "💬",
             }.get(item.get("type"), "🔹")
 
-            content = html.escape(item.get("content") or "")
-            if len(content) > 180:
-                content = content[:177] + "..."
-
             if item.get("link"):
-                lines.append(
-                    f"<b>{index}.</b> {icon} <a href=\"{html.escape(item['link'], quote=True)}\">"
-                    f"{peer_name}{username_text}</a>\n{content}\n"
-                )
+                title_html = f'<a href="{html.escape(item["link"], quote=True)}"><b>{peer_name}{username_text}</b></a>'
             else:
-                lines.append(
-                    f"<b>{index}.</b> {icon} <b>{peer_name}{username_text}</b>\n{content}\n"
-                )
+                title_html = f"<b>{peer_name}{username_text}</b>"
+            lines.append(f"<b>{index}.</b> {icon} {title_html}")
+            if item.get("kind") == "message":
+                snippet = _search_highlight_html(item.get("message"), search_query)
+                if not snippet:
+                    snippet = html.escape(item.get("content") or "")
+                if snippet:
+                    lines.append(f"   {snippet}")
+            elif item.get("content"):
+                lines.append(f"   {html.escape(item['content'])}")
+            lines.append("")
 
     lines.append(f"Page {page}/{total_pages} • {total_results} results")
-    lines.append("</blockquote>")
     text = "\n".join(lines)
 
     kb, counts = _search_filter_buttons(results, active, search_query)
