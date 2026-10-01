@@ -1085,38 +1085,38 @@ async def handle_photo_edit_selection(update, context, data):
         filter_name = "Original"
         description = "No changes applied."
     elif data == "edit_hd":
-        # HD Pro enhancement
+        # Natural-looking HD enhancement: upscale, reduce noise, recover local
+        # contrast, and sharpen edges without aggressively inventing detail.
         src = img.convert("RGB")
-        target_min = 2000
-        scale = max(4.0, target_min / max(1, min(src.size)))
-        scale = min(scale, 8.0)
-        nw = max(2000, int(round(src.width * scale)))
-        nh = max(2000, int(round(src.height * scale)))
         max_dim = 5000
-        if max(nw, nh) > max_dim:
-            ratio = max_dim / max(nw, nh)
-            nw, nh = int(nw * ratio), int(nh * ratio)
-        img = src.resize((nw, nh), Image.Resampling.LANCZOS)
-        img = img.filter(ImageFilter.MedianFilter(size=3))
+        scale = min(2.0, max_dim / max(src.size))
+        nw = max(1, int(round(src.width * scale)))
+        nh = max(1, int(round(src.height * scale)))
+        if (nw, nh) != src.size:
+            src = src.resize((nw, nh), Image.Resampling.LANCZOS)
+
         try:
-            arr = np.array(img)
-            lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
-            l, a, b = cv2.split(lab)
-            clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-            l = clahe.apply(l)
-            lab = cv2.merge((l, a, b))
-            arr = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-            img = Image.fromarray(arr)
-        except ImportError:
-            img = ImageOps.autocontrast(img, cutoff=1)
-        img = ImageEnhance.Contrast(img).enhance(1.15)
-        img = ImageEnhance.Color(img).enhance(1.20)
-        img = ImageEnhance.Brightness(img).enhance(1.03)
-        img = img.filter(ImageFilter.UnsharpMask(radius=3.0, percent=120, threshold=2))
-        img = img.filter(ImageFilter.UnsharpMask(radius=1.2, percent=160, threshold=2))
-        img = ImageEnhance.Sharpness(img).enhance(1.3)
+            arr = np.asarray(src)
+            # Denoise gently in YCrCb so colour edges stay clean.
+            ycrcb = cv2.cvtColor(arr, cv2.COLOR_RGB2YCrCb)
+            y, cr, cb = cv2.split(ycrcb)
+            y = cv2.fastNlMeansDenoising(y, None, h=5, templateWindowSize=7, searchWindowSize=21)
+            # Adaptive local contrast, with restrained strength to avoid halos.
+            clahe = cv2.createCLAHE(clipLimit=1.6, tileGridSize=(8, 8))
+            y = clahe.apply(y)
+            clean = cv2.cvtColor(cv2.merge((y, cr, cb)), cv2.COLOR_YCrCb2RGB)
+            img = Image.fromarray(clean)
+        except (ImportError, AttributeError, cv2.error):
+            img = ImageOps.autocontrast(src, cutoff=0.5)
+
+        # Mild tonal and colour tuning, followed by detail-aware sharpening.
+        img = ImageEnhance.Color(img).enhance(1.06)
+        img = ImageEnhance.Contrast(img).enhance(1.04)
+        img = ImageEnhance.Brightness(img).enhance(1.01)
+        img = img.filter(ImageFilter.UnsharpMask(radius=1.5, percent=115, threshold=3))
+        img = ImageEnhance.Sharpness(img).enhance(1.08)
         filter_name = f"HD Pro • {nw}×{nh}"
-        description = "Upscaled, denoised, sharpened, and colour-boosted."
+        description = "Enhanced resolution, gentle noise reduction, balanced local contrast, and natural edge sharpening."
 
     elif data == "edit_vivid":
         img = ImageEnhance.Contrast(img).enhance(1.3)
