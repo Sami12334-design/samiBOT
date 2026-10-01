@@ -3991,6 +3991,17 @@ async def fetch_search(update, context, query):
         )
 
 
+def _search_exact_match(item, query):
+    normalized = " ".join((query or "").strip().lower().split())
+    if not normalized:
+        return False
+    message = item.get("message")
+    content = " ".join((getattr(message, "message", None) or "").lower().split()) if message is not None else ""
+    title = (item.get("title") or "").lower()
+    username = (item.get("username") or "").lower().lstrip("@")
+    return normalized in content or normalized in title or normalized in username
+
+
 def _search_filter_match(item, filter_type):
     if filter_type == "all":
         return True
@@ -4021,10 +4032,11 @@ def _search_filter_match(item, filter_type):
     return True
 
 
-def _search_filter_buttons(results, active):
+def _search_filter_buttons(results, active, query):
     """Create only filters that actually have results. This is dynamic."""
     definitions = [
         ("all", "🔎 All"),
+        ("exact", "🎯 Exact"),
         ("messages", "💬 Messages"),
         ("photos", "📷 Photos"),
         ("videos", "🎬 Videos"),
@@ -4040,7 +4052,10 @@ def _search_filter_buttons(results, active):
 
     counts = {}
     for filter_type, _ in definitions:
-        counts[filter_type] = sum(1 for item in results if _search_filter_match(item, filter_type))
+        if filter_type == "exact":
+            counts[filter_type] = sum(1 for item in results if _search_exact_match(item, query))
+        else:
+            counts[filter_type] = sum(1 for item in results if _search_filter_match(item, filter_type))
 
     available = []
     for filter_type, label in definitions:
@@ -4073,7 +4088,9 @@ async def display_search_page(update, context, page, filter_type=None):
     search_query = context.user_data.get("search_query", "")
     active = filter_type or context.user_data.get("search_filter", "all")
 
-    filtered = [item for item in results if _search_filter_match(item, active)]
+    filtered = ([item for item in results if _search_exact_match(item, search_query)]
+                if active == "exact" else
+                [item for item in results if _search_filter_match(item, active)])
     per_page = SEARCH_PAGE_SIZE
     total_results = len(filtered)
     total_pages = max(1, (total_results + per_page - 1) // per_page)
@@ -4126,7 +4143,7 @@ async def display_search_page(update, context, page, filter_type=None):
     lines.append("</blockquote>")
     text = "\n".join(lines)
 
-    kb, counts = _search_filter_buttons(results, active)
+    kb, counts = _search_filter_buttons(results, active, search_query)
 
     nav = []
     if page > 1:
