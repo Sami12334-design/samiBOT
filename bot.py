@@ -2003,7 +2003,8 @@ def download_from_piped(meta, output_dir: str, *, height=None, audio=False):
     final = os.path.join(output_dir, "video.mp4")
     download_url_to_file(audio_stream["url"], audio_raw)
     ffmpeg_merge(video_raw, audio_raw, final)
-    os.unlink(video_raw)    os.unlink(audio_raw)
+    os.unlink(video_raw)
+    os.unlink(audio_raw)
     return {"path": final, "title": title}
 
 
