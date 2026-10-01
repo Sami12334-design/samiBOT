@@ -1918,14 +1918,15 @@ def ytdlp_base_options():
         except Exception:
             runtime_path = None
     if runtime_path:
-        options["js_runtimes"] = {"deno": runtime_path}
+        # yt-dlp expects each runtime value to be a configuration dict.
+        options["js_runtimes"] = {"deno": {"path": runtime_path}}
     else:
         for runtime_name in ("node", "qjs", "bun"):
             runtime_path = shutil.which(runtime_name)
             if runtime_name == "node" and not runtime_path:
                 runtime_path = shutil.which("nodejs")
             if runtime_path:
-                options["js_runtimes"] = {runtime_name: runtime_path}
+                options["js_runtimes"] = {runtime_name: {"path": runtime_path}}
                 break
 
     # Prefer clients that currently avoid the GVS PO-token requirement.
