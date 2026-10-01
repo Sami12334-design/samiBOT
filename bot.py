@@ -124,6 +124,84 @@ def init_db():
     conn.commit()
     conn.close()
 
+# --- CONTENT SAFETY FILTER ---
+SAFETY_MAX_TERMS = 100
+
+def safety_config():
+    conn = sqlite3.connect('bot_data.db')
+    c = conn.cursor()
+    c.execute("CREATE TABLE IF NOT EXISTS safety_settings (id INTEGER PRIMARY KEY CHECK(id=1), enabled INTEGER NOT NULL DEFAULT 0)")
+    c.execute("INSERT OR IGNORE INTO safety_settings (id, enabled) VALUES (1, 0)")
+    c.execute("CREATE TABLE IF NOT EXISTS safety_terms (term TEXT PRIMARY KEY COLLATE NOCASE)")
+    conn.commit()
+    c.execute("SELECT enabled FROM safety_settings WHERE id=1")
+    enabled = bool(c.fetchone()[0])
+    c.execute("SELECT term FROM safety_terms ORDER BY term COLLATE NOCASE")
+    terms = [row[0] for row in c.fetchall()]
+    conn.close()
+    return enabled, terms
+
+async def safety_command(update, context):
+    msg = update.effective_message
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await msg.reply_text("🔒 Admin only.")
+        return
+    args = context.args or []
+    action = args[0].lower() if args else "help"
+    conn = sqlite3.connect('bot_data.db')
+    c = conn.cursor()
+    c.execute("CREATE TABLE IF NOT EXISTS safety_settings (id INTEGER PRIMARY KEY CHECK(id=1), enabled INTEGER NOT NULL DEFAULT 0)")
+    c.execute("INSERT OR IGNORE INTO safety_settings (id, enabled) VALUES (1, 0)")
+    c.execute("CREATE TABLE IF NOT EXISTS safety_terms (term TEXT PRIMARY KEY COLLATE NOCASE)")
+    if action == "add" and len(args) > 1:
+        term = " ".join(args[1:]).strip()[:100]
+        c.execute("SELECT COUNT(*) FROM safety_terms")
+        if c.fetchone()[0] >= SAFETY_MAX_TERMS:
+            await msg.reply_text("The saved filter list is full (100 terms).")
+        else:
+            c.execute("INSERT OR IGNORE INTO safety_terms(term) VALUES (?)", (term,))
+            conn.commit()
+            await msg.reply_text("✅ Saved filter phrase: " + html.escape(term))
+    elif action == "remove" and len(args) > 1:
+        term = " ".join(args[1:]).strip()
+        c.execute("DELETE FROM safety_terms WHERE term=? COLLATE NOCASE", (term,))
+        conn.commit()
+        await msg.reply_text("✅ Removed phrase if it was on the list.")
+    elif action in ("on", "off"):
+        c.execute("UPDATE safety_settings SET enabled=? WHERE id=1", (1 if action == "on" else 0,))
+        conn.commit()
+        await msg.reply_text("🛡️ Group safety filter is now " + action.upper() + ".")
+    elif action == "list":
+        c.execute("SELECT term FROM safety_terms ORDER BY term COLLATE NOCASE")
+        terms = [row[0] for row in c.fetchall()]
+        c.execute("SELECT enabled FROM safety_settings WHERE id=1")
+        enabled = bool(c.fetchone()[0])
+        await msg.reply_text("🛡️ Filter: " + ("ON" if enabled else "OFF") + "\\n" + ("\\n".join("• " + html.escape(x) for x in terms) if terms else "No saved phrases."))
+    else:
+        await msg.reply_text("Safety controls (admin):\\n/safety add <word or phrase>\\n/safety remove <phrase>\\n/safety list\\n/safety on\\n/safety off\\n\\nWhen enabled, a matching group message is deleted if possible and the bot leaves that group. Start with specific phrases to reduce false matches.")
+    conn.close()
+
+async def safety_group_monitor(update, context):
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or not chat or chat.type not in ("group", "supergroup"):
+        return
+    enabled, terms = safety_config()
+    if not enabled or not terms:
+        return
+    body = (msg.text or msg.caption or "").casefold()
+    if not body or not any(term.casefold() in body for term in terms):
+        return
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    try:
+        await context.bot.leave_chat(chat_id=chat.id)
+    except Exception:
+        pass
+
 def is_authenticated(user_id):
     conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
@@ -6063,6 +6141,7 @@ async def main():
     global PTB_BOT
     PTB_BOT = bot_app.bot
     bot_app.add_handler(CommandHandler("start", start))
+    bot_app.add_handler(CommandHandler("safety", safety_command))
     bot_app.add_handler(CommandHandler("whisper", whisper_command))
     bot_app.add_handler(InlineQueryHandler(whisper_inline_query))
     bot_app.add_handler(CommandHandler("logout", logout))
@@ -6072,6 +6151,7 @@ async def main():
     bot_app.add_handler(CommandHandler("setphoto", set_bot_photo))
     bot_app.add_handler(CommandHandler("restart", restart_command))
     bot_app.add_handler(CallbackQueryHandler(menu_callback))
+    bot_app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, safety_group_monitor), group=0)
     async def photo_router(update, context):
         if context.user_data.get('state') == 'qr_scan':
             await handle_qr_photo(update, context); return
