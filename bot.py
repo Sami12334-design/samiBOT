@@ -3070,6 +3070,12 @@ async def show_story_viewers(update, context, index=0):
 
     async with lock:
         try:
+            for message_id in context.user_data.pop("profile_visitor_message_ids", []):
+                try:
+                    await context.bot.delete_message(query.message.chat_id, message_id)
+                except Exception:
+                    pass
+
             stories = context.user_data.get("admin_story_posts")
             if stories is None:
                 stories = await _load_owned_story_posts()
