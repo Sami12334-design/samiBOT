@@ -828,7 +828,7 @@ async def menu_callback(update, context):
         await query.message.reply_text("🔗 Fetch Telegram\n\nSend me a link (e.g., t.me/channel/123 or t.me/channel/123-130):")
         context.user_data['state'] = 'fetch_link'
     elif data == "search":
-        await query.message.reply_text("🔎 SEARCH\n\nEnter a keyword to search Telegram globally.\n\nI will prioritize public results outside the chats/channels you already joined.\nExample: Logic mid")
+        await query.message.reply_text("🔎 SEARCH\n\nEnter a keyword to search Telegram globally.\n\nPublic results only — private/admin-only chats are excluded, and results are ranked by relevance.\nExample: Logic mid")
         context.user_data['state'] = 'search_query'
     elif data == "pdf_fetch":
         await query.message.reply_text("📄 PDF FETCH\n\nPlease upload the PDF file directly to this chat.")
@@ -3061,23 +3061,23 @@ async def send_story_at_index(update,context,index):
                 os.remove(compressed_path)
         except Exception: pass
 
-# --- FAST GLOBAL TELEGRAM SEARCH ---
+# --- GLOBAL TELEGRAM SEARCH ---
 #
-# This version implements true Telegram-side pagination, correct peer-ID
-# handling, and avoids race conditions by using a unique search ID.
+# Search is deliberately public-only.  The bot runs one Telethon user session,
+# so using that session's dialogs/private history would make search depend on
+# the admin account.  We only keep peers with a public username and rank the
+# returned public messages locally for relevance.
 
 SEARCH_PAGE_SIZE = 8
 SEARCH_GLOBAL_LIMIT = 100
-SEARCH_MAX_FETCH = 500  # Fetch up to 500 results to fill multiple pages
-SEARCH_JOINED_CACHE_SECONDS = 300  # Reduced to 5 minutes for fresher data
+SEARCH_MAX_FETCH = 500
 
 
 def _search_peer_marked_id(entity):
-    """Return Telegram's marked peer ID safely using utils.get_peer_id."""
+    """Return Telegram's marked peer ID safely."""
     try:
         return int(get_peer_id(entity))
     except Exception:
-        # Only fallback if entity is None or missing ID attributes entirely
         value = getattr(entity, "id", None)
         return int(value) if value is not None else None
 
@@ -3088,10 +3088,8 @@ def _search_peer_kind(entity):
         return "unknown"
     if getattr(entity, "bot", False):
         return "bot"
-    # Telethon Channel represents both broadcast channels and supergroups.
     if hasattr(entity, "broadcast"):
         return "channel" if getattr(entity, "broadcast", False) else "group"
-    # Basic Telegram groups are represented by Chat.
     if entity.__class__.__name__ == "Chat":
         return "group"
     if hasattr(entity, "first_name") or hasattr(entity, "username"):
@@ -3113,19 +3111,13 @@ def _search_peer_name(entity):
 
 def _search_peer_link(entity):
     username = getattr(entity, "username", None)
-    if username:
-        return f"https://t.me/{username}"
-    return None
+    return f"https://t.me/{username}" if username else None
 
 
 def _search_message_link(entity, message_id):
     username = getattr(entity, "username", None)
     if username:
         return f"https://t.me/{username}/{message_id}"
-    marked_id = _search_peer_marked_id(entity)
-    if marked_id is not None and marked_id < -1000000000000:
-        internal_id = str(abs(marked_id))[3:]
-        return f"https://t.me/c/{internal_id}/{message_id}"
     return None
 
 
@@ -3143,7 +3135,7 @@ def _search_message_type(message):
     if getattr(message, "document", None):
         return "document"
     text = (getattr(message, "message", None) or "").strip()
-    if re.search(r"https?://|t\.me/|www\.", text, re.I):
+    if re.search(r"https?://|t\\.me/|www\\.", text, re.I):
         return "link"
     return "text"
 
@@ -3151,7 +3143,7 @@ def _search_message_type(message):
 def _search_content(message):
     text = (getattr(message, "message", None) or "").strip()
     if text:
-        return re.sub(r"\s+", " ", text)[:180]
+        return re.sub(r"\\s+", " ", text)[:180]
     media_type = _search_message_type(message)
     labels = {
         "photo": "📷 Photo",
@@ -3166,98 +3158,137 @@ def _search_content(message):
     return labels.get(media_type, "💬 Message")
 
 
-async def _get_joined_peer_ids(context):
-    """Cache joined peer IDs, throwing a clear error if it fails on a cold cache."""
-    now = time.monotonic()
-    cached_at = context.application.bot_data.get("search_joined_cache_at", 0.0)
-    cached_ids = context.application.bot_data.get("search_joined_ids")
-    if cached_ids is not None and now - cached_at < SEARCH_JOINED_CACHE_SECONDS:
-        return set(cached_ids)
+def _search_public_entity(entity):
+    """Only allow peers that are publicly addressable by username.
 
-    joined = set()
-    try:
-        # No limit here to guarantee complete exclusion coverage
-        async for dialog in telethon_client.iter_dialogs():
-            entity = getattr(dialog, "entity", None)
-            if entity is None:
-                continue
-            kind = _search_peer_kind(entity)
-            if kind in {"group", "channel"}:
-                marked = _search_peer_marked_id(entity)
-                if marked is not None:
-                    joined.add(marked)
-    except Exception as exc:
-        # If we have an old cache, use it, otherwise loudly fail
-        if cached_ids is not None:
-            print(f"[Search] Cache refresh failed, using old cache: {exc}")
-            return set(cached_ids)
-        raise RuntimeError(f"Could not load joined chats for exclusion: {exc}")
-
-    context.application.bot_data["search_joined_ids"] = joined
-    context.application.bot_data["search_joined_cache_at"] = now
-    return joined
+    This is the important isolation rule: private dialogs, private groups,
+    and admin-only peers are never exposed by the bot's global search.
+    """
+    username = (getattr(entity, "username", None) or "").strip()
+    if not username:
+        return False
+    kind = _search_peer_kind(entity)
+    return kind in {"channel", "group", "bot", "user"}
 
 
-def _search_peer_from_result(peer_id, peer_map):
-    if peer_id is None:
-        return None
-    try:
-        return peer_map.get(int(peer_id))
-    except Exception:
-        return None
+def _search_terms(query):
+    normalized = re.sub(r"\\s+", " ", (query or "").strip().lower())
+    raw_tokens = re.findall(r"[\\w@#]+", normalized, flags=re.UNICODE)
+    tokens = []
+    for token in raw_tokens:
+        token = token.lstrip("@#").strip()
+        if len(token) >= 2 and token not in tokens:
+            tokens.append(token)
+    return normalized, tokens
+
+
+def _search_relevance_score(query, entity, message):
+    """Score a Telegram result using exact phrase/token/title matches.
+
+    Telegram performs the server-side fuzzy search. This second pass makes the
+    display order much more useful for multi-word queries instead of simply
+    showing whatever happened to arrive first from the server.
+    """
+    normalized, tokens = _search_terms(query)
+    content = re.sub(r"\\s+", " ", (getattr(message, "message", None) or "").strip().lower())
+    title = _search_peer_name(entity).lower()
+    username = (getattr(entity, "username", None) or "").lower().lstrip("@")
+
+    score = 0.0
+    if normalized and normalized in content:
+        score += 1000
+    if normalized and normalized in title:
+        score += 850
+    if normalized and normalized in username:
+        score += 900
+
+    matched = 0
+    for token in tokens:
+        if token in content:
+            matched += 1
+            score += 180
+            if re.search(r"\\b" + re.escape(token) + r"\\b", content):
+                score += 100
+        if token in title:
+            score += 220
+            if title.startswith(token):
+                score += 90
+        if token in username:
+            score += 260
+            if username.startswith(token):
+                score += 120
+
+    if tokens and matched == len(tokens):
+        score += 500
+    elif matched:
+        score += 80 * matched
+
+    # A small freshness tie-breaker; relevance remains dominant.
+    message_date = getattr(message, "date", None)
+    if message_date:
+        try:
+            age_days = max(0.0, (datetime.now(message_date.tzinfo) - message_date).total_seconds() / 86400) if getattr(message_date, "tzinfo", None) else max(0.0, (datetime.now() - message_date).total_seconds() / 86400)
+            score += max(0.0, 25.0 - min(age_days, 25.0))
+        except Exception:
+            pass
+    return score
+
+
+async def _search_global_batch(query, offset_rate, offset_peer, offset_id):
+    """Fetch one server-ranked global-search page."""
+    return await telethon_client(
+        functions.messages.SearchGlobalRequest(
+            q=query,
+            filter=types.InputMessagesFilterEmpty(),
+            min_date=0,
+            max_date=0,
+            offset_rate=offset_rate,
+            offset_peer=offset_peer,
+            offset_id=offset_id,
+            limit=SEARCH_GLOBAL_LIMIT,
+        )
+    )
 
 
 async def fetch_search(update, context, query):
-    query = (query or "").strip()
+    query = re.sub(r"\\s+", " ", (query or "").strip())
     if not query:
         await update.message.reply_text("🔎 Please enter a keyword, for example: Logic mid")
         return
 
-    # Reset stale search data and create a unique session ID to prevent race conditions
     search_id = uuid.uuid4().hex[:8]
-    context.user_data.pop("search_results", None)
-    context.user_data.pop("search_query", None)
-    context.user_data.pop("search_filter", None)
-    context.user_data.pop("search_page", None)
+    for key in ("search_results", "search_query", "search_filter", "search_page"):
+        context.user_data.pop(key, None)
     context.user_data["search_id"] = search_id
 
     status_msg = await update.message.reply_text(
-        f"🔎 Searching Telegram globally for: <b>{html.escape(query)}</b>\n"
-        "⚡ Server-side search • excluding your joined groups/channels",
+        f"🔎 Searching Telegram globally for: <b>{html.escape(query)}</b>\\n"
+        "🌐 Public results only • private/admin-only chats are excluded\\n"
+        "⚡ Ranking results by query relevance",
         parse_mode=ParseMode.HTML,
     )
 
     started = time.monotonic()
     try:
-        joined_ids = await _get_joined_peer_ids(context)
-        peer_map = {}
         results = []
-        seen = set()
-        joined_hidden = 0
-
+        peer_map = {}
+        seen_messages = set()
+        seen_peers = set()
+        fetched = 0
         offset_rate = 0
         offset_peer = types.InputPeerEmpty()
         offset_id = 0
-        fetched = 0
-        global_rank = 0  # To preserve Telegram's natural order
+        page_count = 0
+        last_state = None
 
-        # True pagination loop
         while fetched < SEARCH_MAX_FETCH:
-            global_result = await telethon_client(
-                functions.messages.SearchGlobalRequest(
-                    q=query,
-                    filter=types.InputMessagesFilterEmpty(),
-                    min_date=0,
-                    max_date=0,
-                    offset_rate=offset_rate,
-                    offset_peer=offset_peer,
-                    offset_id=offset_id,
-                    limit=SEARCH_GLOBAL_LIMIT,
-                )
+            global_result = await _search_global_batch(
+                query, offset_rate, offset_peer, offset_id
             )
+            page_count += 1
 
-            # Build peer map only once per batch
-            for entity in list(getattr(global_result, "chats", []) or []) + list(getattr(global_result, "users", []) or []):
+            entities = list(getattr(global_result, "chats", []) or []) + list(getattr(global_result, "users", []) or [])
+            for entity in entities:
                 marked = _search_peer_marked_id(entity)
                 if marked is not None:
                     peer_map[marked] = entity
@@ -3265,114 +3296,122 @@ async def fetch_search(update, context, query):
             batch_messages = list(getattr(global_result, "messages", []) or [])
             if not batch_messages:
                 break
+
             for message in batch_messages:
-                marked_peer = _search_peer_marked_id(message.peer_id)
-                entity = _search_peer_from_result(marked_peer, peer_map)
-
-                if entity is None:
+                marked_peer = _search_peer_marked_id(getattr(message, "peer_id", None))
+                entity = peer_map.get(marked_peer)
+                if entity is None or not _search_public_entity(entity):
                     continue
 
-                peer_kind = _search_peer_kind(entity)
-
-                # Exclusion for joined groups/channels (counts accurately)
-                if marked_peer in joined_ids and peer_kind in {"group", "channel"}:
-                    joined_hidden += 1
-                    continue
-
-                # Include users/private chats now (matching UI text)
                 message_id = getattr(message, "id", None)
                 if not message_id:
                     continue
-
                 key = (marked_peer, int(message_id))
-                if key in seen:
+                if key in seen_messages:
                     continue
-                seen.add(key)
+                seen_messages.add(key)
 
                 media_type = _search_message_type(message)
-                link = _search_message_link(entity, message_id)
-                global_rank += 1  # Higher rank = earlier in Telegram's response
                 results.append({
                     "kind": "message",
                     "type": media_type,
-                    "peer_type": peer_kind,
+                    "peer_type": _search_peer_kind(entity),
                     "peer_id": marked_peer,
                     "entity": entity,
                     "message": message,
-                    "link": link,
+                    "link": _search_message_link(entity, message_id),
                     "content": _search_content(message),
                     "title": _search_peer_name(entity),
                     "username": getattr(entity, "username", None),
                     "date": getattr(message, "date", None),
-                    "score": global_rank,
+                    "score": _search_relevance_score(query, entity, message),
+                    "server_rank": len(results),
                 })
 
-            # Use the next offsets provided by Telegram, or break if no more
-            next_offset = getattr(global_result, "next_offset", None)
-            if next_offset is not None:
-                offset_rate = getattr(next_offset, "rate", 0)
-                offset_peer = getattr(next_offset, "peer", types.InputPeerEmpty())
-                offset_id = getattr(next_offset, "q_id", 0)
-            else:
+            fetched += len(batch_messages)
+            if fetched >= SEARCH_MAX_FETCH:
                 break
 
-            fetched += len(batch_messages)
+            next_rate = getattr(global_result, "next_rate", None)
+            last_message = batch_messages[-1]
+            last_message_id = int(getattr(last_message, "id", 0) or 0)
+            last_entity = peer_map.get(_search_peer_marked_id(getattr(last_message, "peer_id", None)))
+            if next_rate is None or not last_message_id or last_entity is None:
+                break
 
-        # Expose public peers returned by the search, but only if not already in messages
-        for entity in list(getattr(global_result, "chats", []) or []) + list(getattr(global_result, "users", []) or []):
-            kind = _search_peer_kind(entity)
+            try:
+                next_peer = await telethon_client.get_input_entity(last_entity)
+            except Exception:
+                break
+
+            new_state = (int(next_rate), last_message_id, repr(next_peer))
+            if new_state == last_state:
+                break
+            last_state = new_state
+            offset_rate = int(next_rate)
+            offset_id = last_message_id
+            offset_peer = next_peer
+
+            if page_count >= 10:
+                break
+
+        # Add public peers returned by Telegram as secondary results, but only
+        # when the peer itself matches the query and has not produced a message.
+        message_peer_ids = {item["peer_id"] for item in results}
+        for entity in peer_map.values():
+            if not _search_public_entity(entity):
+                continue
             marked = _search_peer_marked_id(entity)
-            if kind in {"group", "channel"} and marked in joined_ids:
+            if marked is None or marked in message_peer_ids or marked in seen_peers:
                 continue
-            if kind not in {"group", "channel", "bot", "user"}:
-                continue
-
-            # Skip if this peer is already represented by a message result
-            if any(r["peer_id"] == marked for r in results):
-                continue
-
             name = _search_peer_name(entity)
-            username = getattr(entity, "username", None)
-            peer_link = _search_peer_link(entity)
-            peer_key = ("peer", marked)
-            if peer_key in seen:
+            username = (getattr(entity, "username", None) or "").lower()
+            normalized, tokens = _search_terms(query)
+            haystack = f"{name.lower()} {username}"
+            if normalized not in haystack and not any(token in haystack for token in tokens):
                 continue
-            seen.add(peer_key)
-            global_rank += 1
+            seen_peers.add(marked)
+            score = _search_relevance_score(query, entity, None)
             results.append({
                 "kind": "peer",
-                "type": kind,
-                "peer_type": kind,
+                "type": _search_peer_kind(entity),
+                "peer_type": _search_peer_kind(entity),
                 "peer_id": marked,
                 "entity": entity,
                 "message": None,
-                "link": peer_link,
-                "content": f"{('🤖' if kind == 'bot' else '📢' if kind == 'channel' else '👥' if kind == 'group' else '👤')} {name}"
-                            + (f"  @{username}" if username else ""),
+                "link": _search_peer_link(entity),
+                "content": f"{('🤖' if _search_peer_kind(entity) == 'bot' else '📢' if _search_peer_kind(entity) == 'channel' else '👥' if _search_peer_kind(entity) == 'group' else '👤')} {name}"
+                           + (f"  @{getattr(entity, 'username', None)}" if getattr(entity, 'username', None) else ""),
                 "title": name,
-                "username": username,
+                "username": getattr(entity, "username", None),
                 "date": None,
-                "score": global_rank,
+                "score": score,
+                "server_rank": len(results),
             })
 
         if not results:
             await status_msg.edit_text(
-                f"❌ No public results found for <b>{html.escape(query)}</b>.\n\n"
-                "The search intentionally hides results from groups/channels you already joined.",
+                f"❌ No public Telegram results found for <b>{html.escape(query)}</b>.\\n\\n"
+                "Private/admin-only chats are intentionally excluded from global search.",
                 parse_mode=ParseMode.HTML,
             )
             return
 
-        # Messages come first (lower scores due to earlier rank), but peers are mixed naturally
-        # Since global_rank increases sequentially, sorting by score preserves Telegram's order.
-        results.sort(key=lambda item: item.get("score", 0), reverse=False)
+        # Relevance first, server order/date only break ties.
+        results.sort(
+            key=lambda item: (
+                float(item.get("score", 0)),
+                item.get("date") or datetime.min,
+                -int(item.get("server_rank", 0)),
+            ),
+            reverse=True,
+        )
 
-        # Cap memory usage
         context.user_data["search_results"] = results[:500]
         context.user_data["search_query"] = query
         context.user_data["search_filter"] = "all"
         context.user_data["search_page"] = 1
-        context.user_data["search_joined_hidden"] = joined_hidden
+        context.user_data["search_joined_hidden"] = 0
         context.user_data["search_elapsed"] = round(time.monotonic() - started, 2)
 
         await status_msg.delete()
@@ -3383,9 +3422,9 @@ async def fetch_search(update, context, query):
             f"⏳ Telegram rate limit. Please wait {e.seconds} seconds and try again."
         )
     except Exception as e:
-        print(f"[Search] Global search failed: {type(e).__name__}: {e}")
+        print(f"[Search] Global public search failed: {type(e).__name__}: {e}")
         await status_msg.edit_text(
-            f"❌ Search failed: <code>{html.escape(type(e).__name__)}</code>\n\n"
+            f"❌ Search failed: <code>{html.escape(type(e).__name__)}</code>\\n\\n"
             f"{html.escape(str(e)[:700])}",
             parse_mode=ParseMode.HTML,
         )
