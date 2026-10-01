@@ -22,9 +22,9 @@ import cv2
 from datetime import datetime, timedelta
 from flask import Flask
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageChops
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InlineQueryResultArticle, InputTextMessageContent
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes, InlineQueryHandler
 from telethon import TelegramClient, events, functions, types
 from telethon.sessions import StringSession
 from telethon.utils import get_peer_id
@@ -686,6 +686,53 @@ async def ar_cancel(update, context):
     await ar_show_menu(update, context)
 
 
+async def whisper_inline_query(update, context):
+    """Create an inline whisper result for a specific Telegram user."""
+    query = update.inline_query
+    if not query:
+        return
+    if not is_admin(query.from_user.id):
+        await query.answer([], cache_time=0, is_personal=True)
+        return
+    raw = (query.query or "").strip()
+    parts = raw.split(None, 1)
+    if len(parts) < 2 or not parts[1].strip():
+        await query.answer([], cache_time=0, is_personal=True)
+        return
+    target, secret = parts[0], parts[1].strip()
+    try:
+        if target.lstrip("@").isdigit():
+            recipient_id = int(target.lstrip("@"))
+            if recipient_id <= 0:
+                raise ValueError("Invalid user ID")
+            recipient_name = "the selected user"
+        else:
+            chat = await context.bot.get_chat(target if target.startswith("@") else "@" + target)
+            if getattr(chat, "type", None) != "private":
+                raise ValueError("That username does not resolve to a user")
+            recipient_id = chat.id
+            recipient_name = getattr(chat, "first_name", None) or "the selected user"
+    except Exception:
+        await query.answer([], cache_time=0, is_personal=True)
+        return
+
+    token = uuid.uuid4().hex[:12]
+    context.bot_data.setdefault("whisper_messages", {})[token] = {
+        "recipient_id": recipient_id, "text": secret[:3500],
+        "expires": time.time() + 86400
+    }
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔒 Tap to view whisper", callback_data="whisper|" + token)
+    ]])
+    result = InlineQueryResultArticle(
+        id=token,
+        title="🔒 Send private whisper",
+        description="Only " + recipient_name + " can reveal the message",
+        input_message_content=InputTextMessageContent("🔒 A private whisper is here for its intended recipient."),
+        reply_markup=keyboard,
+    )
+    await query.answer([result], cache_time=0, is_personal=True)
+
 async def whisper_command(update, context):
     """Admin-only group whisper: reply to a user's message with /whisper <text>."""
     user = update.effective_user
@@ -724,11 +771,11 @@ async def handle_whisper_callback(update, context, token):
 
 async def menu_callback(update, context):
     query = update.callback_query
-    await query.answer()
     user_id = update.effective_user.id
     if query.data and query.data.startswith("whisper|"):
         await handle_whisper_callback(update, context, query.data.split("|", 1)[1])
         return
+    await query.answer()
     if not is_authenticated(user_id):
         await query.edit_message_text("🔐 Password required.")
         return
@@ -6017,6 +6064,7 @@ async def main():
     PTB_BOT = bot_app.bot
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("whisper", whisper_command))
+    bot_app.add_handler(InlineQueryHandler(whisper_inline_query))
     bot_app.add_handler(CommandHandler("logout", logout))
     bot_app.add_handler(CommandHandler("broadcast", broadcast_command))
     bot_app.add_handler(CommandHandler("setname", set_bot_name))
