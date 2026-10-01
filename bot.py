@@ -46,10 +46,15 @@ import imageio_ffmpeg
 import qrcode
 
 try:
-    from telethon.tl.functions.stories import GetPeerStoriesRequest, GetStoriesByIDRequest
+    from telethon.tl.functions.stories import (
+        GetPeerStoriesRequest,
+        GetStoriesByIDRequest,
+        GetPinnedStoriesRequest,
+    )
 except ImportError:
     GetPeerStoriesRequest = None
     GetStoriesByIDRequest = None
+    GetPinnedStoriesRequest = None
 
 app = Flask(__name__)
 
@@ -840,7 +845,12 @@ async def menu_callback(update, context):
     elif data.startswith("story_nav_"):
         try:
             idx = int(data.split("_", 2)[2])
-            await send_story_at_index(update, context, idx)
+            lock=context.user_data.get("story_lock")
+            if lock is None:
+                lock=asyncio.Lock()
+                context.user_data["story_lock"]=lock
+            async with lock:
+                await send_story_at_index(update, context, idx)
         except (ValueError, IndexError):
             await query.answer("Invalid story navigation.", show_alert=True)
         return
@@ -2878,36 +2888,73 @@ async def handle_story_view(update,context,refresh=False):
         await query.edit_message_text("❌ No profile selected. Please search a user again."); return
     if GetPeerStoriesRequest is None:
         await query.edit_message_text("❌ Telegram Stories support is unavailable in this Telethon installation."); return
-    try:
-        result=await telethon_client(GetPeerStoriesRequest(peer=entity))
-        story_items=_story_items_from_result(result)
-        stories=[story for story in story_items if _story_is_active(story)]
-        stories.sort(key=_story_sort_key,reverse=True)
-        if not stories:
-            kb=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh",callback_data="story_refresh")],
-                                     [InlineKeyboardButton("👤 Profile",callback_data="story_back")]])
-            try:
-                await query.edit_message_caption(caption="📭 <b>No active stories</b>\n\nThis profile has no currently available stories.",
-                                                  parse_mode=ParseMode.HTML,reply_markup=kb)
-            except Exception:
-                await query.edit_message_text("📭 <b>No active stories</b>\n\nThis profile has no currently available stories.",
-                                              parse_mode=ParseMode.HTML,reply_markup=kb)
-            return
-        context.user_data["stories_list"]=stories
-        context.user_data["story_index"]=0
-        await send_story_at_index(update,context,0)
-    except FloodWaitError as e:
-        await query.edit_message_text(f"⏳ Telegram temporarily rate-limited story loading.\n\nPlease try again in about {e.seconds} seconds.")
-    except (ChannelPrivateError,UsernameNotOccupiedError):
-        await query.edit_message_text("🔒 Stories are unavailable for this profile.")
-    except Exception as e:
-        print(f"Story load error: {type(e).__name__}: {e}")
-        await query.edit_message_text("❌ Could not load stories right now.\n\n"
-                                      "The profile may have restricted stories, the story may have expired, "
-                                      "or Telegram may have temporarily rejected the request.",
-                                      reply_markup=InlineKeyboardMarkup([
-                                          [InlineKeyboardButton("🔄 Refresh",callback_data="story_refresh")],
-                                          [InlineKeyboardButton("👤 Profile",callback_data="story_back")]]))
+
+    # Serialize refresh/open operations per user so rapid taps cannot create
+    # multiple viewer messages at the same time.
+    lock=context.user_data.get("story_lock")
+    if lock is None:
+        lock=asyncio.Lock()
+        context.user_data["story_lock"]=lock
+
+    async with lock:
+        try:
+            active_result=await telethon_client(GetPeerStoriesRequest(peer=entity))
+            active_items=_story_items_from_result(active_result)
+            stories=[story for story in active_items if _story_is_active(story)]
+
+            # Expired stories are normally private to their owner, but stories
+            # explicitly pinned to a profile are viewable by profile visitors.
+            # Include pinned stories so the viewer can continue from recent
+            # active stories into older profile-pinned stories.
+            if GetPinnedStoriesRequest is not None:
+                try:
+                    pinned_result=await telethon_client(
+                        GetPinnedStoriesRequest(peer=entity,offset_id=0,limit=100)
+                    )
+                    pinned_items=_story_items_from_result(pinned_result)
+                    stories.extend(pinned_items)
+                except Exception as pinned_error:
+                    print(f"Story pinned fetch skipped: {type(pinned_error).__name__}: {pinned_error}")
+
+            # Deduplicate active/pinned overlap by Telegram story ID.
+            unique={}
+            for story in stories:
+                story_id=getattr(story,"id",None)
+                key=("id",int(story_id)) if story_id is not None else (
+                    "fallback",id(story)
+                )
+                unique[key]=story
+            stories=list(unique.values())
+            stories.sort(key=_story_sort_key,reverse=True)
+
+            if not stories:
+                kb=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh",callback_data="story_refresh")],
+                                         [InlineKeyboardButton("👤 Profile",callback_data="story_back")]])
+                try:
+                    await query.edit_message_caption(caption="📭 <b>No viewable stories</b>\n\n"
+                                                              "This profile has no active or pinned stories available to this account.",
+                                                      parse_mode=ParseMode.HTML,reply_markup=kb)
+                except Exception:
+                    await query.edit_message_text("📭 <b>No viewable stories</b>\n\n"
+                                                   "This profile has no active or pinned stories available to this account.",
+                                                   parse_mode=ParseMode.HTML,reply_markup=kb)
+                return
+
+            context.user_data["stories_list"]=stories
+            context.user_data["story_index"]=0
+            await send_story_at_index(update,context,0)
+        except FloodWaitError as e:
+            await query.edit_message_text(f"⏳ Telegram temporarily rate-limited story loading.\n\nPlease try again in about {e.seconds} seconds.")
+        except (ChannelPrivateError,UsernameNotOccupiedError):
+            await query.edit_message_text("🔒 Stories are unavailable for this profile.")
+        except Exception as e:
+            print(f"Story load error: {type(e).__name__}: {e}")
+            await query.edit_message_text("❌ Could not load stories right now.\n\n"
+                                          "The profile may have restricted stories, the story may have expired, "
+                                          "or Telegram may have temporarily rejected the request.",
+                                          reply_markup=InlineKeyboardMarkup([
+                                              [InlineKeyboardButton("🔄 Refresh",callback_data="story_refresh")],
+                                              [InlineKeyboardButton("👤 Profile",callback_data="story_back")]]))
 
 async def send_story_at_index(update,context,index):
     query=update.callback_query
@@ -2963,6 +3010,12 @@ async def send_story_at_index(update,context,index):
                 print(f"Story edit fallback: {type(edit_error).__name__}: {edit_error}")
 
         if not edited:
+            previous_story_message_id=context.user_data.get("story_message_id")
+            if previous_story_message_id and previous_story_message_id != query.message.message_id:
+                try:
+                    await context.bot.delete_message(query.message.chat_id,previous_story_message_id)
+                except Exception:
+                    pass
             with open(upload_path,"rb") as media_file:
                 document=getattr(media,"document",None)
                 mime=str(getattr(document,"mime_type","") or "").lower()
