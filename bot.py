@@ -2822,40 +2822,74 @@ async def show_profile_visitors(update, context):
         await query.answer("🔒 Admin only", show_alert=True)
         return
     await query.answer("Loading profile visitors…")
+
+    # Remove the previous visitor report so refresh does not stack copies.
+    for message_id in context.user_data.pop("profile_visitor_message_ids", []):
+        try:
+            await context.bot.delete_message(query.message.chat_id, message_id)
+        except Exception:
+            pass
+
     rows = get_profile_visits(user_id)
     if not rows:
-        text = (
+        chunks = [(
             "👀 <b>WHO VISITED MY PROFILE</b>\n\n"
             "No visits have been recorded through the bot yet.\n\n"
             "<i>This tracks users who open your Telegram profile through this bot's Profile lookup. "
             "Telegram itself does not provide a general profile-viewer list.</i>"
-        )
+        )]
     else:
-        lines = [
+        header = [
             "👀 <b>WHO VISITED MY PROFILE</b>",
             "",
             f"Total unique visitors: <b>{len(rows)}</b>",
             "",
         ]
+        entries = []
         for idx, (visitor_id, username, first_name, last_name, first_seen, last_seen, count) in enumerate(rows, 1):
             name = f"{first_name or ''} {last_name or ''}".strip() or "Unknown user"
             handle = f"@{username}" if username else f"ID {visitor_id}"
-            lines.append(
+            entries.append(
                 f"<b>{idx}.</b> {html.escape(name)} — {html.escape(handle)}\n"
                 f"🕒 Last visit: {html.escape(str(last_seen))} • Visits: {count}"
             )
-        lines.append("")
-        lines.append("<i>Only visits made through this bot's Profile lookup are recorded.</i>")
-        text = "\n".join(lines)
+
+        chunks = []
+        current = "\n".join(header)
+        for entry in entries:
+            candidate = current + ("\n\n" if current else "") + entry
+            if len(candidate) > 3900 and current.strip():
+                chunks.append(current)
+                current = entry
+            else:
+                current = candidate
+        if current.strip():
+            chunks.append(current)
+        chunks[-1] += "\n\n<i>Only visits made through this bot's Profile lookup are recorded.</i>"
+
+    sent_ids = []
+    for chunk in chunks:
+        sent = await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=chunk,
+            parse_mode=ParseMode.HTML,
+        )
+        sent_ids.append(sent.message_id)
+
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Refresh", callback_data="profile_visitors")],
         [InlineKeyboardButton("📖 Who Viewed My Stories", callback_data="story_viewers")],
         [InlineKeyboardButton("⬅️ Back", callback_data="more")],
     ])
-    try:
-        await query.edit_message_text(text[:4096], parse_mode=ParseMode.HTML, reply_markup=kb)
-    except Exception:
-        await query.message.reply_text(text[:4096], parse_mode=ParseMode.HTML, reply_markup=kb)
+    controls = await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text="⬆️ <b>Profile visitor controls</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
+    sent_ids.append(controls.message_id)
+    context.user_data["profile_visitor_message_ids"] = sent_ids
+
 
 
 def _story_reaction_text(reaction):
