@@ -3303,6 +3303,13 @@ async def fetch_search(update, context, query):
                 if entity is None or not _search_public_entity(entity):
                     continue
 
+                # Message results are restricted to public channels/groups.
+                # A public username on a user/bot does NOT make private DMs
+                # searchable; those must never leak from the admin session.
+                peer_kind = _search_peer_kind(entity)
+                if peer_kind not in {"channel", "group"}:
+                    continue
+
                 message_id = getattr(message, "id", None)
                 if not message_id:
                     continue
@@ -3336,8 +3343,19 @@ async def fetch_search(update, context, query):
             last_message = batch_messages[-1]
             last_message_id = int(getattr(last_message, "id", 0) or 0)
             last_entity = peer_map.get(_search_peer_marked_id(getattr(last_message, "peer_id", None)))
-            if next_rate is None or not last_message_id or last_entity is None:
+            if not last_message_id or last_entity is None:
                 break
+
+            # Telegram documents that offset_rate should use next_rate when
+            # present, otherwise the date of the last returned message.
+            if next_rate is None:
+                last_date = getattr(last_message, "date", None)
+                if last_date is None:
+                    break
+                try:
+                    next_rate = int(last_date.timestamp())
+                except Exception:
+                    break
 
             try:
                 next_peer = await telethon_client.get_input_entity(last_entity)
@@ -3398,14 +3416,19 @@ async def fetch_search(update, context, query):
             return
 
         # Relevance first, server order/date only break ties.
-        results.sort(
-            key=lambda item: (
+        def _search_sort_key(item):
+            result_date = item.get("date")
+            try:
+                date_score = result_date.timestamp() if result_date else 0.0
+            except Exception:
+                date_score = 0.0
+            return (
                 float(item.get("score", 0)),
-                item.get("date") or datetime.min,
+                date_score,
                 -int(item.get("server_rank", 0)),
-            ),
-            reverse=True,
-        )
+            )
+
+        results.sort(key=_search_sort_key, reverse=True)
 
         context.user_data["search_results"] = results[:500]
         context.user_data["search_query"] = query
