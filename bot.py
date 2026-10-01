@@ -969,6 +969,7 @@ def build_edit_keyboard(page=1):
             [("☀️ Brighten", "edit_bright"), ("🌙 Darken", "edit_dark"), ("🌫️ Blur", "edit_blur")],
             [("🟥 Pixel", "edit_pixel"), ("🔄 Invert", "edit_invert"), ("✏️ Sketch", "edit_sketch")],
             [("🧊 Emboss", "edit_emboss"), ("🎞️ Poster", "edit_poster"), ("🔥 Solarize", "edit_solar")],
+            [("✂️ Crop Photo", "edit_crop"), ("🪄 Remove Background", "edit_remove_bg")],
             [("➡️ More Effects", "edit_page2"), ("🗑️ Remove Photo", "edit_clear")],
         ]
     else:  # page 2
@@ -1005,8 +1006,32 @@ async def handle_photo_edit_selection(update, context, data):
         await query.message.reply_text("🗑️ Current photo removed. Send another photo to edit.")
         return
 
+    if data == "edit_crop":
+        context.user_data["state"] = "awaiting_crop_width"
+        await query.message.reply_text("✂️ CROP PHOTO\n\nSend the target width in pixels (1–5000). The image will be center-cropped to the exact dimensions.")
+        return
+
     if data == "edit_remove_bg":
-        await query.message.reply_text("ℹ️ Background removal is disabled in this version.")
+        status = await query.message.reply_text("🪄 Removing background… This may take a little while on the first run.")
+        try:
+            def remove_background_sync():
+                from rembg import remove, new_session
+                session = new_session("u2netp")
+                return remove(img.convert("RGBA"), session=session)
+            result = await asyncio.to_thread(remove_background_sync)
+            if not isinstance(result, Image.Image):
+                result = Image.open(BytesIO(result))
+            out = BytesIO()
+            result.save(out, format="PNG")
+            out.seek(0)
+            await query.message.reply_document(
+                document=out, filename="background_removed.png",
+                caption="✅ Background removed. Transparent areas are preserved.",
+                reply_markup=tool_done_kb()
+            )
+            await status.edit_text("✅ Background removal complete.")
+        except Exception as e:
+            await status.edit_text("❌ Background removal failed.\n\n" + html.escape(str(e)[:1200]), parse_mode=ParseMode.HTML)
         return
 
     if data == "edit_change_bg":
@@ -5778,6 +5803,43 @@ async def handle_link(update, context):
     user_id = update.effective_user.id
     text = update.message.text if update.message.text else ""
     self_ping()
+    state = context.user_data.get("state")
+    if state in ("awaiting_crop_width", "awaiting_crop_height"):
+        raw = (text or "").strip()
+        if not raw.isdigit():
+            await update.message.reply_text("❌ Please send a whole number of pixels.")
+            return
+        value = int(raw)
+        if not 1 <= value <= 5000:
+            await update.message.reply_text("❌ Use a dimension from 1 to 5000 pixels.")
+            return
+        if state == "awaiting_crop_width":
+            context.user_data["crop_width"] = value
+            context.user_data["state"] = "awaiting_crop_height"
+            await update.message.reply_text("Now send the target height in pixels (1–5000).")
+            return
+        width = int(context.user_data.pop("crop_width", 0))
+        height = value
+        context.user_data["state"] = None
+        if width * height > 20000000:
+            context.user_data["state"] = "awaiting_crop_width"
+            await update.message.reply_text("❌ That output is too large (maximum 20 million pixels). Send a smaller width.")
+            return
+        source = context.user_data.get("edit_image")
+        if source is None:
+            await update.message.reply_text("❌ The photo is no longer available. Upload it again.")
+            return
+        status = await update.message.reply_text("✂️ Cropping photo…")
+        try:
+            cropped = await asyncio.to_thread(lambda: ImageOps.fit(source.convert("RGB"), (width, height), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5)))
+            out = BytesIO()
+            cropped.save(out, format="JPEG", quality=95)
+            out.seek(0)
+            await update.message.reply_photo(photo=out, caption=f"✅ Cropped to {width} × {height} px.", reply_markup=tool_done_kb())
+            await status.edit_text("✅ Crop complete.")
+        except Exception as e:
+            await status.edit_text("❌ Crop failed: " + html.escape(str(e)[:1000]), parse_mode=ParseMode.HTML)
+        return
     if await handle_mm_input(update, context): return
     if context.user_data.get('state') == 'qr_create': await handle_qr_create(update, context); return
     if context.user_data.get('state') == 'qr_scan' and getattr(update.message, 'document', None) and str(getattr(update.message.document, 'mime_type', '')).startswith('image/'):
