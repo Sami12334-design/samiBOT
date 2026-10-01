@@ -56,6 +56,12 @@ try:
 except ImportError:
     GetPinnedStoriesRequest = None
 
+try:
+    from telethon.tl.functions.stories import GetStoryViewsListRequest, GetStoriesArchiveRequest
+except ImportError:
+    GetStoryViewsListRequest = None
+    GetStoriesArchiveRequest = None
+
 app = Flask(__name__)
 
 @app.route('/')
@@ -93,6 +99,17 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS inbox (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, sender_id INTEGER, name TEXT, username TEXT, text TEXT, media_type TEXT, date TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS tracking (target_id INTEGER PRIMARY KEY, username TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS user_history (user_id INTEGER, username TEXT, first_name TEXT, last_name TEXT, date TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS profile_visits (
+        target_id INTEGER NOT NULL,
+        visitor_id INTEGER NOT NULL,
+        username TEXT,
+        first_name TEXT,
+        last_name TEXT,
+        first_seen TEXT NOT NULL,
+        last_seen TEXT NOT NULL,
+        visit_count INTEGER NOT NULL DEFAULT 1,
+        PRIMARY KEY (target_id, visitor_id)
+    )''')
     c.execute('''CREATE TABLE IF NOT EXISTS message_manager_rules (id INTEGER PRIMARY KEY CHECK (id=1), messaging INTEGER DEFAULT 1, block_everyone_until REAL DEFAULT 0, blocked_users TEXT DEFAULT '{}', filter_links_until REAL DEFAULT 0, filter_videos_until REAL DEFAULT 0, keyword_rules TEXT DEFAULT '{}')''')
     c.execute("INSERT OR IGNORE INTO message_manager_rules (id) VALUES (1)")
     c.execute('''CREATE TABLE IF NOT EXISTS auto_responder (
@@ -163,6 +180,44 @@ def get_user_history(user_id):
     conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
     c.execute("SELECT username, first_name, last_name, date FROM user_history WHERE user_id = ? ORDER BY date DESC", (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def record_profile_visit(target_id, visitor):
+    """Record a profile visit made through this bot's Profile lookup flow."""
+    if visitor is None or getattr(visitor, "id", None) is None:
+        return
+    now = datetime.now().isoformat(timespec="seconds")
+    visitor_id = int(visitor.id)
+    username = getattr(visitor, "username", None)
+    first_name = getattr(visitor, "first_name", None) or ""
+    last_name = getattr(visitor, "last_name", None) or ""
+    conn = sqlite3.connect('bot_data.db')
+    c = conn.cursor()
+    c.execute(
+        """INSERT INTO profile_visits
+           (target_id, visitor_id, username, first_name, last_name, first_seen, last_seen, visit_count)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+           ON CONFLICT(target_id, visitor_id) DO UPDATE SET
+             username=excluded.username,
+             first_name=excluded.first_name,
+             last_name=excluded.last_name,
+             last_seen=excluded.last_seen,
+             visit_count=profile_visits.visit_count + 1""",
+        (int(target_id), visitor_id, username, first_name, last_name, now, now)
+    )
+    conn.commit()
+    conn.close()
+
+def get_profile_visits(target_id):
+    conn = sqlite3.connect('bot_data.db')
+    c = conn.cursor()
+    c.execute(
+        """SELECT visitor_id, username, first_name, last_name, first_seen, last_seen, visit_count
+           FROM profile_visits WHERE target_id = ? ORDER BY last_seen DESC""",
+        (int(target_id),)
+    )
     rows = c.fetchall()
     conn.close()
     return rows
