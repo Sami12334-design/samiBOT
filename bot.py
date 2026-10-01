@@ -5003,10 +5003,12 @@ async def handle_qr_create(update, context):
     context.user_data['state']=None; return True
 
 
-# --- COMMON GROUPS ---------------------------------------------------------
-COMMON_GROUPS_PAGE_SIZE = 12
+# --- COMMON GROUPS / USER TELEGRAM DISCOVERY -------------------------------
+COMMON_GROUPS_PAGE_SIZE = 10
 COMMON_GROUPS_MAX = 300
 COMMON_GROUPS_TIMEOUT = 18
+PUBLIC_DISCOVERY_MAX = 300
+PUBLIC_DISCOVERY_PAGES = 4
 
 
 def _common_group_marked_id(chat):
@@ -5018,7 +5020,7 @@ def _common_group_marked_id(chat):
 
 
 def _common_group_is_group(chat):
-    """Match Telegram's 'Groups' concept, not broadcast channels."""
+    """Match Telegram's group concept, excluding broadcast-only channels."""
     if chat is None:
         return False
     if chat.__class__.__name__ == "Chat":
@@ -5026,40 +5028,39 @@ def _common_group_is_group(chat):
     return bool(getattr(chat, "megagroup", False))
 
 
+def _common_group_is_public(chat):
+    return bool((getattr(chat, "username", None) or "").strip())
+
+
 def _common_group_name(chat):
     return (getattr(chat, "title", None) or "Unnamed group").strip()
 
 
-async def _common_group_link(chat):
-    """Return a real link; private groups use a recent message deep-link."""
+def _common_group_link(chat):
+    """Return an HTTP link for public chats; private chats get no fake URL."""
     username = (getattr(chat, "username", None) or "").strip().lstrip("@")
     if username:
         return f"https://t.me/{username}"
-
-    # Telegram does not expose a universal HTTP URL for a private group
-    # without a username. If the connected account can read the group, a
-    # tg://openmessage link can open it when paired with a real message ID.
-    try:
-        latest = await asyncio.wait_for(
-            telethon_client.get_messages(chat, limit=1),
-            timeout=4,
-        )
-        message_id = int(getattr(latest, "id", 0) or 0)
-        chat_id = int(getattr(chat, "id", 0) or 0)
-        if message_id and chat_id:
-            return f"tg://openmessage?chat_id={chat_id}&message_id={message_id}"
-    except Exception:
-        pass
     return None
+
+
+def _common_group_message_link(chat, message_id):
+    username = (getattr(chat, "username", None) or "").strip().lstrip("@")
+    try:
+        message_id = int(message_id or 0)
+    except Exception:
+        message_id = 0
+    if username and message_id:
+        return f"https://t.me/{username}/{message_id}"
+    return _common_group_link(chat)
 
 
 async def _resolve_common_user(raw_query):
     """
     Resolve a target user using several independent layers.
 
-    A bare numeric ID is only resolvable when this Telethon session already
-    knows the user's access hash. Telegram does not let a client manufacture
-    that hash from a user ID alone.
+    Numeric IDs are only directly useful when this MTProto session has
+    previously learned the user's access hash. A username is preferred.
     """
     raw = re.sub(r"\s+", " ", (raw_query or "").strip())
     if not raw:
@@ -5084,7 +5085,9 @@ async def _resolve_common_user(raw_query):
 
         try:
             resolved = await asyncio.wait_for(
-                telethon_client(functions.contacts.ResolveUsernameRequest(username=clean)),
+                telethon_client(
+                    functions.contacts.ResolveUsernameRequest(username=clean)
+                ),
                 timeout=COMMON_GROUPS_TIMEOUT,
             )
             users = list(getattr(resolved, "users", []) or [])
@@ -5097,7 +5100,9 @@ async def _resolve_common_user(raw_query):
         if len(clean) >= 2:
             try:
                 found = await asyncio.wait_for(
-                    telethon_client(functions.contacts.SearchRequest(q=clean, limit=20)),
+                    telethon_client(
+                        functions.contacts.SearchRequest(q=clean, limit=20)
+                    ),
                     timeout=COMMON_GROUPS_TIMEOUT,
                 )
                 users = list(getattr(found, "users", []) or [])
@@ -5171,11 +5176,10 @@ async def _resolve_common_user(raw_query):
 
 async def _fetch_common_groups_for_user(user_entity):
     """
-    Canonical Telegram method first, with a bounded fallback scan.
+    Confirmed membership/shared-group pass.
 
-    This matches Telegram's official 'common groups' concept: groups shared
-    by the logged-in Telethon account and the target user. It is not a method
-    for revealing every private group another person belongs to.
+    Telegram's official getCommonChats method is the authoritative way to
+    reproduce the native 'Groups in common' view.
     """
     errors = []
 
@@ -5183,6 +5187,7 @@ async def _fetch_common_groups_for_user(user_entity):
         all_chats = []
         max_id = 0
         seen_ids = set()
+
         for _ in range(10):
             result = await asyncio.wait_for(
                 telethon_client(
@@ -5200,13 +5205,13 @@ async def _fetch_common_groups_for_user(user_entity):
             ]
             if not batch:
                 break
-            new_batch = []
+
             for chat in batch:
                 marked = _common_group_marked_id(chat)
                 if marked is not None and marked not in seen_ids:
                     seen_ids.add(marked)
-                    new_batch.append(chat)
-            all_chats.extend(new_batch)
+                    all_chats.append(chat)
+
             if len(all_chats) >= COMMON_GROUPS_MAX:
                 break
 
@@ -5224,6 +5229,7 @@ async def _fetch_common_groups_for_user(user_entity):
     except Exception as exc:
         errors.append(f"getCommonChats: {type(exc).__name__}: {exc}")
 
+    # Fallback: inspect groups already available to the connected account.
     try:
         username = (getattr(user_entity, "username", None) or "").strip()
         target_id = int(getattr(user_entity, "id", 0) or 0)
@@ -5235,39 +5241,332 @@ async def _fetch_common_groups_for_user(user_entity):
             try:
                 if username:
                     members = await asyncio.wait_for(
-                        telethon_client.get_participants(chat, search=username, limit=20),
+                        telethon_client.get_participants(
+                            chat, search=username, limit=20
+                        ),
                         timeout=5,
                     )
-                    if any(int(getattr(m, "id", -1)) == target_id for m in members):
+                    if any(
+                        int(getattr(m, "id", -1)) == target_id
+                        for m in members
+                    ):
                         found.append(chat)
                         continue
+
                 if chat.__class__.__name__ == "Chat":
                     members = await asyncio.wait_for(
                         telethon_client.get_participants(chat, limit=200),
                         timeout=5,
                     )
-                    if any(int(getattr(m, "id", -1)) == target_id for m in members):
+                    if any(
+                        int(getattr(m, "id", -1)) == target_id
+                        for m in members
+                    ):
                         found.append(chat)
             except Exception:
                 continue
+
         return found[:COMMON_GROUPS_MAX], errors
     except Exception as exc:
         errors.append(f"dialog scan: {type(exc).__name__}: {exc}")
 
-    raise RuntimeError("Common-group lookup failed: " + " | ".join(errors[-3:]))
+    raise RuntimeError(
+        "Common-group lookup failed: " + " | ".join(errors[-3:])
+    )
+
+
+def _public_discovery_queries(user_entity):
+    """Build conservative public-search terms from the target profile."""
+    values = []
+    username = (getattr(user_entity, "username", None) or "").strip().lstrip("@")
+    first = (getattr(user_entity, "first_name", None) or "").strip()
+    last = (getattr(user_entity, "last_name", None) or "").strip()
+
+    if username and len(username) >= 2:
+        values.append(username)
+        values.append("@" + username)
+
+    full_name = " ".join(x for x in (first, last) if x).strip()
+    if len(full_name) >= 3:
+        values.append(full_name)
+
+    if len(first) >= 4:
+        values.append(first)
+
+    seen = set()
+    out = []
+    for value in values:
+        value = re.sub(r"\s+", " ", value).strip()
+        key = value.lower()
+        if value and key not in seen:
+            seen.add(key)
+            out.append(value)
+    return out[:4]
+
+
+async def _search_global_public_chats(query, kind):
+    """
+    Search public Telegram groups/channels connected to a query.
+
+    This is intentionally an evidence/discovery pass, not a claim that the
+    target is a member. It is useful for reproducing reports like the example
+    where public message links and public chat links are shown.
+    """
+    if not query:
+        return []
+
+    if kind == "group":
+        flags = {"groups_only": True}
+    else:
+        flags = {"broadcasts_only": True}
+
+    found = []
+    seen_messages = set()
+    peer_map = {}
+    offset_rate = 0
+    offset_id = 0
+    offset_peer = types.InputPeerEmpty()
+
+    for _ in range(PUBLIC_DISCOVERY_PAGES):
+        try:
+            result = await asyncio.wait_for(
+                telethon_client(
+                    functions.messages.SearchGlobalRequest(
+                        broadcasts_only=flags.get("broadcasts_only", False),
+                        groups_only=flags.get("groups_only", False),
+                        users_only=False,
+                        q=query,
+                        filter=types.InputMessagesFilterEmpty(),
+                        min_date=0,
+                        max_date=0,
+                        offset_rate=offset_rate,
+                        offset_peer=offset_peer,
+                        offset_id=offset_id,
+                        limit=50,
+                    )
+                ),
+                timeout=COMMON_GROUPS_TIMEOUT,
+            )
+        except Exception:
+            break
+
+        for entity in list(getattr(result, "chats", []) or []):
+            marked = _common_group_marked_id(entity)
+            if marked is not None:
+                peer_map[marked] = entity
+
+        messages = list(getattr(result, "messages", []) or [])
+        if not messages:
+            break
+
+        for message in messages:
+            peer = getattr(message, "peer_id", None)
+            marked = _common_group_marked_id(peer)
+            entity = peer_map.get(marked)
+            if entity is None:
+                continue
+            if not _common_group_is_public(entity):
+                continue
+            if kind == "group":
+                if not _common_group_is_group(entity):
+                    continue
+            else:
+                if _common_group_is_group(entity):
+                    continue
+                if not getattr(entity, "broadcast", False):
+                    continue
+
+            message_id = int(getattr(message, "id", 0) or 0)
+            if not message_id:
+                continue
+
+            key = (marked, message_id)
+            if key in seen_messages:
+                continue
+            seen_messages.add(key)
+
+            found.append({
+                "chat": entity,
+                "message": message,
+                "message_link": _common_group_message_link(entity, message_id),
+                "chat_link": _common_group_link(entity),
+                "query": query,
+                "kind": kind,
+            })
+
+        next_rate = getattr(result, "next_rate", None)
+        last_message = messages[-1]
+        last_message_id = int(getattr(last_message, "id", 0) or 0)
+        last_marked = _common_group_marked_id(
+            getattr(last_message, "peer_id", None)
+        )
+        last_entity = peer_map.get(last_marked)
+        if not last_message_id or last_entity is None:
+            break
+
+        if next_rate is None:
+            last_date = getattr(last_message, "date", None)
+            if last_date is None:
+                break
+            try:
+                next_rate = int(last_date.timestamp())
+            except Exception:
+                break
+
+        try:
+            next_peer = await telethon_client.get_input_entity(last_entity)
+        except Exception:
+            break
+
+        if (
+            int(next_rate) == int(offset_rate)
+            and last_message_id == int(offset_id)
+        ):
+            break
+
+        offset_rate = int(next_rate)
+        offset_id = last_message_id
+        offset_peer = next_peer
+
+        if len(found) >= PUBLIC_DISCOVERY_MAX:
+            break
+
+    return found[:PUBLIC_DISCOVERY_MAX]
+
+
+async def _discover_user_telegram_places(user_entity):
+    """
+    Multi-pass report used by the admin Common Groups button.
+
+    Passes:
+      1) official common-chat API
+      2) connected-dialog participant fallback
+      3) public group search by username
+      4) public channel search by username
+      5) public group search by display name
+      6) public channel search by display name
+
+    The first two are membership evidence for the connected account.
+    Public-search passes are explicitly labeled as discovered public traces.
+    They must never be presented as proof that the target joined a chat.
+    """
+    errors = []
+
+    # Passes 1 + 2: confirmed common groups.
+    try:
+        common_groups, common_errors = await _fetch_common_groups_for_user(user_entity)
+        errors.extend(common_errors)
+    except Exception as exc:
+        common_groups = []
+        errors.append(f"common groups: {type(exc).__name__}: {exc}")
+
+    records = []
+    seen_chat_ids = set()
+
+    for chat in common_groups:
+        marked = _common_group_marked_id(chat)
+        if marked is None or marked in seen_chat_ids:
+            continue
+        seen_chat_ids.add(marked)
+        records.append({
+            "chat": chat,
+            "message": None,
+            "message_link": None,
+            "chat_link": _common_group_link(chat),
+            "kind": "confirmed_common_group",
+            "source": "Telegram common chats",
+        })
+
+    # Passes 3-6: public evidence/discovery.
+    queries = _public_discovery_queries(user_entity)
+    for query in queries:
+        for kind in ("group", "channel"):
+            try:
+                public_hits = await _search_global_public_chats(query, kind)
+            except Exception as exc:
+                errors.append(
+                    f"public {kind} search {query!r}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                continue
+
+            for hit in public_hits:
+                chat = hit["chat"]
+                marked = _common_group_marked_id(chat)
+                if marked is None:
+                    continue
+
+                # Keep the confirmed group record if the public search also
+                # discovers it. For other chats, retain the best message hit.
+                existing = next(
+                    (
+                        item for item in records
+                        if _common_group_marked_id(item["chat"]) == marked
+                    ),
+                    None,
+                )
+                if existing and existing["kind"] == "confirmed_common_group":
+                    continue
+
+                if existing:
+                    old_date = getattr(existing.get("message"), "date", None)
+                    new_date = getattr(hit.get("message"), "date", None)
+                    if old_date and new_date and new_date <= old_date:
+                        continue
+                    records.remove(existing)
+
+                records.append({
+                    "chat": chat,
+                    "message": hit.get("message"),
+                    "message_link": hit.get("message_link"),
+                    "chat_link": hit.get("chat_link"),
+                    "kind": "public_discovery",
+                    "source": f"public search: {query}",
+                })
+
+                if len(records) >= COMMON_GROUPS_MAX:
+                    break
+
+            if len(records) >= COMMON_GROUPS_MAX:
+                break
+        if len(records) >= COMMON_GROUPS_MAX:
+            break
+
+    # Stable ordering: confirmed common groups first, then public evidence by
+    # newest message date where available.
+    def _record_sort_key(item):
+        confirmed = 1 if item.get("kind") == "confirmed_common_group" else 0
+        message = item.get("message")
+        date = getattr(message, "date", None) if message else None
+        try:
+            stamp = date.timestamp() if date else 0.0
+        except Exception:
+            stamp = 0.0
+        return (confirmed, stamp)
+
+    records.sort(key=_record_sort_key, reverse=True)
+    return records[:COMMON_GROUPS_MAX], errors
 
 
 def _common_groups_keyboard(page, total):
     rows = []
     if page > 0:
         rows.append([
-            InlineKeyboardButton("⬅️ Previous", callback_data=f"common_page_{page-1}")
+            InlineKeyboardButton(
+                "⬅️ Previous",
+                callback_data=f"common_page_{page-1}",
+            )
         ])
     if (page + 1) * COMMON_GROUPS_PAGE_SIZE < total:
         rows.append([
-            InlineKeyboardButton("Next ➡️", callback_data=f"common_page_{page+1}")
+            InlineKeyboardButton(
+                "Next ➡️",
+                callback_data=f"common_page_{page+1}",
+            )
         ])
-    rows.append([InlineKeyboardButton("⬅️ More Commands", callback_data="more")])
+    rows.append([
+        InlineKeyboardButton("⬅️ More Commands", callback_data="more")
+    ])
     return InlineKeyboardMarkup(rows)
 
 
@@ -5282,11 +5581,11 @@ async def show_common_groups(update, context, page=0):
         await query.answer()
 
     user_entity = context.user_data.get("common_groups_user")
-    groups = context.user_data.get("common_groups_results") or []
-    total = len(groups)
+    records = context.user_data.get("common_groups_results") or []
+    total = len(records)
     start = page * COMMON_GROUPS_PAGE_SIZE
     end = min(start + COMMON_GROUPS_PAGE_SIZE, total)
-    shown = groups[start:end]
+    shown = records[start:end]
 
     name = (
         f"{getattr(user_entity, 'first_name', '') or ''} "
@@ -5295,43 +5594,78 @@ async def show_common_groups(update, context, page=0):
         or str(getattr(user_entity, "id", "user"))
     )
 
+    confirmed_total = sum(
+        1 for item in records
+        if item.get("kind") == "confirmed_common_group"
+    )
+    discovered_total = sum(
+        1 for item in records
+        if item.get("kind") == "public_discovery"
+    )
+
     lines = [
-        "👥 <b>COMMON GROUPS</b>",
+        "👥 <b>TELEGRAM GROUPS & CHANNEL DISCOVERY</b>",
         f"👤 <b>{html.escape(name)}</b>",
-        f"📊 {total} group(s) in common with the connected Telegram account.",
+        f"✅ Confirmed groups in common: <b>{confirmed_total}</b>",
+        f"🔎 Public groups/channels discovered: <b>{discovered_total}</b>",
+        "",
+        "<i>Public discoveries are evidence of a public Telegram trace, "
+        "not proof of membership. Telegram does not expose a universal "
+        "API that lists every private group another user joined.</i>",
         "",
     ]
 
     if not shown:
         lines.append(
-            "ℹ️ No common groups were returned. Telegram does not expose "
-            "a list of every private group another person belongs to."
+            "ℹ️ Nothing was found from the available Telegram account/API paths."
         )
     else:
-        for index, chat in enumerate(shown, start=start + 1):
+        for index, item in enumerate(shown, start=start + 1):
+            chat = item.get("chat")
             title = html.escape(_common_group_name(chat))
-            link = await _common_group_link(chat)
-            if link:
+            kind = item.get("kind")
+            chat_link = item.get("chat_link")
+            message_link = item.get("message_link")
+            if kind == "confirmed_common_group":
+                prefix = "✅"
+            else:
+                prefix = "🔎"
+
+            if message_link and chat_link:
                 lines.append(
-                    f'{index}. <a href="{html.escape(link, quote=True)}">👥 {title}</a>'
+                    f'{index}. {prefix} <a href="{html.escape(message_link, quote=True)}">'
+                    f'💬 {title}</a> → '
+                    f'<a href="{html.escape(chat_link, quote=True)}">'
+                    f'{title}</a>'
+                )
+            elif chat_link:
+                lines.append(
+                    f'{index}. {prefix} '
+                    f'<a href="{html.escape(chat_link, quote=True)}">👥 {title}</a>'
                 )
             else:
-                lines.append(f"{index}. 👥 {title}")
+                lines.append(f"{index}. {prefix} 👥 {title}")
 
     text = "\n".join(lines)
+    markup = _common_groups_keyboard(page, total)
+
     if query:
-        await query.edit_message_text(
-            text,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-            reply_markup=_common_groups_keyboard(page, total),
-        )
+        try:
+            await query.edit_message_text(
+                text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=markup,
+            )
+        except Exception as exc:
+            if "message is not modified" not in str(exc).lower():
+                raise
     else:
         await update.message.reply_text(
             text,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
-            reply_markup=_common_groups_keyboard(page, total),
+            reply_markup=markup,
         )
 
 
@@ -5341,30 +5675,59 @@ async def handle_common_groups_query(update, context, text):
         await update.message.reply_text("🔒 Admin only.")
         return
 
+    status = None
     try:
-        user_entity, _method = await _resolve_common_user(text)
+        user_entity, resolve_method = await _resolve_common_user(text)
         context.user_data["common_groups_user"] = user_entity
+
         status = await update.message.reply_text(
-            "🔎 Resolving user and checking Telegram common groups…"
+            "🔎 Resolving user…\n"
+            "1/6 checking confirmed common groups\n"
+            "2/6 checking the connected account's group cache\n"
+            "3-6/6 searching public Telegram group/channel traces"
         )
-        groups, _errors = await _fetch_common_groups_for_user(user_entity)
-        context.user_data["common_groups_results"] = groups
+
+        records, errors = await _discover_user_telegram_places(user_entity)
+        context.user_data["common_groups_results"] = records
+        context.user_data["common_groups_resolve_method"] = resolve_method
+        context.user_data["common_groups_errors"] = errors
         context.user_data["state"] = None
-        try:
-            await status.delete()
-        except Exception:
-            pass
+
+        if status:
+            try:
+                await status.delete()
+            except Exception:
+                pass
+
         await show_common_groups(update, context, 0)
+
     except FloodWaitError as exc:
         context.user_data["state"] = None
+        if status:
+            try:
+                await status.edit_text(
+                    f"⏳ Telegram rate limit: wait {int(exc.seconds)} seconds. "
+                    "The bot stopped instead of hammering the account."
+                )
+                return
+            except Exception:
+                pass
         await update.message.reply_text(
-            f"⏳ Telegram asked the account to wait {int(exc.seconds)} seconds. "
-            "No repeated requests will be made automatically."
+            f"⏳ Telegram rate limit: wait {int(exc.seconds)} seconds."
         )
     except Exception as exc:
         context.user_data["state"] = None
+        if status:
+            try:
+                await status.edit_text(
+                    "❌ Telegram discovery failed safely.\n\n"
+                    f"{type(exc).__name__}: {str(exc)[:900]}"
+                )
+                return
+            except Exception:
+                pass
         await update.message.reply_text(
-            "❌ Common-group lookup failed safely.\n\n"
+            "❌ Telegram discovery failed safely.\n\n"
             f"{type(exc).__name__}: {str(exc)[:900]}"
         )
 
