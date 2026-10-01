@@ -731,6 +731,28 @@ async def menu_callback(update, context):
         await show_statistics(update, context); return
     if data == "profile_visitors":
         await show_profile_visitors(update, context); return
+    if data == "common":
+        if not is_admin(user_id):
+            await query.answer("🔒 Admin only", show_alert=True)
+            return
+        context.user_data.pop("common_groups_results", None)
+        context.user_data.pop("common_groups_user", None)
+        context.user_data["state"] = "common_query"
+        await query.answer()
+        await query.message.reply_text(
+            "👥 COMMON GROUPS\n\n"
+            "Send the Telegram @username or numeric user ID.\n\n"
+            "Example: @username\n"
+            "Example: 123456789"
+        )
+        return
+    if data.startswith("common_page_"):
+        try:
+            page = max(0, int(data.removeprefix("common_page_")))
+        except ValueError:
+            page = 0
+        await show_common_groups(update, context, page)
+        return
     if data == "story_viewers":
         context.user_data.pop("admin_story_posts", None)
         await show_story_viewers(update, context, 0); return
@@ -4980,6 +5002,361 @@ async def handle_qr_create(update, context):
     except Exception as e: await status.edit_text('❌ QR creation failed: '+str(e)[:1000])
     context.user_data['state']=None; return True
 
+
+# --- COMMON GROUPS ---------------------------------------------------------
+COMMON_GROUPS_PAGE_SIZE = 12
+COMMON_GROUPS_MAX = 300
+COMMON_GROUPS_TIMEOUT = 18
+
+
+def _common_group_marked_id(chat):
+    try:
+        return int(get_peer_id(chat))
+    except Exception:
+        chat_id = getattr(chat, "id", None)
+        return int(chat_id) if chat_id is not None else None
+
+
+def _common_group_is_group(chat):
+    """Match Telegram's 'Groups' concept, not broadcast channels."""
+    if chat is None:
+        return False
+    if chat.__class__.__name__ == "Chat":
+        return True
+    return bool(getattr(chat, "megagroup", False))
+
+
+def _common_group_name(chat):
+    return (getattr(chat, "title", None) or "Unnamed group").strip()
+
+
+def _common_group_link(chat):
+    """Return a safe clickable Telegram link without creating/inventing invites."""
+    username = (getattr(chat, "username", None) or "").strip().lstrip("@")
+    if username:
+        return f"https://t.me/{username}"
+    marked = _common_group_marked_id(chat)
+    if marked is not None:
+        return f"tg://openmessage?chat_id={marked}"
+    return None
+
+
+async def _resolve_common_user(raw_query):
+    """
+    Resolve a target user using several independent layers.
+
+    A bare numeric ID is only resolvable when this Telethon session already
+    knows the user's access hash. Telegram does not let a client manufacture
+    that hash from a user ID alone.
+    """
+    raw = re.sub(r"\s+", " ", (raw_query or "").strip())
+    if not raw:
+        raise ValueError("Please enter a Telegram username or numeric user ID.")
+
+    clean = raw
+    if clean.startswith("https://t.me/") or clean.startswith("http://t.me/"):
+        clean = clean.split("t.me/", 1)[1].split("/", 1)[0]
+    clean = clean.strip().lstrip("@")
+
+    if clean and not clean.lstrip("-").isdigit():
+        try:
+            entity = await asyncio.wait_for(
+                telethon_client.get_entity(clean),
+                timeout=COMMON_GROUPS_TIMEOUT,
+            )
+            if getattr(entity, "bot", False):
+                raise ValueError("The supplied account is a bot, not a user.")
+            return entity, "direct username"
+        except Exception:
+            pass
+
+        try:
+            resolved = await asyncio.wait_for(
+                telethon_client(functions.contacts.ResolveUsernameRequest(username=clean)),
+                timeout=COMMON_GROUPS_TIMEOUT,
+            )
+            users = list(getattr(resolved, "users", []) or [])
+            user = next((u for u in users if not getattr(u, "bot", False)), None)
+            if user is not None:
+                return user, "contacts.resolveUsername"
+        except Exception:
+            pass
+
+        if len(clean) >= 2:
+            try:
+                found = await asyncio.wait_for(
+                    telethon_client(functions.contacts.SearchRequest(q=clean, limit=20)),
+                    timeout=COMMON_GROUPS_TIMEOUT,
+                )
+                users = list(getattr(found, "users", []) or [])
+                exact = [
+                    u for u in users
+                    if (getattr(u, "username", "") or "").lower() == clean.lower()
+                    and not getattr(u, "bot", False)
+                ]
+                if exact:
+                    return exact[0], "contacts.search"
+                if len(users) == 1 and not getattr(users[0], "bot", False):
+                    return users[0], "contacts.search"
+            except Exception:
+                pass
+
+    if clean.lstrip("-").isdigit():
+        try:
+            entity = await asyncio.wait_for(
+                telethon_client.get_input_entity(int(clean)),
+                timeout=COMMON_GROUPS_TIMEOUT,
+            )
+            entity = await asyncio.wait_for(
+                telethon_client.get_entity(entity),
+                timeout=COMMON_GROUPS_TIMEOUT,
+            )
+            if getattr(entity, "bot", False):
+                raise ValueError("The supplied account is a bot, not a user.")
+            return entity, "cached numeric ID"
+        except Exception:
+            pass
+
+    try:
+        target_id = int(clean) if clean.lstrip("-").isdigit() else None
+        async for dialog in telethon_client.iter_dialogs(limit=200):
+            entity = getattr(dialog, "entity", None)
+            if entity is None or getattr(entity, "bot", False):
+                continue
+            if target_id is not None and int(getattr(entity, "id", -1)) == abs(target_id):
+                return entity, "dialog cache"
+            username = (getattr(entity, "username", "") or "").lower().lstrip("@")
+            if clean and username == clean.lower():
+                return entity, "dialog username cache"
+    except Exception:
+        pass
+
+    if clean.lstrip("-").isdigit():
+        try:
+            conn = sqlite3.connect("bot_data.db")
+            row = conn.execute(
+                "SELECT user_id, username FROM user_history WHERE user_id=? "
+                "ORDER BY date DESC LIMIT 1",
+                (abs(int(clean)),),
+            ).fetchone()
+            conn.close()
+            if row and row[1]:
+                entity = await asyncio.wait_for(
+                    telethon_client.get_entity(str(row[1]).lstrip("@")),
+                    timeout=COMMON_GROUPS_TIMEOUT,
+                )
+                if int(getattr(entity, "id", -1)) == abs(int(clean)):
+                    return entity, "bot history + username"
+        except Exception:
+            pass
+
+    raise ValueError(
+        "Telegram could not resolve that user from this account. "
+        "Try the person's @username. A numeric ID works when this Telethon "
+        "session has previously encountered that user."
+    )
+
+
+async def _fetch_common_groups_for_user(user_entity):
+    """
+    Canonical Telegram method first, with a bounded fallback scan.
+
+    This matches Telegram's official 'common groups' concept: groups shared
+    by the logged-in Telethon account and the target user. It is not a method
+    for revealing every private group another person belongs to.
+    """
+    errors = []
+
+    try:
+        all_chats = []
+        max_id = 0
+        seen_ids = set()
+        for _ in range(10):
+            result = await asyncio.wait_for(
+                telethon_client(
+                    functions.messages.GetCommonChatsRequest(
+                        user_id=user_entity,
+                        max_id=max_id,
+                        limit=100,
+                    )
+                ),
+                timeout=COMMON_GROUPS_TIMEOUT,
+            )
+            batch = [
+                chat for chat in (getattr(result, "chats", []) or [])
+                if _common_group_is_group(chat)
+            ]
+            if not batch:
+                break
+            new_batch = []
+            for chat in batch:
+                marked = _common_group_marked_id(chat)
+                if marked is not None and marked not in seen_ids:
+                    seen_ids.add(marked)
+                    new_batch.append(chat)
+            all_chats.extend(new_batch)
+            if len(all_chats) >= COMMON_GROUPS_MAX:
+                break
+
+            ids = [
+                int(getattr(chat, "id", 0) or 0)
+                for chat in batch
+                if getattr(chat, "id", None) is not None
+            ]
+            next_max = min(ids) if ids else 0
+            if not next_max or next_max == max_id:
+                break
+            max_id = next_max
+
+        return all_chats[:COMMON_GROUPS_MAX], errors
+    except Exception as exc:
+        errors.append(f"getCommonChats: {type(exc).__name__}: {exc}")
+
+    try:
+        username = (getattr(user_entity, "username", None) or "").strip()
+        target_id = int(getattr(user_entity, "id", 0) or 0)
+        found = []
+        async for dialog in telethon_client.iter_dialogs(limit=150):
+            chat = getattr(dialog, "entity", None)
+            if not _common_group_is_group(chat):
+                continue
+            try:
+                if username:
+                    members = await asyncio.wait_for(
+                        telethon_client.get_participants(chat, search=username, limit=20),
+                        timeout=5,
+                    )
+                    if any(int(getattr(m, "id", -1)) == target_id for m in members):
+                        found.append(chat)
+                        continue
+                if chat.__class__.__name__ == "Chat":
+                    members = await asyncio.wait_for(
+                        telethon_client.get_participants(chat, limit=200),
+                        timeout=5,
+                    )
+                    if any(int(getattr(m, "id", -1)) == target_id for m in members):
+                        found.append(chat)
+            except Exception:
+                continue
+        return found[:COMMON_GROUPS_MAX], errors
+    except Exception as exc:
+        errors.append(f"dialog scan: {type(exc).__name__}: {exc}")
+
+    raise RuntimeError("Common-group lookup failed: " + " | ".join(errors[-3:]))
+
+
+def _common_groups_keyboard(page, total):
+    rows = []
+    if page > 0:
+        rows.append([
+            InlineKeyboardButton("⬅️ Previous", callback_data=f"common_page_{page-1}")
+        ])
+    if (page + 1) * COMMON_GROUPS_PAGE_SIZE < total:
+        rows.append([
+            InlineKeyboardButton("Next ➡️", callback_data=f"common_page_{page+1}")
+        ])
+    rows.append([InlineKeyboardButton("⬅️ More Commands", callback_data="more")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_common_groups(update, context, page=0):
+    query = update.callback_query
+    if not is_admin(update.effective_user.id):
+        if query:
+            await query.answer("🔒 Admin only", show_alert=True)
+        return
+
+    if query:
+        await query.answer()
+
+    user_entity = context.user_data.get("common_groups_user")
+    groups = context.user_data.get("common_groups_results") or []
+    total = len(groups)
+    start = page * COMMON_GROUPS_PAGE_SIZE
+    end = min(start + COMMON_GROUPS_PAGE_SIZE, total)
+    shown = groups[start:end]
+
+    name = (
+        f"{getattr(user_entity, 'first_name', '') or ''} "
+        f"{getattr(user_entity, 'last_name', '') or ''}".strip()
+        or getattr(user_entity, "username", None)
+        or str(getattr(user_entity, "id", "user"))
+    )
+
+    lines = [
+        "👥 <b>COMMON GROUPS</b>",
+        f"👤 <b>{html.escape(name)}</b>",
+        f"📊 {total} group(s) in common with the connected Telegram account.",
+        "",
+    ]
+
+    if not shown:
+        lines.append(
+            "ℹ️ No common groups were returned. Telegram does not expose "
+            "a list of every private group another person belongs to."
+        )
+    else:
+        for index, chat in enumerate(shown, start=start + 1):
+            title = html.escape(_common_group_name(chat))
+            link = _common_group_link(chat)
+            if link:
+                lines.append(
+                    f'{index}. <a href="{html.escape(link, quote=True)}">👥 {title}</a>'
+                )
+            else:
+                lines.append(f"{index}. 👥 {title}")
+
+    text = "\n".join(lines)
+    if query:
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=_common_groups_keyboard(page, total),
+        )
+    else:
+        await update.message.reply_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=_common_groups_keyboard(page, total),
+        )
+
+
+async def handle_common_groups_query(update, context, text):
+    if not is_admin(update.effective_user.id):
+        context.user_data["state"] = None
+        await update.message.reply_text("🔒 Admin only.")
+        return
+
+    try:
+        user_entity, _method = await _resolve_common_user(text)
+        context.user_data["common_groups_user"] = user_entity
+        status = await update.message.reply_text(
+            "🔎 Resolving user and checking Telegram common groups…"
+        )
+        groups, _errors = await _fetch_common_groups_for_user(user_entity)
+        context.user_data["common_groups_results"] = groups
+        context.user_data["state"] = None
+        try:
+            await status.delete()
+        except Exception:
+            pass
+        await show_common_groups(update, context, 0)
+    except FloodWaitError as exc:
+        context.user_data["state"] = None
+        await update.message.reply_text(
+            f"⏳ Telegram asked the account to wait {int(exc.seconds)} seconds. "
+            "No repeated requests will be made automatically."
+        )
+    except Exception as exc:
+        context.user_data["state"] = None
+        await update.message.reply_text(
+            "❌ Common-group lookup failed safely.\n\n"
+            f"{type(exc).__name__}: {str(exc)[:900]}"
+        )
+
+
 # --- MAIN HANDLER ---
 async def handle_link(update, context):
     user_id = update.effective_user.id
@@ -5047,6 +5424,7 @@ async def handle_link(update, context):
     if state:
         context.user_data['state'] = None
         if state == 'profile_query': await fetch_profile(update, context, text)
+        elif state == 'common_query': await handle_common_groups_query(update, context, text)
         elif state == 'search_query': await fetch_search(update, context, text)
         elif state == 'words': await fetch_words(update, context, text)
         elif state == 'friends': await fetch_friends(update, context, text)
