@@ -728,6 +728,20 @@ async def menu_callback(update, context):
         if not is_admin(user_id):
             await query.answer("🔒 Admin only", show_alert=True); return
         await show_statistics(update, context); return
+    if data == "profile_visitors":
+        await show_profile_visitors(update, context); return
+    if data == "story_viewers":
+        context.user_data.pop("admin_story_posts", None)
+        await show_story_viewers(update, context, 0); return
+    if data == "story_viewers_refresh":
+        context.user_data.pop("admin_story_posts", None)
+        await show_story_viewers(update, context, context.user_data.get("admin_story_index", 0)); return
+    if data.startswith("admin_story_"):
+        try:
+            story_index = int(data.removeprefix("admin_story_"))
+        except ValueError:
+            await query.answer("Invalid story.", show_alert=True); return
+        await show_story_viewers(update, context, story_index); return
     # Dynamic search filter buttons. They are created from the actual result
     # types, so a filter is shown only when it has matching results.
     if data.startswith("sf_"):
@@ -774,6 +788,7 @@ async def menu_callback(update, context):
             admin_buttons = [
                 [InlineKeyboardButton("💬 Message Manager", callback_data="message_manager")],
                 [InlineKeyboardButton("📊 Statistics", callback_data="stats")],
+                [InlineKeyboardButton("👀 Profile Visitors", callback_data="profile_visitors"), InlineKeyboardButton("📖 Story Viewers", callback_data="story_viewers")],
                 [InlineKeyboardButton("🔔 Track", callback_data="track"), InlineKeyboardButton("🔗 Names", callback_data="names")],
                 [InlineKeyboardButton("👥 Groups", callback_data="groups"), InlineKeyboardButton("💬 Messages", callback_data="messages")],
                 [InlineKeyboardButton("🔎 Analysis", callback_data="analysis"), InlineKeyboardButton("📢 Channels", callback_data="channels")],
