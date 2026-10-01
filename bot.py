@@ -3700,6 +3700,63 @@ async def _search_global_batch(query, offset_rate, offset_peer, offset_id):
     )
 
 
+async def _search_public_posts(query):
+    """Search public channel posts globally when Telegram permits the query."""
+    request_cls = getattr(functions.channels, "SearchPostsRequest", None)
+    if request_cls is None:
+        return [], {}, "unsupported"
+    normalized = (query or "").strip().lower()
+    is_hashtag = normalized.startswith("#") and " " not in normalized
+    posts = []
+    peer_map = {}
+    offset_rate = 0
+    offset_peer = types.InputPeerEmpty()
+    offset_id = 0
+    last_state = None
+    for _ in range(3):
+        kwargs = {"offset_rate": int(offset_rate or 0), "offset_peer": offset_peer, "offset_id": int(offset_id or 0), "limit": 100}
+        kwargs["hashtag" if is_hashtag else "query"] = normalized[1:] if is_hashtag else normalized
+        try:
+            result = await telethon_client(request_cls(**kwargs))
+        except Exception as e:
+            print(f"[Search] Public-post search skipped: {type(e).__name__}: {e}")
+            return posts, peer_map, type(e).__name__
+        for entity in list(getattr(result, "chats", []) or []) + list(getattr(result, "users", []) or []):
+            marked = _search_peer_marked_id(entity)
+            if marked is not None:
+                peer_map[marked] = entity
+        batch = list(getattr(result, "messages", []) or [])
+        posts.extend(batch)
+        if not batch:
+            break
+        next_rate = getattr(result, "next_rate", None)
+        last = batch[-1]
+        last_id = int(getattr(last, "id", 0) or 0)
+        last_entity = peer_map.get(_search_peer_marked_id(getattr(last, "peer_id", None)))
+        if not last_id or last_entity is None:
+            break
+        if next_rate is None:
+            last_date = getattr(last, "date", None)
+            if last_date is None:
+                break
+            try:
+                next_rate = int(last_date.timestamp())
+            except Exception:
+                break
+        try:
+            next_peer = await telethon_client.get_input_entity(last_entity)
+        except Exception:
+            break
+        state = (int(next_rate), last_id, repr(next_peer))
+        if state == last_state:
+            break
+        last_state = state
+        offset_rate = int(next_rate)
+        offset_id = last_id
+        offset_peer = next_peer
+    return posts, peer_map, None
+
+
 async def fetch_search(update, context, query):
     query = re.sub(r"\s+", " ", (query or "").strip())
     if not query:
@@ -3822,6 +3879,37 @@ async def fetch_search(update, context, query):
 
             if page_count >= 10:
                 break
+
+        # Also search Telegram's dedicated global public-channel post index.
+        # This is separate from the connected account's joined chats.
+        post_messages, post_peers, post_error = await _search_public_posts(query)
+        peer_map.update(post_peers)
+        for message in post_messages:
+            marked_peer = _search_peer_marked_id(getattr(message, "peer_id", None))
+            entity = peer_map.get(marked_peer)
+            if entity is None or not _search_public_entity(entity):
+                continue
+            if _search_peer_kind(entity) != "channel":
+                continue
+            message_id = getattr(message, "id", None)
+            if not message_id:
+                continue
+            key = (marked_peer, int(message_id))
+            if key in seen_messages:
+                continue
+            seen_messages.add(key)
+            results.append({
+                "kind": "message", "type": _search_message_type(message),
+                "peer_type": "channel", "peer_id": marked_peer,
+                "entity": entity, "message": message,
+                "link": _search_message_link(entity, message_id),
+                "content": _search_content(message),
+                "title": _search_peer_name(entity),
+                "username": getattr(entity, "username", None),
+                "date": getattr(message, "date", None),
+                "score": _search_relevance_score(query, entity, message) + 250,
+                "server_rank": len(results),
+            })
 
         # Add public peers returned by Telegram as secondary results, but only
         # when the peer itself matches the query and has not produced a message.
