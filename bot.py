@@ -685,10 +685,50 @@ async def ar_cancel(update, context):
     context.user_data['state'] = None
     await ar_show_menu(update, context)
 
+
+async def whisper_command(update, context):
+    """Admin-only group whisper: reply to a user's message with /whisper <text>."""
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not is_admin(user.id):
+        await message.reply_text("⛔ This command is temporarily available to admins only.")
+        return
+    if message.chat.type not in ("group", "supergroup"):
+        await message.reply_text("Use /whisper as a reply to a user's message in a group.")
+        return
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        await message.reply_text("Reply to the intended user's message with /whisper <private text>.")
+        return
+    text = " ".join(context.args or []).strip()
+    if not text:
+        await message.reply_text("Usage: reply to a user's message with /whisper <text>.")
+        return
+    recipient = message.reply_to_message.from_user
+    token = uuid.uuid4().hex[:12]
+    context.bot_data.setdefault("whisper_messages", {})[token] = {
+        "recipient_id": recipient.id, "text": text[:3500], "expires": time.time() + 86400
+    }
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔒 Tap to view whisper", callback_data="whisper|" + token)]])
+    await message.reply_text("🔒 An admin sent a whisper for " + html.escape(recipient.first_name or "the selected user") + ".", reply_markup=keyboard)
+
+async def handle_whisper_callback(update, context, token):
+    query = update.callback_query
+    item = context.bot_data.get("whisper_messages", {}).get(token)
+    if not item or item["expires"] < time.time():
+        await query.answer("This whisper has expired.", show_alert=True)
+        return
+    if query.from_user.id != item["recipient_id"]:
+        await query.answer("This whisper is only for its intended recipient.", show_alert=True)
+        return
+    await query.answer(item["text"], show_alert=True)
+
 async def menu_callback(update, context):
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
+    if query.data and query.data.startswith("whisper|"):
+        await handle_whisper_callback(update, context, query.data.split("|", 1)[1])
+        return
     if not is_authenticated(user_id):
         await query.edit_message_text("🔐 Password required.")
         return
@@ -5976,6 +6016,7 @@ async def main():
     global PTB_BOT
     PTB_BOT = bot_app.bot
     bot_app.add_handler(CommandHandler("start", start))
+    bot_app.add_handler(CommandHandler("whisper", whisper_command))
     bot_app.add_handler(CommandHandler("logout", logout))
     bot_app.add_handler(CommandHandler("broadcast", broadcast_command))
     bot_app.add_handler(CommandHandler("setname", set_bot_name))
