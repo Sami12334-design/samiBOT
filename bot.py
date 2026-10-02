@@ -765,19 +765,25 @@ async def ar_cancel(update, context):
 
 
 async def whisper_inline_query(update, context):
-    """Create an inline whisper result for a specific Telegram user."""
+    """Create a recipient-locked whisper inline result usable in any chat.
+
+    Syntax after the bot username: <message> <recipient @username/ID>
+    """
     query = update.inline_query
     if not query:
         return
-    if not is_admin(query.from_user.id):
-        await query.answer([], cache_time=0, is_personal=True)
-        return
     raw = (query.query or "").strip()
-    parts = raw.split(None, 1)
-    if len(parts) < 2 or not parts[1].strip():
+    parts = raw.split()
+    if len(parts) < 2:
         await query.answer([], cache_time=0, is_personal=True)
         return
-    target, secret = parts[0], parts[1].strip()
+
+    # Match the common format: message text followed by recipient ID/username.
+    target = parts[-1]
+    secret = " ".join(parts[:-1]).strip()
+    if not secret:
+        await query.answer([], cache_time=0, is_personal=True)
+        return
     try:
         if target.lstrip("@").isdigit():
             recipient_id = int(target.lstrip("@"))
@@ -785,28 +791,31 @@ async def whisper_inline_query(update, context):
                 raise ValueError("Invalid user ID")
             recipient_name = "the selected user"
         else:
-            chat = await context.bot.get_chat(target if target.startswith("@") else "@" + target)
-            if getattr(chat, "type", None) != "private":
-                raise ValueError("That username does not resolve to a user")
-            recipient_id = chat.id
-            recipient_name = getattr(chat, "first_name", None) or "the selected user"
+            resolved = await context.bot.get_chat(target if target.startswith("@") else "@" + target)
+            if getattr(resolved, "type", None) != "private":
+                raise ValueError("Target is not a private user")
+            recipient_id = resolved.id
+            recipient_name = getattr(resolved, "first_name", None) or "the selected user"
     except Exception:
         await query.answer([], cache_time=0, is_personal=True)
         return
 
     token = uuid.uuid4().hex[:12]
     context.bot_data.setdefault("whisper_messages", {})[token] = {
-        "recipient_id": recipient_id, "text": secret[:3500],
+        "recipient_id": recipient_id,
+        "text": secret[:3500],
         "expires": time.time() + 86400
     }
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔒 Tap to view whisper", callback_data="whisper|" + token)
+        InlineKeyboardButton("👁️ Read content", callback_data="whisper|" + token)
     ]])
     result = InlineQueryResultArticle(
         id=token,
-        title="🔒 Send private whisper",
-        description="Only " + recipient_name + " can reveal the message",
-        input_message_content=InputTextMessageContent("🔒 A private whisper is here for its intended recipient."),
+        title="💌 Send a whisper",
+        description="Only " + recipient_name + " can reveal the content",
+        input_message_content=InputTextMessageContent(
+            "🔒 Whisper for " + recipient_name + ". Only they can read the content."
+        ),
         reply_markup=keyboard,
     )
     await query.answer([result], cache_time=0, is_personal=True)
