@@ -975,6 +975,7 @@ async def menu_callback(update, context):
         if is_admin(user_id):
             admin_buttons = [
                 [InlineKeyboardButton("💬 Message Manager", callback_data="message_manager")],
+                [InlineKeyboardButton("🕰️ Message Time Machine", callback_data="time_machine")],
                 [InlineKeyboardButton("📊 Statistics", callback_data="stats")],
                 [InlineKeyboardButton("👀 Profile Visitors", callback_data="profile_visitors"), InlineKeyboardButton("📖 Story Viewers", callback_data="story_viewers")],
                 [InlineKeyboardButton("🔔 Track", callback_data="track"), InlineKeyboardButton("🔗 Names", callback_data="names")],
@@ -1085,6 +1086,11 @@ async def menu_callback(update, context):
             return
         context.user_data['state'] = 'names'
         await query.message.reply_text("🔗 NAMES & USERNAME HISTORY\n\nEnter a Telegram username or numeric user ID:")
+    elif data == "time_machine":
+        if not is_admin(user_id):
+            await query.answer("🔒 Admin only", show_alert=True); return
+        context.user_data["state"] = "tm_group"
+        await query.message.reply_text("🕰️ MESSAGE TIME MACHINE\\n\\n1/3 Send the group or channel @username, public link, or numeric chat ID. The connected Telegram account must have access.")
     elif data == "profile":
         await query.message.reply_text("👤 PROFILE\n\nEnter a Telegram username or ID to generate the Profile Card:")
         context.user_data['state'] = 'profile_query'
@@ -5965,6 +5971,61 @@ async def handle_common_groups_query(update, context, text):
 
 
 # --- MAIN HANDLER ---
+async def time_machine_fetch(update, context, date_text):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("🔒 Admin only."); return
+    target_text = (date_text or "").strip().lower()
+    start_dt = end_dt = None
+    if target_text not in ("all", "all time", "*"):
+        try:
+            if ".." in target_text:
+                left, right = [x.strip() for x in target_text.split("..", 1)]
+                start_dt = datetime.strptime(left, "%Y-%m-%d")
+                end_dt = datetime.strptime(right, "%Y-%m-%d") + timedelta(days=1)
+            else:
+                start_dt = datetime.strptime(target_text, "%Y-%m-%d")
+                end_dt = start_dt + timedelta(days=1)
+            if end_dt <= start_dt: raise ValueError("end before start")
+        except ValueError:
+            await update.message.reply_text("Use all, YYYY-MM-DD, or YYYY-MM-DD..YYYY-MM-DD (inclusive)."); return
+    group_ref = context.user_data.pop("tm_group", None)
+    user_ref = context.user_data.pop("tm_user", None)
+    if not group_ref or not user_ref:
+        context.user_data["state"] = None
+        await update.message.reply_text("Search session expired. Open Message Time Machine again."); return
+    status = await update.message.reply_text("🔎 Fetching matching messages…")
+    try:
+        chat = await telethon_client.get_entity(group_ref)
+        person = await telethon_client.get_entity(user_ref)
+        matches = []
+        async for item in telethon_client.iter_messages(chat, from_user=person, limit=5000):
+            dt = getattr(item, "date", None)
+            if dt and dt.tzinfo:
+                dt = dt.replace(tzinfo=None)
+            if start_dt and dt and dt < start_dt: break
+            if end_dt and dt and dt >= end_dt: continue
+            body = (getattr(item, "message", None) or getattr(item, "text", None) or "").strip()
+            if not body:
+                body = "[media/attachment]" if getattr(item, "media", None) else "[empty message]"
+            stamp = dt.strftime("%Y-%m-%d %H:%M") if dt else "unknown time"
+            link = ""
+            uname = getattr(chat, "username", None)
+            if uname: link = f" https://t.me/{uname}/{item.id}"
+            matches.append(f"• {stamp} | msg {item.id}\\n{body[:1200]}{link}")
+            if len(matches) >= 300: break
+        context.user_data["state"] = None
+        if not matches:
+            await status.edit_text("No matching messages found in the accessible history."); return
+        await status.edit_text(f"✅ Found {len(matches)} message(s). Sending results in batches. (Scan capped at 5,000 history items / 300 matches.)")
+        for offset in range(0, len(matches), 8):
+            chunk = matches[offset:offset+8]
+            text = f"🕰️ Results {offset+1}–{offset+len(chunk)} of {len(matches)}\\n\\n" + "\\n\\n".join(chunk)
+            await update.message.reply_text(text[:3900], disable_web_page_preview=True)
+    except Exception as exc:
+        context.user_data["state"] = None
+        await status.edit_text("❌ Could not search this chat: " + html.escape(f"{type(exc).__name__}: {str(exc)[:500]}"))
+
 async def handle_link(update, context):
     user_id = update.effective_user.id
     text = update.message.text if update.message.text else ""
@@ -6063,6 +6124,33 @@ async def handle_link(update, context):
             await update.message.reply_text("✅ Reply sent!")
         except Exception as e:
             await update.message.reply_text(f"❌ Failed: {e}")
+        return
+    state = context.user_data.get("state")
+    if state in ("tm_group", "tm_user", "tm_date"):
+        if not is_admin(user_id):
+            context.user_data["state"] = None
+            await update.message.reply_text("🔒 Admin only."); return
+        value = (text or "").strip()
+        if state == "tm_group":
+            try:
+                entity = await telethon_client.get_entity(value)
+                context.user_data["tm_group"] = entity
+                context.user_data["state"] = "tm_user"
+                await update.message.reply_text("2/3 Send the target user's @username or numeric ID.")
+            except Exception as exc:
+                await update.message.reply_text("Could not access that group/channel. Check the identifier and account access, then try again.")
+            return
+        if state == "tm_user":
+            try:
+                entity = await telethon_client.get_entity(value)
+                context.user_data["tm_user"] = entity
+                context.user_data["state"] = "tm_date"
+                await update.message.reply_text("3/3 Choose time: all, one day (YYYY-MM-DD), or inclusive range (YYYY-MM-DD..YYYY-MM-DD).")
+            except Exception:
+                await update.message.reply_text("Could not resolve that user. Try @username or numeric ID."); return
+            return
+        context.user_data["state"] = None
+        await time_machine_fetch(update, context, value)
         return
     state = context.user_data.get('state')
     if state:
