@@ -812,78 +812,67 @@ async def whisper_inline_query(update, context):
     await query.answer([result], cache_time=0, is_personal=True)
 
 async def whisper_command(update, context):
-    """Create a recipient-locked whisper button in a group.
+    """Post a recipient-locked whisper using the connected Telegram user account.
 
-    Usage:
-      - Reply to a user's message: /whisper private message
-      - Target a username or numeric Telegram ID: /whisper @username private message
-      - Reply to a forwarded message when Telegram preserves its sender.
+    Usage: /whisper <group @username/ID> <recipient @username/ID> <message>
+    Run this command in the bot's private chat.
     """
     user = update.effective_user
     message = update.effective_message
     if not user or not is_admin(user.id):
         await message.reply_text("⛔ Whisper is currently available to admins only.")
         return
-    if not message or message.chat.type not in ("group", "supergroup"):
-        await message.reply_text("Use /whisper in a group, either as a reply or with a username/ID.")
-        return
-
     args = list(context.args or [])
-    recipient = None
-    secret = ""
-
-    # Explicit target mode: /whisper @username message or /whisper 123456 message
-    if len(args) >= 2 and (args[0].startswith("@") or args[0].lstrip("-").isdigit()):
-        target = args.pop(0)
-        secret = " ".join(args).strip()
-        try:
-            if target.lstrip("@").isdigit():
-                recipient_id = int(target.lstrip("@"))
-                if recipient_id <= 0:
-                    raise ValueError("Invalid Telegram user ID")
-                recipient_name = "the selected user"
-            else:
-                resolved = await context.bot.get_chat(target)
-                if getattr(resolved, "type", None) != "private":
-                    raise ValueError("Target is not a private user")
-                recipient_id = resolved.id
-                recipient_name = getattr(resolved, "first_name", None) or "the selected user"
-        except Exception:
-            await message.reply_text(
-                "❌ I couldn't resolve that recipient. Use a valid @username or numeric ID. "
-                "A username may not be resolvable until the person has interacted with the bot."
-            )
-            return
-    else:
-        secret = " ".join(args).strip()
-        replied = message.reply_to_message
-        if not replied or not replied.from_user:
-            await message.reply_text(
-                "Reply to the recipient's message with /whisper <private text>, "
-                "or use /whisper @username <private text>."
-            )
-            return
-        recipient_id = replied.from_user.id
-        recipient_name = replied.from_user.first_name or "the selected user"
-
-    if not secret:
-        await message.reply_text("Add the private message after /whisper.")
+    if message.chat.type != "private" or len(args) < 3:
+        await message.reply_text(
+            "Usage:\n/whisper <group @username/ID> <recipient @username/ID> <message>\n\n"
+            "Example: /whisper @mygroup @sam Hello, this is for you."
+        )
         return
 
-    token = uuid.uuid4().hex[:12]
-    context.bot_data.setdefault("whisper_messages", {})[token] = {
-        "recipient_id": recipient_id,
-        "text": secret[:3500],
-        "expires": time.time() + 86400
-    }
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔒 Open private whisper", callback_data="whisper|" + token)
-    ]])
-    await message.reply_text(
-        "🔒 A private whisper is ready for " + html.escape(recipient_name) +
-        ". Only the intended recipient can open it.",
-        reply_markup=keyboard
-    )
+    group_ref, recipient_ref = args[0], args[1]
+    secret = " ".join(args[2:]).strip()
+    if not secret:
+        await message.reply_text("Add the whisper text after the group and recipient.")
+        return
+
+    status = await message.reply_text("🔎 Checking the group and recipient…")
+    try:
+        group = await telethon_client.get_entity(group_ref)
+        recipient = await telethon_client.get_entity(recipient_ref)
+        if not isinstance(group, (types.Chat, types.Channel)):
+            raise ValueError("That identifier is not a group or channel.")
+        if isinstance(group, types.Channel) and not getattr(group, "megagroup", False):
+            raise ValueError("Whispers can only be posted in groups, not broadcast channels.")
+        recipient_id = int(recipient.id)
+        group_id = int(get_peer_id(group))
+        token = uuid.uuid4().hex[:12]
+        context.bot_data.setdefault("whisper_messages", {})[token] = {
+            "recipient_id": recipient_id,
+            "text": secret[:3500],
+            "expires": time.time() + 86400
+        }
+
+        # The connected user account posts the visible placeholder.
+        await telethon_client.send_message(
+            group, "🔒 A private whisper is ready for its intended recipient."
+        )
+        # The bot supplies the recipient-locked button; it need not be an admin,
+        # but it must be a member of the destination group to post it.
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔒 Open private whisper", callback_data="whisper|" + token)
+        ]])
+        await context.bot.send_message(
+            chat_id=group_id,
+            text="🔐 Tap to open the whisper (only the intended recipient can reveal it).",
+            reply_markup=keyboard
+        )
+        await status.edit_text("✅ Whisper posted. The visible placeholder was sent by your connected Telegram account.")
+    except Exception as exc:
+        await status.edit_text(
+            "❌ Could not post the whisper. Check that the connected account can access the group "
+            "and that the bot is a member of it.\n" + html.escape(f"{type(exc).__name__}: {str(exc)[:500]}")
+        )
 
 async def handle_whisper_callback(update, context, token):
     query = update.callback_query
