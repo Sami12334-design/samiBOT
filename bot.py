@@ -857,17 +857,18 @@ async def whisper_command(update, context):
         # The connected user account posts the placeholder first. The bot then
         # attaches its recipient-locked button as a reply, keeping the two
         # messages visually grouped in the chat.
+        recipient_label = getattr(recipient, "first_name", None) or getattr(recipient, "title", None) or "the intended recipient"
         posted = await telethon_client.send_message(
-            group, "🔒 A private whisper is ready for its intended recipient."
+            group,
+            "🔒 Whisper for " + recipient_label + ". Only they can read the content."
         )
-        # The bot supplies the recipient-locked button; it need not be an admin,
-        # but it must be a member of the destination group to post it.
+        # The bot supplies the recipient-locked reveal button as a reply.
         keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔒 Open private whisper", callback_data="whisper|" + token)
+            InlineKeyboardButton("👁️ Read content", callback_data="whisper|" + token)
         ]])
         await context.bot.send_message(
             chat_id=group_id,
-            text="🔐 Open whisper",
+            text="",
             reply_to_message_id=posted.id,
             reply_markup=keyboard
         )
