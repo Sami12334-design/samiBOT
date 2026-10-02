@@ -854,7 +854,10 @@ async def whisper_command(update, context):
         }
 
         # The connected user account posts the visible placeholder.
-        await telethon_client.send_message(
+        # The connected user account posts the placeholder first. The bot then
+        # attaches its recipient-locked button as a reply, keeping the two
+        # messages visually grouped in the chat.
+        posted = await telethon_client.send_message(
             group, "🔒 A private whisper is ready for its intended recipient."
         )
         # The bot supplies the recipient-locked button; it need not be an admin,
@@ -864,7 +867,8 @@ async def whisper_command(update, context):
         ]])
         await context.bot.send_message(
             chat_id=group_id,
-            text="🔐 Tap to open the whisper (only the intended recipient can reveal it).",
+            text="🔐 Open whisper",
+            reply_to_message_id=posted.id,
             reply_markup=keyboard
         )
         await status.edit_text("✅ Whisper posted. The visible placeholder was sent by your connected Telegram account.")
