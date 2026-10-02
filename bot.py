@@ -812,29 +812,78 @@ async def whisper_inline_query(update, context):
     await query.answer([result], cache_time=0, is_personal=True)
 
 async def whisper_command(update, context):
-    """Admin-only group whisper: reply to a user's message with /whisper <text>."""
+    """Create a recipient-locked whisper button in a group.
+
+    Usage:
+      - Reply to a user's message: /whisper private message
+      - Target a username or numeric Telegram ID: /whisper @username private message
+      - Reply to a forwarded message when Telegram preserves its sender.
+    """
     user = update.effective_user
     message = update.effective_message
     if not user or not is_admin(user.id):
-        await message.reply_text("⛔ This command is temporarily available to admins only.")
+        await message.reply_text("⛔ Whisper is currently available to admins only.")
         return
-    if message.chat.type not in ("group", "supergroup"):
-        await message.reply_text("Use /whisper as a reply to a user's message in a group.")
+    if not message or message.chat.type not in ("group", "supergroup"):
+        await message.reply_text("Use /whisper in a group, either as a reply or with a username/ID.")
         return
-    if not message.reply_to_message or not message.reply_to_message.from_user:
-        await message.reply_text("Reply to the intended user's message with /whisper <private text>.")
+
+    args = list(context.args or [])
+    recipient = None
+    secret = ""
+
+    # Explicit target mode: /whisper @username message or /whisper 123456 message
+    if len(args) >= 2 and (args[0].startswith("@") or args[0].lstrip("-").isdigit()):
+        target = args.pop(0)
+        secret = " ".join(args).strip()
+        try:
+            if target.lstrip("@").isdigit():
+                recipient_id = int(target.lstrip("@"))
+                if recipient_id <= 0:
+                    raise ValueError("Invalid Telegram user ID")
+                recipient_name = "the selected user"
+            else:
+                resolved = await context.bot.get_chat(target)
+                if getattr(resolved, "type", None) != "private":
+                    raise ValueError("Target is not a private user")
+                recipient_id = resolved.id
+                recipient_name = getattr(resolved, "first_name", None) or "the selected user"
+        except Exception:
+            await message.reply_text(
+                "❌ I couldn't resolve that recipient. Use a valid @username or numeric ID. "
+                "A username may not be resolvable until the person has interacted with the bot."
+            )
+            return
+    else:
+        secret = " ".join(args).strip()
+        replied = message.reply_to_message
+        if not replied or not replied.from_user:
+            await message.reply_text(
+                "Reply to the recipient's message with /whisper <private text>, "
+                "or use /whisper @username <private text>."
+            )
+            return
+        recipient_id = replied.from_user.id
+        recipient_name = replied.from_user.first_name or "the selected user"
+
+    if not secret:
+        await message.reply_text("Add the private message after /whisper.")
         return
-    text = " ".join(context.args or []).strip()
-    if not text:
-        await message.reply_text("Usage: reply to a user's message with /whisper <text>.")
-        return
-    recipient = message.reply_to_message.from_user
+
     token = uuid.uuid4().hex[:12]
     context.bot_data.setdefault("whisper_messages", {})[token] = {
-        "recipient_id": recipient.id, "text": text[:3500], "expires": time.time() + 86400
+        "recipient_id": recipient_id,
+        "text": secret[:3500],
+        "expires": time.time() + 86400
     }
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔒 Tap to view whisper", callback_data="whisper|" + token)]])
-    await message.reply_text("🔒 An admin sent a whisper for " + html.escape(recipient.first_name or "the selected user") + ".", reply_markup=keyboard)
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔒 Open private whisper", callback_data="whisper|" + token)
+    ]])
+    await message.reply_text(
+        "🔒 A private whisper is ready for " + html.escape(recipient_name) +
+        ". Only the intended recipient can open it.",
+        reply_markup=keyboard
+    )
 
 async def handle_whisper_callback(update, context, token):
     query = update.callback_query
