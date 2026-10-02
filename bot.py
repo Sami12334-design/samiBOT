@@ -3228,6 +3228,19 @@ async def open_inbox_chat(update, context, index):
         await query.message.reply_text(f"⏳ Telegram asks us to wait {e.seconds} seconds before loading this conversation.")
     except Exception as e:
         await query.message.reply_text(f"❌ Could not open conversation: {type(e).__name__}: {e}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Inbox", callback_data="inbox")]]))
+async def last_seen_shortcut(update, context):
+    """Quick aliases for the existing profile/status lookup."""
+    args = context.args or []
+    if not args:
+        context.user_data["state"] = "profile_query"
+        await update.effective_message.reply_text(
+            "Send a Telegram @username or numeric ID to check its visible last-seen status.\\n"
+            "Shortcuts: /lastseen, /ls, /seen, /online, /status, /last"
+        )
+        return
+    await fetch_profile(update, context, " ".join(args))
+
+
 async def fetch_profile(update, context, target):
     try:
         entity = await telethon_client.get_entity(target)
@@ -3247,42 +3260,38 @@ async def fetch_profile(update, context, target):
         last_name = getattr(entity, "last_name", "") or ""
         display_name = f"{first_name} {last_name}".strip() or getattr(entity, "title", "Unknown")
 
-        # ---- Fetch online status (READ DIRECTLY from entity) ----
+        # ---- Fetch online status with exact timestamp when Telegram exposes it ----
         status_text = "⚪ Unknown status"
         try:
-            status = entity.status  # No extra API call, works perfectly
-
-            if status is not None:
-                if isinstance(status, types.UserStatusOnline):
-                    status_text = "🟢 Online now"
-                elif isinstance(status, types.UserStatusOffline):
-                    if status.was_online:
-                        delta = datetime.now(status.was_online.tzinfo) - status.was_online
-                        seconds = delta.total_seconds()
-                        if seconds < 60:
-                            status_text = "🟢 Last seen just now"
-                        elif seconds < 3600:
-                            minutes = int(seconds // 60)
-                            status_text = f"🟢 Last seen {minutes} minute{'s' if minutes != 1 else ''} ago"
-                        elif seconds < 86400:
-                            hours = int(seconds // 3600)
-                            status_text = f"🟢 Last seen {hours} hour{'s' if hours != 1 else ''} ago"
-                        elif seconds < 604800:
-                            days = int(seconds // 86400)
-                            status_text = f"🟢 Last seen {days} day{'s' if days != 1 else ''} ago"
-                        else:
-                            weeks = int(seconds // 604800)
-                            status_text = f"🟢 Last seen {weeks} week{'s' if weeks != 1 else ''} ago"
+            status = entity.status
+            if isinstance(status, types.UserStatusOnline):
+                status_text = "🟢 Online now"
+                until = getattr(status, "expires", None)
+                if until:
+                    status_text += f"\\n⏳ Online status expires: {until.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+            elif isinstance(status, types.UserStatusOffline):
+                was_online = getattr(status, "was_online", None)
+                if was_online:
+                    if was_online.tzinfo:
+                        local_seen = was_online.astimezone()
+                        now = datetime.now(was_online.tzinfo)
                     else:
-                        status_text = "⚪ Last seen a long time ago"
-                elif isinstance(status, types.UserStatusRecently):
-                    status_text = "🟢 Last seen recently"
-                elif isinstance(status, types.UserStatusLastWeek):
-                    status_text = "🟢 Last seen within this week"
-                elif isinstance(status, types.UserStatusLastMonth):
-                    status_text = "🟢 Last seen within this month"
-                elif isinstance(status, types.UserStatusEmpty):
+                        local_seen = was_online
+                        now = datetime.now()
+                    seconds = max(0, (now - was_online).total_seconds())
+                    exact = local_seen.strftime("%Y-%m-%d %H:%M:%S %Z").strip()
+                    ago = str(timedelta(seconds=int(seconds)))
+                    status_text = f"⚪ Last seen: {exact}\\n🕒 {ago} ago"
+                else:
                     status_text = "⚪ Last seen a long time ago"
+            elif isinstance(status, types.UserStatusRecently):
+                status_text = "🟡 Last seen recently (exact time hidden by Telegram)"
+            elif isinstance(status, types.UserStatusLastWeek):
+                status_text = "🟡 Last seen within this week (exact time hidden by Telegram)"
+            elif isinstance(status, types.UserStatusLastMonth):
+                status_text = "🟡 Last seen within this month (exact time hidden by Telegram)"
+            elif isinstance(status, types.UserStatusEmpty):
+                status_text = "⚪ Last seen a long time ago"
         except Exception as e:
             print(f"Status fetch error: {e}")
 
@@ -6322,6 +6331,8 @@ async def main():
     global PTB_BOT
     PTB_BOT = bot_app.bot
     bot_app.add_handler(CommandHandler("start", start))
+    for shortcut in ("lastseen", "ls", "seen", "online", "status", "last"):
+        bot_app.add_handler(CommandHandler(shortcut, last_seen_shortcut))
     bot_app.add_handler(CommandHandler("safety", safety_command))
     bot_app.add_handler(CommandHandler("whisper", whisper_command))
     bot_app.add_handler(InlineQueryHandler(whisper_inline_query))
