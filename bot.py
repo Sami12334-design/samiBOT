@@ -2518,10 +2518,48 @@ def tikwm_download(url: str, output_dir: str, *, quality="hd", audio=False):
     return {"path": out, "title": title}
 
 
+def cobalt_prepare(url: str, *, audio=False):
+    """Use Cobalt's independent public API for YouTube without yt-dlp extraction."""
+    endpoint = os.environ.get("COBALT_API_URL", "https://api.cobalt.tools/").strip()
+    payload = {
+        "url": url,
+        "downloadMode": "audio" if audio else "auto",
+        "audioFormat": "mp3",
+        "videoQuality": "720",
+        "filenameStyle": "pretty",
+    }
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "User-Agent": "SamiBOT/1.0",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Origin": "https://cobalt.tools",
+            "Referer": "https://cobalt.tools/",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=35) as response:
+        data = json.load(response)
+    if data.get("status") not in {"tunnel", "redirect"} or not data.get("url"):
+        raise RuntimeError(data.get("text") or data.get("error") or "Cobalt returned no downloadable media")
+    return data
+
+
 def extract_download_options(url: str):
     platform = video_platform(url)
     normalized = normalize_public_url(url) if platform == "tiktok" else url
-    # Direct yt-dlp path first.
+    # YouTube: try an independent hosted download API first, not yt-dlp clients.
+    if platform == "youtube":
+        try:
+            cobalt = cobalt_prepare(normalized)
+            return {"source": "cobalt", "platform": platform, "url": normalized,
+                    "title": cobalt.get("filename") or "YouTube video",
+                    "qualities": [720], "audio": False, "cobalt": cobalt}
+        except Exception:
+            pass
+    # Keep existing extractor path for other platforms and as a YouTube fallback.
     try:
         info = extract_ytdlp_info(normalized)
         title = info.get("title") or "Video"
@@ -2677,6 +2715,12 @@ async def handle_video_callback(update, context, data):
             audio = False
 
         def do_download():
+            if job["source"] == "cobalt":
+                ext = ".mp3" if audio else ".mp4"
+                out = os.path.join(output_dir, "cobalt_media" + ext)
+                cobalt_data = cobalt_prepare(job["url"], audio=audio) if audio else job.get("cobalt", {})
+                download_url_to_file(cobalt_data["url"], out, headers={"User-Agent": "Mozilla/5.0", "Accept": "*/*"})
+                return {"path": out, "title": cobalt_data.get("filename") or job.get("title", "YouTube video")}
             if job["source"] == "ytdlp":
                 return ytdlp_download(job["url"], output_dir, height=quality, audio=audio, title_hint=job.get("title", "video"))
             if job["source"] in {"piped", "invidious"}:
