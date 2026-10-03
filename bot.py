@@ -3624,21 +3624,32 @@ async def show_story_viewers(update, context, index=0):
             try:
                 media = getattr(story, "media", None)
                 if media is not None:
-                    media_path = tempfile.NamedTemporaryFile(delete=False, suffix=".bin").name
+                    media_doc = getattr(media, "document", None)
+                    mime = str(getattr(media_doc, "mime_type", "") or "").lower()
+                    attrs = list(getattr(media_doc, "attributes", []) or [])
+                    is_photo = getattr(media, "photo", None) is not None
+                    is_video = ("video" in mime or getattr(media, "video", None) is not None
+                                or any(type(attr).__name__.lower().endswith("videoattribute") for attr in attrs))
+                    is_gif = ("gif" in mime or getattr(media, "gif", None) is not None
+                              or any(type(attr).__name__.lower().endswith("animatedattribute") for attr in attrs))
+                    suffix = ".jpg" if is_photo else (".mp4" if is_video else (".gif" if is_gif else ".dat"))
+                    media_path = tempfile.NamedTemporaryFile(delete=False, suffix=suffix).name
                     await telethon_client.download_media(media, file=media_path)
                     if os.path.exists(media_path) and os.path.getsize(media_path) > 0:
-                        media_doc = getattr(media, "document", None)
-                        mime = str(getattr(media_doc, "mime_type", "") or "").lower()
-                        caption = f"📖 Story {index + 1}/{len(stories)} • {getattr(story, 'id', '?')}"
+                        caption = f"📖 Story {index + 1}/{len(stories)} • ID {getattr(story, 'id', '?')}"
                         with open(media_path, "rb") as media_file:
-                            if getattr(media, "photo", None) is not None:
+                            if is_photo:
                                 sent = await context.bot.send_photo(query.message.chat_id, photo=media_file, caption=caption)
-                            elif "video" in mime or getattr(media, "video", None) is not None:
+                            elif is_video:
                                 sent = await context.bot.send_video(query.message.chat_id, video=media_file, caption=caption, supports_streaming=True)
-                            elif "gif" in mime or getattr(media, "gif", None) is not None:
+                            elif is_gif:
                                 sent = await context.bot.send_animation(query.message.chat_id, animation=media_file, caption=caption)
                             else:
-                                sent = await context.bot.send_document(query.message.chat_id, document=media_file, caption=caption)
+                                sent = await context.bot.send_document(
+                                    query.message.chat_id,
+                                    document=InputFile(media_file, filename=f"story_{getattr(story, 'id', 'media')}{suffix}"),
+                                    caption=caption
+                                )
                         sent_ids.append(sent.message_id)
             except Exception as media_error:
                 print(f"[Story viewers] Media send failed: {type(media_error).__name__}: {media_error}")
