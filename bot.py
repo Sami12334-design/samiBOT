@@ -3251,11 +3251,9 @@ async def fetch_profile(update, context, target):
         context.user_data["post_entity"] = entity
         context.user_data["story_entity"] = entity
 
-        # Profile visits are tracked only when the lookup target is one of the
-        # configured admins. This is a bot-level visit metric, not a Telegram
-        # profile-view API (Telegram does not expose arbitrary profile viewers).
-        if is_admin(int(getattr(entity, "id", 0) or 0)):
-            record_profile_visit(entity.id, update.effective_user)
+        # Track lookups for any target, not only configured admins. This is
+        # a bot-level lookup metric, not a Telegram profile-view API.
+        record_profile_visit(entity.id, update.effective_user)
 
         save_user_history(entity.id, getattr(entity, "username", None), getattr(entity, "first_name", ""), getattr(entity, "last_name", ""))
 
@@ -3335,10 +3333,7 @@ async def fetch_profile(update, context, target):
 async def show_profile_visitors(update, context):
     query = update.callback_query
     user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await query.answer("🔒 Admin only", show_alert=True)
-        return
-    await query.answer("Loading profile visitors…")
+    await query.answer("Loading your profile lookup visitors…")
 
     # Remove the previous visitor report so refresh does not stack copies.
     for message_id in context.user_data.pop("profile_visitor_message_ids", []):
