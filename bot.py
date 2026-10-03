@@ -369,6 +369,7 @@ def stats_counts():
     out = {}
     for label, q in (
         ("users", "SELECT COUNT(*) FROM users"),
+        ("started", "SELECT COUNT(*) FROM started_users"),
         ("inbox", "SELECT COUNT(*) FROM inbox"),
         ("history", "SELECT COUNT(*) FROM user_history"),
         ("ar_rules", "SELECT COUNT(*) FROM auto_responder"),
@@ -484,6 +485,12 @@ async def handle_telethon_error(update, error):
 
 async def start(update, context):
     user_id = update.effective_user.id
+    conn = sqlite3.connect('bot_data.db')
+    conn.execute("CREATE TABLE IF NOT EXISTS started_users (user_id INTEGER PRIMARY KEY, first_started TEXT NOT NULL)")
+    conn.execute("INSERT OR IGNORE INTO started_users (user_id, first_started) VALUES (?, ?)",
+                 (user_id, datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+    conn.close()
     self_ping()
     if not is_authenticated(user_id):
         context.user_data['state'] = 'awaiting_password'
