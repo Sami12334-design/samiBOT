@@ -289,16 +289,22 @@ def record_profile_visit(target_id, visitor):
     conn.close()
 
 def get_profile_visits(target_id):
+    """Return only lookup records for the exact Telegram account whose profile is being viewed."""
+    try:
+        owner_id = int(target_id)
+    except (TypeError, ValueError):
+        return []
     conn = sqlite3.connect('bot_data.db')
-    c = conn.cursor()
-    c.execute(
-        """SELECT visitor_id, username, first_name, last_name, first_seen, last_seen, visit_count
-           FROM profile_visits WHERE target_id = ? ORDER BY last_seen DESC""",
-        (int(target_id),)
-    )
-    rows = c.fetchall()
-    conn.close()
-    return rows
+    try:
+        c = conn.cursor()
+        c.execute(
+            """SELECT visitor_id, username, first_name, last_name, first_seen, last_seen, visit_count
+               FROM profile_visits WHERE target_id = ? ORDER BY last_seen DESC""",
+            (owner_id,)
+        )
+        return c.fetchall()
+    finally:
+        conn.close()
 # ─────────────────────────────────────────────────────────────
 # AUTO-RESPONDER  (all authenticated users)
 # ─────────────────────────────────────────────────────────────
@@ -3340,7 +3346,11 @@ async def fetch_profile(update, context, target):
 
 async def show_profile_visitors(update, context):
     query = update.callback_query
-    user_id = update.effective_user.id
+    user = update.effective_user
+    user_id = int(user.id) if user else 0
+    if not user or not is_admin(user_id):
+        await query.answer("🔒 Admin only", show_alert=True)
+        return
     await query.answer("Loading your profile lookup visitors…")
 
     # Remove the previous visitor report so refresh does not stack copies.
