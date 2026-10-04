@@ -3348,8 +3348,13 @@ async def show_profile_visitors(update, context):
     query = update.callback_query
     user = update.effective_user
     user_id = int(user.id) if user else 0
-    if not user or not is_admin(user_id):
-        await query.answer("🔒 Admin only", show_alert=True)
+    if not user or not is_authenticated(user_id):
+        await query.answer("🔐 Please authenticate first.", show_alert=True)
+        return
+    # Visitor records are private to the account whose ID is the target.
+    # Never display them in a group chat where other members could see them.
+    if not query.message or query.message.chat.type != "private" or query.message.chat.id != user_id:
+        await query.answer("🔒 Open Profile Visitors in your private chat with the bot.", show_alert=True)
         return
     await query.answer("Loading your profile lookup visitors…")
 
