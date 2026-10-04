@@ -498,7 +498,8 @@ async def start(update, context):
         return
     if is_admin(user_id):
         keyboard = [
-            [InlineKeyboardButton("📥 Inbox", callback_data="inbox"), InlineKeyboardButton("👤 Profile", callback_data="profile")],
+            [InlineKeyboardButton("📥 Inbox", callback_data="inbox"), InlineKeyboardButton("💬 Message Control", callback_data="message_manager")],
+            [InlineKeyboardButton("👤 Profile", callback_data="profile")],
             [InlineKeyboardButton("👀 Profile Visitors", callback_data="profile_visitors"), InlineKeyboardButton("📖 Story Viewers", callback_data="story_viewers")],
             [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")],
             [InlineKeyboardButton("➕ More Commands", callback_data="more")]
