@@ -5506,6 +5506,9 @@ async def fetch_names(update, context, target):
                     country_obj = pycountry.countries.get(alpha_2=region)
                     if country_obj:
                         country = country_obj.name
+                    else:
+                        # Never expose an ISO/Telephony code to the user.
+                        country = "Unknown / unavailable"
             except Exception:
                 country = "Unknown / unavailable"
 
