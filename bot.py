@@ -1097,8 +1097,18 @@ async def menu_callback(update, context):
         context.user_data["state"] = "audio_video_to_audio"
         await query.message.reply_text("🎬 VIDEO → AUDIO\n\nSend a video and I’ll extract its audio as MP3.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="audio_tools")]]))
     elif data == "cut_audio":
-        context.user_data["state"] = "audio_cut_waiting_times"
-        await query.message.reply_text("✂️ CUT AUDIO\n\nSend start and end time, for example:\n• <code>0:30 1:45</code>\n• <code>30 105</code>\n\nThen send the audio/voice file.", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="audio_tools")]]))
+        context.user_data["audio_cut_start"] = None
+        context.user_data["audio_cut_end"] = None
+        context.user_data["state"] = "audio_cut_waiting_start"
+        await query.message.reply_text(
+            "✂️ <b>CUT AUDIO</b>\n\n"
+            "⏱️ <b>Step 1 of 3 — Starting point</b>\n\n"
+            "Where should the audio start?\n"
+            "Enter <b>minutes:seconds</b>.\n\n"
+            "Examples: <code>0:30</code> • <code>2:15</code> • <code>10:00</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="audio_tools")]]),
+        )
     elif data == "qr_menu":
         kb=[[InlineKeyboardButton("📷 Scan / Read QR",callback_data="qr_scan"),InlineKeyboardButton("➕ Create QR",callback_data="qr_create")],[InlineKeyboardButton("⬅️ Back",callback_data="converter")]]
         await query.message.reply_text("📱 QR CODE\n\nScan any readable QR image, or create a QR code from text/link.",reply_markup=InlineKeyboardMarkup(kb))
@@ -2052,6 +2062,16 @@ async def handle_text_to_image(update, context):
     except Exception as e: await status.edit_text("❌ Text-to-Image failed.\n\n"+html.escape(str(e)[:1500]),parse_mode=ParseMode.HTML)
     finally: context.user_data["state"]=None
         
+def _format_audio_time(seconds):
+    seconds = max(0.0, float(seconds))
+    minutes = int(seconds // 60)
+    secs = int(round(seconds - minutes * 60))
+    if secs >= 60:
+        minutes += 1
+        secs = 0
+    return f"{minutes}:{secs:02d}"
+
+
 # --- AUDIO TOOLS ---
 def _parse_audio_time(value):
     value = str(value or "").strip().replace(",", ".")
@@ -2125,51 +2145,78 @@ async def handle_video_to_audio(update, context):
         context.user_data["state"] = None
 
 async def handle_audio_cut(update, context):
+    """Friendly step-by-step audio cutter: start -> end -> media."""
     state = context.user_data.get("state")
-    if state == "audio_cut_waiting_times":
-        raw = (update.message.text or "").strip()
-        parts = re.split(r"\\s+", raw)
-        if len(parts) != 2:
-            await update.message.reply_text(
-                "✂️ Send <b>start end</b> like <code>0:30 1:45</code> or <code>30 105</code>.",
+    message = update.effective_message
+
+    if state == "audio_cut_waiting_start":
+        raw = (message.text or "").strip()
+        try:
+            start = _parse_audio_time(raw)
+            if start < 0:
+                raise ValueError
+        except Exception:
+            await message.reply_text(
+                "❌ I couldn't understand that time.\n\n"
+                "Please enter the <b>starting point</b> as minutes:seconds.\n"
+                "Example: <code>0:30</code> or <code>2:15</code>",
                 parse_mode=ParseMode.HTML,
             )
             return
-        try:
-            start = _parse_audio_time(parts[0])
-            end = _parse_audio_time(parts[1])
-            if start < 0 or end <= start:
-                raise ValueError("end must be after start")
-            if end - start > 3600:
-                raise ValueError("maximum cut length is 60 minutes")
-        except Exception:
-            await update.message.reply_text("❌ Invalid times. Example: <code>0:30 1:45</code>.", parse_mode=ParseMode.HTML)
-            return
         context.user_data["audio_cut_start"] = start
+        context.user_data["state"] = "audio_cut_waiting_end"
+        await message.reply_text(
+            f"✅ Start point: <b>{html.escape(raw)}</b>\n\n"
+            "🏁 Now enter the <b>ending point</b>.\n"
+            "Example: <code>2:45</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="audio_tools")]]),
+        )
+        return
+
+    if state == "audio_cut_waiting_end":
+        raw = (message.text or "").strip()
+        try:
+            end = _parse_audio_time(raw)
+            start = float(context.user_data.get("audio_cut_start", 0))
+            if end <= start:
+                raise ValueError
+            if end - start > 3600:
+                raise ValueError
+        except Exception:
+            await message.reply_text(
+                "❌ Invalid ending point. It must be <b>after the starting point</b>.\n\n"
+                "Please enter the ending time, for example <code>2:45</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
         context.user_data["audio_cut_end"] = end
         context.user_data["state"] = "audio_cut_waiting_file"
-        await update.message.reply_text(
-            f"✅ Range saved: <b>{parts[0]}</b> → <b>{parts[1]}</b>\n\n"
-            "Now send the audio file or voice message.",
+        await message.reply_text(
+            f"✅ Start: <b>{_format_audio_time(start)}</b>\n"
+            f"✅ End: <b>{_format_audio_time(end)}</b>\n"
+            f"⏱️ Length: <b>{_format_audio_time(end - start)}</b>\n\n"
+            "🎵 Perfect! Now <b>send the audio or voice message</b> you want to cut.",
             parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="audio_tools")]]),
         )
         return
 
     if state != "audio_cut_waiting_file":
         return
-    if not (update.message.audio or update.message.voice or update.message.document):
-        await update.message.reply_text("🎵 Please send an audio file or voice message.")
+    if not (message.audio or message.voice or (message.document and str(getattr(message.document, "mime_type", "")).lower().startswith("audio/"))):
+        await message.reply_text("🎵 Please send an audio file or voice message.")
         return
-    status = await update.message.reply_text("⏳ Cutting the audio…")
-    src = None
-    out = None
+
+    status = await message.reply_text("✂️ <b>Cutting your audio…</b>", parse_mode=ParseMode.HTML)
+    src = out = None
     try:
-        suffix = ".ogg" if update.message.voice else ".mp3"
-        src = await _download_message_media(update.message, context, suffix)
+        suffix = ".ogg" if message.voice else ".mp3"
+        src = await _download_message_media(message, context, suffix)
         fd, out = tempfile.mkstemp(prefix="sami_cut_audio_", suffix=".mp3")
         os.close(fd)
-        start = context.user_data["audio_cut_start"]
-        end = context.user_data["audio_cut_end"]
+        start = float(context.user_data["audio_cut_start"])
+        end = float(context.user_data["audio_cut_end"])
         ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
         proc = await asyncio.to_thread(
             subprocess.run,
@@ -2181,12 +2228,15 @@ async def handle_audio_cut(update, context):
         if proc.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
             raise RuntimeError(proc.stderr.decode(errors="ignore")[:500] or "FFmpeg failed")
         with open(out, "rb") as f:
-            await update.message.reply_audio(audio=f, filename="cut_audio.mp3",
-                                             caption=f"✂️ Cut: {start:g}s → {end:g}s",
-                                             reply_markup=tool_done_kb())
-        await status.edit_text("✅ Audio cut complete.")
+            await message.reply_audio(
+                audio=f,
+                filename="cut_audio.mp3",
+                caption=f"✂️ Cut: {_format_audio_time(start)} → {_format_audio_time(end)} • {_format_audio_time(end - start)}",
+                reply_markup=tool_done_kb(),
+            )
+        await status.edit_text("✅ <b>Audio cut complete!</b>", parse_mode=ParseMode.HTML)
     except Exception as e:
-        await status.edit_text("❌ Audio cut failed.\n\n" + html.escape(str(e)[:800]), parse_mode=ParseMode.HTML)
+        await status.edit_text("❌ <b>Audio cut failed.</b>\n\n" + html.escape(str(e)[:800]), parse_mode=ParseMode.HTML)
     finally:
         for p in (src, out):
             if p:
@@ -6660,7 +6710,7 @@ async def handle_link(update, context):
         await time_machine_fetch(update, context, value)
         return
     state = context.user_data.get('state')
-    if state in ("audio_cut_waiting_times", "audio_cut_waiting_file"):
+    if state in ("audio_cut_waiting_start", "audio_cut_waiting_end", "audio_cut_waiting_file"):
         await handle_audio_cut(update, context)
         return
     if state == "audio_video_to_audio":
