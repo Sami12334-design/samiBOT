@@ -2972,7 +2972,7 @@ async def handle_admin_youtube_audio(update, context):
         return
 
     raw_url = (update.message.text or "").strip()
-    if not re.match(r"^https?://(www\.)?(youtube\.com|youtu\.be)/", raw_url, re.I):
+    if not re.match(r"^https?://(www\\.)?(youtube\\.com|youtu\\.be)/", raw_url, re.I):
         await update.message.reply_text("❌ Please send a valid YouTube video link.")
         return
 
@@ -2980,27 +2980,38 @@ async def handle_admin_youtube_audio(update, context):
     output_dir = tempfile.mkdtemp(prefix="tg_yt_audio_")
     try:
         def download_audio():
-            opts = ytdlp_base_options()
-            opts.update({
-                "format": "bestaudio/best",
-                "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
-                "overwrites": True,
-                "postprocessors": [{
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }],
-            })
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(raw_url, download=True)
-                filepath = ydl.prepare_filename(info)
-                base, _ = os.path.splitext(filepath)
-                mp3_path = base + ".mp3"
-                if os.path.isfile(mp3_path):
-                    filepath = mp3_path
-                if not os.path.isfile(filepath):
-                    raise FileNotFoundError("The MP3 file was not created.")
-                return filepath, info.get("title") or "YouTube Audio"
+            # Use Cobalt first so this admin tool does not depend on YouTube
+            # authentication/cookies on the Render server.
+            try:
+                cobalt_data = cobalt_prepare(raw_url, audio=True)
+                mp3_path = os.path.join(output_dir, "youtube_audio.mp3")
+                download_url_to_file(
+                    cobalt_data["url"],
+                    mp3_path,
+                    headers={"User-Agent": "Mozilla/5.0", "Accept": "*/*"},
+                )
+                if os.path.isfile(mp3_path) and os.path.getsize(mp3_path) > 0:
+                    return mp3_path, cobalt_data.get("filename") or "YouTube Audio"
+            except Exception as cobalt_error:
+                cobalt_error_text = str(cobalt_error)
+            else:
+                cobalt_error_text = "Cobalt returned an empty audio file."
+
+            # If Cobalt is unavailable, use the bot's existing public Piped
+            # fallback and convert its best audio stream to 192 kbps MP3.
+            video_id = youtube_video_id(raw_url)
+            if not video_id:
+                raise RuntimeError("Could not read the YouTube video ID.")
+            try:
+                meta = piped_metadata(video_id)
+                result = download_from_piped(meta, output_dir, audio=True)
+                return result["path"], result.get("title") or "YouTube Audio"
+            except Exception as piped_error:
+                raise RuntimeError(
+                    "Alternative download services failed. "
+                    f"Cobalt: {cobalt_error_text[:400]} | "
+                    f"Piped: {str(piped_error)[:400]}"
+                )
 
         filepath, title = await asyncio.to_thread(download_audio)
         if os.path.getsize(filepath) > VIDEO_MAX_UPLOAD:
@@ -3019,13 +3030,7 @@ async def handle_admin_youtube_audio(update, context):
             )
         await status_msg.edit_text("✅ YouTube audio downloaded successfully.")
     except Exception as e:
-        msg = str(e)
-        if "Sign in to confirm" in msg or "LOGIN_REQUIRED" in msg:
-            msg = (
-                "YouTube is requiring authentication from this server. "
-                "The video may need a fresh cookies file through YTDLP_COOKIES_FILE."
-            )
-        await status_msg.edit_text(f"❌ Audio download failed.\n\n{msg[:1000]}")
+        await status_msg.edit_text(f"❌ Audio download failed.\\n\\n{str(e)[:1000]}")
     finally:
         context.user_data["state"] = None
         shutil.rmtree(output_dir, ignore_errors=True)
