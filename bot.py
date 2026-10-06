@@ -252,9 +252,35 @@ def get_inbox_conversations():
     return rows
 
 def save_user_history(user_id, username, first_name, last_name):
+    """Record a profile snapshot only when the user's visible name/username changes."""
+    username = username or None
+    first_name = first_name or ""
+    last_name = last_name or ""
+
     conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
-    c.execute("INSERT INTO user_history (user_id, username, first_name, last_name, date) VALUES (?, ?, ?, ?, ?)", (user_id, username, first_name, last_name, str(__import__('datetime').datetime.now())))
+    c.execute(
+        "SELECT username, first_name, last_name FROM user_history "
+        "WHERE user_id = ? ORDER BY date DESC LIMIT 1",
+        (int(user_id),)
+    )
+    previous = c.fetchone()
+
+    current = (username, first_name, last_name)
+    if previous != current:
+        c.execute(
+            "INSERT INTO user_history "
+            "(user_id, username, first_name, last_name, date) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                int(user_id),
+                username,
+                first_name,
+                last_name,
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            ),
+        )
+
     conn.commit()
     conn.close()
 
