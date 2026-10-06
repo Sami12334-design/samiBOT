@@ -1,0 +1,26 @@
+name: AI media detector tests
+
+on:
+  push:
+    paths:
+      - "ai_media_detector.py"
+      - "ai_media_onnx.py"
+      - "tests/test_ai_media_detector.py"
+  pull_request:
+    paths:
+      - "ai_media_detector.py"
+      - "ai_media_onnx.py"
+      - "tests/test_ai_media_detector.py"
+
+jobs:
+  detector-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install numpy Pillow
+      - run: python -m py_compile ai_media_detector.py ai_media_onnx.py tests/test_ai_media_detector.py
+      - run: python -m unittest tests/test_ai_media_detector.py
