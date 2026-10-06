@@ -6956,12 +6956,13 @@ def check_ai_image(image_path):
     }
 
 async def handle_ai_image_check(update, context):
-    """Download one Telegram image and run the local checker off the event loop."""
+    """Check one Telegram image using the bot's existing lightweight AI detector."""
     if context.user_data.get("state") != "ai_image_check":
         return False
     msg = update.effective_message
     if not msg:
         return True
+
     photo = getattr(msg, "photo", None)
     document = getattr(msg, "document", None)
     mime = str(getattr(document, "mime_type", "") or "").lower()
@@ -6969,52 +6970,38 @@ async def handle_ai_image_check(update, context):
         await msg.reply_text("🖼️ Please send an image.")
         return True
 
-    path = None
     status = await msg.reply_text("🔎 Checking image locally…")
     try:
         file_id = photo[-1].file_id if photo else document.file_id
-        suffix = ".jpg"
+        filename = "telegram_photo.jpg"
         if document and getattr(document, "file_name", None):
-            suffix = os.path.splitext(document.file_name)[1] or ".jpg"
-        fd, path = tempfile.mkstemp(prefix="ai_image_", suffix=suffix)
-        os.close(fd)
-        tg_file = await context.bot.get_file(file_id)
-        with open(path, "wb") as out:
-            await tg_file.download_to_memory(out)
+            filename = document.file_name
 
-        result = await asyncio.to_thread(check_ai_image, path)
-        metadata_line = (
-            "🏷️ Metadata: " + ", ".join(result["metadata_hits"][:4])
-            if result["metadata_hits"] else "🏷️ Metadata: no known AI-generator tag found"
-        )
-        text = (
-            "🖼️ <b>AI IMAGE CHECK</b>\n\n"
-            f"📌 Result: <b>{html.escape(result['result'])}</b>\n"
-            f"🎯 Confidence: <b>{result['confidence']:.1f}%</b>\n"
-            f"🧠 Model AI score: <b>{result['model_score'] * 100:.1f}%</b>\n"
-            f"{metadata_line}\n"
-            f"💡 Reason: {html.escape(result['reason'])}\n\n"
-            "⚠️ This is an offline detector, not proof of origin."
-        )
-        await status.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=tool_done_kb())
-    except ImportError as exc:
+        tg_file = await context.bot.get_file(file_id)
+        buf = BytesIO()
+        await tg_file.download_to_memory(buf)
+
+        result = await analyze_image_bytes(buf.getvalue(), filename)
         await status.edit_text(
-            "❌ AI Image Check is not installed correctly.\n\n"
-            "Add transformers, torch, and exifread to requirements.txt, then redeploy.\n"
-            f"Missing module: {getattr(exc, \"name\", None) or str(exc)[:300]}"
+            format_detection_result(result),
+            parse_mode=ParseMode.HTML,
+            reply_markup=tool_done_kb(),
+        )
+    except DetectorError as exc:
+        await status.edit_text(
+            "❌ AI image check failed: " + html.escape(str(exc)[:900]),
+            parse_mode=ParseMode.HTML,
         )
     except Exception as exc:
         await status.edit_text(
-            "❌ AI image check failed.\n\n" + html.escape(f"{type(exc).__name__}: {str(exc)[:900]}"),
+            "❌ AI image check failed safely.\n\n"
+            + html.escape(f"{type(exc).__name__}: {str(exc)[:900]}"),
             parse_mode=ParseMode.HTML,
         )
     finally:
         context.user_data["state"] = None
-        if path:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+
+    return True
 
 async def _run_ai_media_check(message, context, media_kind=None):
     """Download and analyze one Telegram image/audio attachment safely."""
