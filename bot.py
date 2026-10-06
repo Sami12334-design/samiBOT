@@ -4426,9 +4426,13 @@ async def _search_public_index(query):
         channel_result, group_result = await asyncio.gather(
             _global_public_request(broadcasts_only=True),
             _global_public_request(groups_only=True),
+            return_exceptions=True,
         )
-        await _collect_global(channel_result)
-        await _collect_global(group_result)
+        for label, result in (("channels", channel_result), ("groups", group_result)):
+            if isinstance(result, Exception):
+                print(f"[SearchV2] global {label} search failed: {type(result).__name__}: {result}")
+                continue
+            await _collect_global(result)
     except Exception as exc:
         print(f"[SearchV2] global public search failed: {type(exc).__name__}: {exc}")
 
