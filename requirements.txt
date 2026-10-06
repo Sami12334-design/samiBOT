@@ -25,3 +25,4 @@ c2pa-python>=0.37.4
 transformers>=4.45
 torch>=2.2
 exifread>=3.0.1
+torchvision>=0.17
