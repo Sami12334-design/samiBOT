@@ -6737,7 +6737,7 @@ async def handle_ai_image_check(update, context):
         await status.edit_text(
             "❌ AI Image Check is not installed correctly.\n\n"
             "Add transformers, torch, and exifread to requirements.txt, then redeploy.\n"
-            f"Missing: {type(exc).__name__}"
+            f"Missing module: {getattr(exc, \"name\", None) or str(exc)[:300]}"
         )
     except Exception as exc:
         await status.edit_text(
