@@ -920,6 +920,145 @@ async def handle_whisper_callback(update, context, token):
         return
     await query.answer(item["text"], show_alert=True)
 
+async def handle_word_frequency(update, context, raw_input):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Admin only.")
+        return
+
+    value = (raw_input or "").strip()
+    if not value:
+        await update.message.reply_text("❌ Send a Telegram @username or numeric user ID.")
+        return
+
+    try:
+        target = await telethon_client.get_entity(value)
+        if not isinstance(target, types.User):
+            await update.message.reply_text("❌ That identifier is not a Telegram user.")
+            return
+    except Exception:
+        await update.message.reply_text("❌ User not found. Try @username or numeric ID.")
+        return
+
+    status = await update.message.reply_text("⏳ Searching accessible Telegram chats for this user's messages…")
+    counts = {}
+    message_count = 0
+    chat_count = 0
+    max_dialogs = 100
+    max_messages_per_chat = 500
+    stop_words = {
+        "the","and","for","that","this","with","you","your","are","was","were","have","has",
+        "from","but","not","they","their","what","when","where","how","why","can","will",
+        "all","about","into","just","than","then","there","here","its","it's","our","out",
+        "who","which","would","could","should","been","being","his","her","him","she","them",
+        "a","an","to","of","in","on","at","is","it","i","we","he","as","or","if","be","do",
+        "did","so","no","yes","my","me","us"
+    }
+
+    try:
+        async for dialog in telethon_client.iter_dialogs(limit=max_dialogs):
+            entity = dialog.entity
+            if not getattr(entity, "id", None):
+                continue
+            chat_count += 1
+            try:
+                async for msg in telethon_client.iter_messages(
+                    entity,
+                    limit=max_messages_per_chat,
+                    from_user=target,
+                ):
+                    text_value = (getattr(msg, "message", None) or "").casefold()
+                    if not text_value:
+                        continue
+                    message_count += 1
+                    for word in re.findall(r"[\w']{2,}", text_value, flags=re.UNICODE):
+                        word = word.strip("_'")
+                        if not word or word in stop_words or word.isdigit():
+                            continue
+                        counts[word] = counts.get(word, 0) + 1
+            except Exception:
+                continue
+
+        if not counts:
+            await status.edit_text(
+                "ℹ️ No readable text messages from that user were found in the chats "
+                "available to the connected Telegram account."
+            )
+            return
+
+        top = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:20]
+        label = getattr(target, "username", None) or str(target.id)
+        lines = [f"🔵 <b>WORD FREQUENCY</b>", f"👤 User: <code>{html.escape(label)}</code>",
+                 f"💬 Messages analyzed: <b>{message_count}</b>", "", "📊 <b>Top words:</b>"]
+        for index, (word, count) in enumerate(top, 1):
+            lines.append(f"{index}. <code>{html.escape(word)}</code> — <b>{count}</b>")
+        lines.append("")
+        lines.append("ℹ️ Only messages visible to the connected Telegram account were analyzed.")
+        await status.edit_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception as exc:
+        await status.edit_text("❌ Word frequency search failed: " + html.escape(f"{type(exc).__name__}: {str(exc)[:500]}"),
+                               parse_mode=ParseMode.HTML)
+
+
+async def handle_channel_lookup(update, context, raw_input):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Admin only.")
+        return
+
+    value = (raw_input or "").strip()
+    if not value:
+        await update.message.reply_text("❌ Send a Telegram @username or numeric user ID.")
+        return
+
+    try:
+        target = await telethon_client.get_entity(value)
+        if not isinstance(target, types.User):
+            await update.message.reply_text("❌ That identifier is not a Telegram user.")
+            return
+    except Exception:
+        await update.message.reply_text("❌ User not found. Try @username or numeric ID.")
+        return
+
+    try:
+        me = await telethon_client.get_me()
+        if int(target.id) != int(me.id):
+            await update.message.reply_text(
+                "⚠️ Telegram does not provide a complete API for listing every channel "
+                "another user has joined.\n\n"
+                "For privacy and API limitations, this feature can list broadcast channels "
+                "only for the connected Telegram account."
+            )
+            return
+
+        status = await update.message.reply_text("⏳ Reading the connected Telegram account's channel list…")
+        channels = []
+        async for dialog in telethon_client.iter_dialogs():
+            entity = dialog.entity
+            if getattr(dialog, "is_channel", False) and not getattr(entity, "megagroup", False):
+                channels.append(entity)
+
+        if not channels:
+            await status.edit_text("ℹ️ No broadcast channels were found in the connected account's dialogs.")
+            return
+
+        lines = [
+            "📢 <b>CHANNELS JOINED / SUBSCRIBED</b>",
+            f"👤 <code>{html.escape(getattr(me, 'username', None) or str(me.id))}</code>",
+            f"📊 Total: <b>{len(channels)}</b>",
+            ""
+        ]
+        for index, channel in enumerate(channels, 1):
+            username = getattr(channel, "username", None)
+            title = getattr(channel, "title", "Untitled")
+            link = f"https://t.me/{username}" if username else "Private channel"
+            lines.append(f"{index}. <b>{html.escape(title)}</b> — {html.escape(link)}")
+        await status.edit_text("\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except Exception as exc:
+        await update.message.reply_text(
+            "❌ Channel lookup failed: " + html.escape(f"{type(exc).__name__}: {str(exc)[:500]}"),
+            parse_mode=ParseMode.HTML
+        )
+
+
 async def menu_callback(update, context):
     query = update.callback_query
     user_id = update.effective_user.id
@@ -975,6 +1114,34 @@ async def menu_callback(update, context):
         except ValueError:
             await query.answer("Invalid rule", show_alert=True); return
         await ar_delete(update, context, rid); return
+    if data == "words":
+        if not is_admin(user_id):
+            await query.answer("🔒 Admin only", show_alert=True)
+            return
+        context.user_data["state"] = "word_frequency"
+        await query.message.reply_text(
+            "🔵 <b>WORDS FREQUENCY</b>\n\n"
+            "Send the user's <b>@username</b> or numeric <b>ID</b>.\n"
+            "I will count the most frequent words in messages from that user "
+            "that the connected Telegram account can access.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="more")]])
+        )
+        return
+    if data == "channels":
+        if not is_admin(user_id):
+            await query.answer("🔒 Admin only", show_alert=True)
+            return
+        context.user_data["state"] = "channel_lookup"
+        await query.message.reply_text(
+            "📢 <b>CHANNELS</b>\n\n"
+            "Send a Telegram <b>@username</b> or numeric <b>ID</b>.\n"
+            "For privacy/API limitations, the full joined-channel list is available "
+            "only for the connected Telegram account.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="more")]])
+        )
+        return
     if data == "youtube_audio_downloader":
         if not is_admin(user_id):
             await query.answer("🔒 Admin only", show_alert=True)
@@ -6987,6 +7154,14 @@ async def handle_link(update, context):
         await time_machine_fetch(update, context, value)
         return
     state = context.user_data.get('state')
+    if state == "word_frequency":
+        context.user_data["state"] = None
+        await handle_word_frequency(update, context, text)
+        return
+    if state == "channel_lookup":
+        context.user_data["state"] = None
+        await handle_channel_lookup(update, context, text)
+        return
     if state in ("audio_cut_waiting_start", "audio_cut_waiting_end", "audio_cut_waiting_file"):
         await handle_audio_cut(update, context)
         return
