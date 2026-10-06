@@ -1059,6 +1059,62 @@ async def handle_channel_lookup(update, context, raw_input):
         )
 
 
+async def handle_name_history(update, context, raw_input):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Admin only.")
+        return
+
+    value = (raw_input or "").strip()
+    try:
+        target = await telethon_client.get_entity(value)
+        if not isinstance(target, types.User):
+            await update.message.reply_text("❌ That identifier is not a Telegram user.")
+            return
+    except Exception:
+        await update.message.reply_text("❌ User not found. Try @username or numeric ID.")
+        return
+
+    status = await update.message.reply_text("⏳ Fetching Telegram profile history…")
+    try:
+        current_username = getattr(target, "username", None)
+        current_first = getattr(target, "first_name", None) or ""
+        current_last = getattr(target, "last_name", None) or ""
+
+        # Telegram does not expose a complete historical username/name-change
+        # timeline through the public API. We report what is actually available.
+        country = "Unknown"
+        phone = getattr(target, "phone", None)
+        if phone:
+            try:
+                import phonenumbers
+                parsed = phonenumbers.parse("+" + str(phone), None)
+                country = phonenumbers.region_code_for_number(parsed) or "Unknown"
+            except Exception:
+                country = "Unknown"
+
+        lines = [
+            "🔗 <b>NAME / USERNAME HISTORY</b>",
+            f"👤 User ID: <code>{target.id}</code>",
+            f"🌍 Country: <b>{html.escape(country)}</b>",
+            "",
+            f"🟢 Current name: <b>{html.escape((current_first + ' ' + current_last).strip() or 'Unknown')}</b>",
+            f"🔵 Current username: <b>@{html.escape(current_username) if current_username else 'None'}</b>",
+            "",
+            "📅 Account creation/join date: <b>Not available through Telegram's public API</b>",
+            "",
+            "⚠️ Telegram's public API does not provide a complete historical list of every "
+            "previous first name, last name, or username a user has used. "
+            "This bot will not invent historical data.",
+        ]
+        await status.edit_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception as exc:
+        await status.edit_text(
+            "❌ Name history lookup failed: " +
+            html.escape(f"{type(exc).__name__}: {str(exc)[:500]}"),
+            parse_mode=ParseMode.HTML
+        )
+
+
 async def menu_callback(update, context):
     query = update.callback_query
     user_id = update.effective_user.id
@@ -1138,6 +1194,21 @@ async def menu_callback(update, context):
             "Send a Telegram <b>@username</b> or numeric <b>ID</b>.\n"
             "For privacy/API limitations, the full joined-channel list is available "
             "only for the connected Telegram account.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="more")]])
+        )
+        return
+    if data == "names":
+        if not is_admin(user_id):
+            await query.answer("🔒 Admin only", show_alert=True)
+            return
+        context.user_data["state"] = "name_history"
+        await query.message.reply_text(
+            "🔗 <b>NAMES</b>\n\n"
+            "Send the user's <b>@username</b> or numeric <b>ID</b>.\n"
+            "I will show the country information available from the account, "
+            "current profile name/username, and clearly identify Telegram history "
+            "that the public API does not expose.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="more")]])
         )
@@ -7154,6 +7225,10 @@ async def handle_link(update, context):
         await time_machine_fetch(update, context, value)
         return
     state = context.user_data.get('state')
+    if state == "name_history":
+        context.user_data["state"] = None
+        await handle_name_history(update, context, text)
+        return
     if state == "word_frequency":
         context.user_data["state"] = None
         await handle_word_frequency(update, context, text)
