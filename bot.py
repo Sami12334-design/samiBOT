@@ -4343,6 +4343,8 @@ async def fetch_search(update, context, query):
 
     started = time.monotonic()
     try:
+        # Run the dedicated public-channel index in parallel with global search.
+        public_posts_task = asyncio.create_task(_search_public_posts(query))
         results = []
         peer_map = {}
         seen_messages = set()
@@ -4446,9 +4448,12 @@ async def fetch_search(update, context, query):
             if page_count >= 10:
                 break
 
-        # Also search Telegram's dedicated global public-channel post index.
-        # This is separate from the connected account's joined chats.
-        post_messages, post_peers, post_error = await _search_public_posts(query)
+        # Merge the dedicated public-channel index after the global pass.
+        # It has been running concurrently since the search started.
+        try:
+            post_messages, post_peers, post_error = await public_posts_task
+        except Exception as post_exc:
+            post_messages, post_peers, post_error = [], {}, type(post_exc).__name__
         peer_map.update(post_peers)
         for message in post_messages:
             marked_peer = _search_peer_marked_id(getattr(message, "peer_id", None))
@@ -4545,6 +4550,9 @@ async def fetch_search(update, context, query):
         await display_search_page(update, context, 1, "all")
 
     except FloodWaitError as e:
+        task = locals().get("public_posts_task")
+        if task and not task.done():
+            task.cancel()
         await status_msg.edit_text(
             f"⏳ Telegram rate limit. Please wait {e.seconds} seconds and try again."
         )
