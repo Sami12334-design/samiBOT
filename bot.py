@@ -2972,7 +2972,7 @@ async def handle_admin_youtube_audio(update, context):
         return
 
     raw_url = (update.message.text or "").strip()
-    if not re.match(r"^https?://(www\\.)?(youtube\\.com|youtu\\.be)/", raw_url, re.I):
+    if not re.match(r"^https?://(www\.)?(youtube\.com|youtu\.be)/", raw_url, re.I):
         await update.message.reply_text("❌ Please send a valid YouTube video link.")
         return
 
