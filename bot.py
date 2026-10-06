@@ -1228,7 +1228,7 @@ async def menu_callback(update, context):
         if not is_admin(user_id):
             await query.answer("🔒 Admin only", show_alert=True)
             return
-        context.user_data["state"] = "name_history"
+        context.user_data["state"] = "names"
         await query.message.reply_text(
             "🔗 <b>NAMES</b>\n\n"
             "Send the user's <b>@username</b> or numeric <b>ID</b>.\n"
@@ -5458,59 +5458,132 @@ async def fetch_friends(update, context, text):
     except Exception as e: await update.message.reply_text(f"❌ Error: {e}")
 
 async def fetch_names(update, context, target):
+    """Show profile-name history recorded by SamiBOT.
+
+    Telegram does not expose a complete historical name/username timeline for
+    arbitrary users, so this report only shows snapshots that SamiBOT has
+    legitimately recorded.
+    """
     try:
         target = (target or "").strip()
         if not target:
             await update.message.reply_text("Send a Telegram username or numeric user ID.")
             return
+
         entity = await telethon_client.get_entity(target)
+        if not isinstance(entity, types.User):
+            await update.message.reply_text("❌ That identifier does not resolve to a Telegram user.")
+            return
+
         user_id = int(entity.id)
         username = getattr(entity, "username", None)
         first_name = getattr(entity, "first_name", "") or ""
         last_name = getattr(entity, "last_name", "") or ""
 
-        # Avoid creating duplicate snapshots every time the same profile is queried.
-        previous = get_user_history(user_id)
-        current = (username, first_name, last_name)
-        if not previous or tuple(previous[0][:3]) != current:
-            save_user_history(user_id, username, first_name, last_name)
-            previous = get_user_history(user_id)
+        # Save the current visible profile as a snapshot. save_user_history()
+        # automatically avoids duplicate rows when nothing changed.
+        save_user_history(user_id, username, first_name, last_name)
+        history = list(get_user_history(user_id))  # newest -> oldest
 
-        history = list(reversed(previous))  # oldest to newest for readable history
-        display_name = html.escape((first_name + " " + last_name).strip() or "Unknown")
-        current_tag = f' (@{html.escape(username)})' if username else ""
-        lines = [f"<blockquote>Names history {display_name}{current_tag}", "", "usernames:"]
+        display_name = html.escape(
+            (" ".join(part for part in (first_name, last_name) if part).strip())
+            or "Unknown"
+        )
+        current_tag = (
+            f' (@{html.escape(username)})'
+            if username else ""
+        )
+
+        # Country can only be reported when Telegram exposes a phone number
+        # to this authorized client. Never infer a country from a username/ID.
+        phone = getattr(entity, "phone", None)
+        country = "Unknown / unavailable"
+        if phone:
+            try:
+                import phonenumbers
+                parsed = phonenumbers.parse("+" + str(phone), None)
+                region = phonenumbers.region_code_for_number(parsed)
+                if region:
+                    country = region
+            except Exception:
+                country = "Unknown / unavailable"
+
+        lines = [
+            "<blockquote>🔎 NAMES HISTORY",
+            "",
+            f"👤 Current name: <b>{display_name}</b>{current_tag}",
+            f"🆔 User ID: <code>{user_id}</code>",
+            f"🌍 Country: <b>{html.escape(country)}</b>",
+            "",
+            "📜 USERNAME HISTORY (recent → old)",
+        ]
+
         seen_usernames = set()
-        number = 0
-        for old_username, _first, _last, date in history:
-            if not old_username or old_username in seen_usernames:
+        username_count = 0
+        for old_username, _old_first, _old_last, date in history:
+            if not old_username:
                 continue
-            seen_usernames.add(old_username)
-            number += 1
+            normalized = old_username.casefold()
+            if normalized in seen_usernames:
+                continue
+            seen_usernames.add(normalized)
+            username_count += 1
             safe_username = html.escape(old_username)
             safe_date = html.escape(str(date)[:10])
-            lines.append(f'{number}. <a href="https://t.me/{safe_username}">@{safe_username}</a> [{safe_date}]')
-        if number == 0:
+            lines.append(
+                f'{username_count}. <a href="https://t.me/{safe_username}">'
+                f'@{safe_username}</a> <i>[{safe_date}]</i>'
+            )
+
+        if username_count == 0:
             lines.append("No recorded username history.")
 
-        lines.extend(["", "first name / last name:"])
+        lines.extend(["", "👤 NAME HISTORY (recent → old)"])
+
         seen_names = set()
         name_count = 0
-        for _username, old_first, old_last, date in history:
-            old_name = " ".join(part for part in (old_first or "", old_last or "") if part).strip()
-            if not old_name:
-                old_name = "Unknown"
-            if old_name in seen_names:
+        for _old_username, old_first, old_last, date in history:
+            old_name = " ".join(
+                part for part in (old_first or "", old_last or "") if part
+            ).strip() or "Unknown"
+            key = old_name.casefold()
+            if key in seen_names:
                 continue
-            seen_names.add(old_name)
+            seen_names.add(key)
             name_count += 1
-            lines.append(f"|{html.escape(str(date)[:10])} -> {html.escape(old_name)}")
+            safe_date = html.escape(str(date)[:10])
+            lines.append(
+                f"{name_count}. {html.escape(old_name)} "
+                f"<i>[{safe_date}]</i>"
+            )
+
         if name_count == 0:
             lines.append("No recorded name history.")
-        lines.extend(["", "History reflects profile snapshots recorded by this bot; it cannot retrieve changes from before they were recorded.", "</blockquote>"])
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+        first_observed = str(history[-1][3])[:10] if history else "—"
+        lines.extend([
+            "",
+            f"📅 First observed by SamiBOT: <b>{html.escape(first_observed)}</b>",
+            "",
+            "⚠️ This is observed history recorded by SamiBOT. "
+            "Telegram does not provide a guaranteed complete list of every "
+            "previous name/username, so changes from before the first recorded "
+            "snapshot cannot be recovered.",
+            "</blockquote>",
+        ])
+
+        await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
     except Exception as e:
-        await update.message.reply_text(f"❌ Could not fetch names history: {html.escape(str(e))}", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            f"❌ Could not fetch names history: "
+            f"{html.escape(str(e)[:1000])}",
+            parse_mode=ParseMode.HTML,
+        )
+
 async def process_auto_responder(event):
     if not event.is_private or event.out:
         return
