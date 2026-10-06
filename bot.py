@@ -5495,10 +5495,17 @@ async def fetch_names(update, context, target):
         if phone:
             try:
                 import phonenumbers
+                import pycountry
+
                 parsed = phonenumbers.parse("+" + str(phone), None)
                 region = phonenumbers.region_code_for_number(parsed)
-                if region:
-                    country = region
+
+                # Convert ISO-3166 codes such as ET/US/GB into human-readable
+                # country names. Never display non-geographical code 001.
+                if region and region != "001":
+                    country_obj = pycountry.countries.get(alpha_2=region)
+                    if country_obj:
+                        country = country_obj.name
             except Exception:
                 country = "Unknown / unavailable"
 
