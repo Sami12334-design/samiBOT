@@ -514,6 +514,7 @@ async def start(update, context):
             [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")],
             [InlineKeyboardButton("🌍 Public Search", callback_data="search")],
             [InlineKeyboardButton("🤖 AI Content Check", callback_data="ai_content_check")],
+            [InlineKeyboardButton("🎵 YouTube Video Audio Downloader", callback_data="youtube_audio_downloader")],
             [InlineKeyboardButton("➕ More Commands", callback_data="more")]
         ]
     else:
@@ -974,6 +975,19 @@ async def menu_callback(update, context):
         except ValueError:
             await query.answer("Invalid rule", show_alert=True); return
         await ar_delete(update, context, rid); return
+    if data == "youtube_audio_downloader":
+        if not is_admin(user_id):
+            await query.answer("🔒 Admin only", show_alert=True)
+            return
+        context.user_data["state"] = "admin_youtube_audio"
+        await query.message.reply_text(
+            "🎵 <b>YOUTUBE VIDEO AUDIO DOWNLOADER</b>\n\n"
+            "Send the YouTube video link.\n"
+            "I will download the audio and send it to you as an MP3 file.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="more")]])
+        )
+        return
     if data == "ai_content_check":
         context.user_data["state"] = "ai_content_check"
         await query.message.reply_text(
@@ -2947,6 +2961,74 @@ def video_quality_keyboard(job):
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data="vd_cancel")])
     return InlineKeyboardMarkup(rows)
 
+
+async def handle_admin_youtube_audio(update, context):
+    if context.user_data.get("state") != "admin_youtube_audio":
+        return
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        context.user_data["state"] = None
+        await update.message.reply_text("🔒 Admin only.")
+        return
+
+    raw_url = (update.message.text or "").strip()
+    if not re.match(r"^https?://(www\\.)?(youtube\\.com|youtu\\.be)/", raw_url, re.I):
+        await update.message.reply_text("❌ Please send a valid YouTube video link.")
+        return
+
+    status_msg = await update.message.reply_text("⏳ Downloading YouTube audio…")
+    output_dir = tempfile.mkdtemp(prefix="tg_yt_audio_")
+    try:
+        def download_audio():
+            opts = ytdlp_base_options()
+            opts.update({
+                "format": "bestaudio/best",
+                "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
+                "overwrites": True,
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }],
+            })
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(raw_url, download=True)
+                filepath = ydl.prepare_filename(info)
+                base, _ = os.path.splitext(filepath)
+                mp3_path = base + ".mp3"
+                if os.path.isfile(mp3_path):
+                    filepath = mp3_path
+                if not os.path.isfile(filepath):
+                    raise FileNotFoundError("The MP3 file was not created.")
+                return filepath, info.get("title") or "YouTube Audio"
+
+        filepath, title = await asyncio.to_thread(download_audio)
+        if os.path.getsize(filepath) > VIDEO_MAX_UPLOAD:
+            raise RuntimeError(
+                f"The audio file is {format_bytes(os.path.getsize(filepath))}, "
+                "which is above Telegram's current 50 MB bot upload limit."
+            )
+
+        with open(filepath, "rb") as audio_file:
+            await update.message.reply_audio(
+                audio=audio_file,
+                filename=os.path.basename(filepath),
+                title=title[:64],
+                caption=f"🎵 {title[:900]}",
+                reply_markup=tool_done_kb(),
+            )
+        await status_msg.edit_text("✅ YouTube audio downloaded successfully.")
+    except Exception as e:
+        msg = str(e)
+        if "Sign in to confirm" in msg or "LOGIN_REQUIRED" in msg:
+            msg = (
+                "YouTube is requiring authentication from this server. "
+                "The video may need a fresh cookies file through YTDLP_COOKIES_FILE."
+            )
+        await status_msg.edit_text(f"❌ Audio download failed.\n\n{msg[:1000]}")
+    finally:
+        context.user_data["state"] = None
+        shutil.rmtree(output_dir, ignore_errors=True)
 
 async def handle_video_download(update, context):
     if context.user_data.get("state") != "awaiting_video_link":
@@ -6652,6 +6734,9 @@ async def handle_link(update, context):
     if context.user_data.get('state') == 'awaiting_doc_pptx_pdf': await handle_pptx_to_pdf(update, context); return
     if context.user_data.get('state') == 'awaiting_voice_en': await handle_voice_to_text(update, context, 'en-US'); return
     if context.user_data.get('state') == 'awaiting_voice_am': await handle_voice_to_text(update, context, 'am-ET'); return
+    if context.user_data.get('state') == 'admin_youtube_audio':
+        await handle_admin_youtube_audio(update, context)
+        return
     if context.user_data.get('state') == 'awaiting_video_link': await handle_video_download(update, context); return
     if context.user_data.get('state') == 'awaiting_password':
         if text == BOT_PASSWORD:
