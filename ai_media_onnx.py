@@ -229,7 +229,8 @@ def local_onnx_image(data) -> Optional[float]:
         if len(scores) >= 5:
             scores = scores[1:-1]
         return float(np.mean(scores))
-
+    except Exception:
+        return None
 
 def local_onnx_audio(data) -> Optional[float]:
     path = os.getenv("AI_DETECT_ONNX_AUDIO_MODEL", "").strip()
