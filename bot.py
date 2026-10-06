@@ -512,6 +512,7 @@ async def start(update, context):
             [InlineKeyboardButton("👀 Profile Visitors", callback_data="profile_visitors"), InlineKeyboardButton("📖 Story Viewers", callback_data="story_viewers")],
             [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")],
             [InlineKeyboardButton("🌍 Public Search", callback_data="search")],
+            [InlineKeyboardButton("🤖 AI Content Check", callback_data="ai_content_check")],
             [InlineKeyboardButton("➕ More Commands", callback_data="more")]
         ]
     else:
