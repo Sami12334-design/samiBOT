@@ -6,6 +6,7 @@ on:
       - "ai_media_detector.py"
       - "ai_media_onnx.py"
       - "tests/test_ai_media_detector.py"
+      - "scripts/install_ai_detector_models.py"
   pull_request:
     paths:
       - "ai_media_detector.py"
