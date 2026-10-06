@@ -4088,6 +4088,7 @@ SEARCH_MAX_QUERY = 80
 SEARCH_MAX_RESULTS = 160
 SEARCH_PUBLIC_PEER_LIMIT = 50
 SEARCH_MESSAGES_PER_PEER = 12
+SEARCH_GLOBAL_MESSAGE_LIMIT = 120
 SEARCH_CONCURRENCY = 8
 SEARCH_TIMEOUT = 7.5
 SEARCH_CACHE_TTL = 45.0
@@ -4339,10 +4340,9 @@ def _search_result_from_message(entity, message, query, rank):
 
 async def _search_public_index(query):
     """
-    Build a public-only result set.
-
-    Cache is shared across users because it contains only public Telegram data.
-    User-specific filters and pagination are still stored only in user_data.
+    Search Telegram's global message index first, then keep only public
+    groups/channels. A small public-peer fallback remains for channel/group
+    name and @username lookups.
     """
     cache_key = _search_cache_key(query)
     now = time.monotonic()
@@ -4353,89 +4353,138 @@ async def _search_public_index(query):
             return list(cached[1]), 0.0, True
 
     started = time.monotonic()
-    peers = await _search_discover_public_peers(query)
-
-    if not peers:
-        async with _SEARCH_CACHE_LOCK:
-            _SEARCH_CACHE[cache_key] = (time.monotonic(), [])
-        return [], time.monotonic() - started, False
-
-    semaphore = asyncio.Semaphore(SEARCH_CONCURRENCY)
-    tasks = [
-        asyncio.create_task(_search_public_peer(entity, query, semaphore))
-        for entity in list(peers.values())[:SEARCH_DIRECT_PEER_LIMIT]
-    ]
-
     results = []
     seen = set()
-    completed = 0
 
-    # Return useful results as quickly as possible while still allowing every
-    # discovery task to finish. A hard timeout prevents a slow public channel
-    # from holding the whole search hostage.
+    # 1) TRUE GLOBAL MESSAGE SEARCH.
+    # entity=None makes Telethon use Telegram's global search API.
+    # We never inspect dialogs. Returned private/user results are discarded
+    # by the strict public group/channel gate.
     try:
-        pending = set(tasks)
-        deadline = time.monotonic() + SEARCH_TIMEOUT
-        while pending and time.monotonic() < deadline and len(results) < SEARCH_MAX_RESULTS:
-            remaining = max(0.1, deadline - time.monotonic())
-            done, pending = await asyncio.wait(
-                pending,
-                timeout=remaining,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for task in done:
-                completed += 1
-                entity, messages, error = await task
-                if error:
-                    continue
-                for message in messages:
-                    item = _search_result_from_message(entity, message, query, completed)
-                    if not item:
-                        continue
-                    key = (item["peer_id"], getattr(message, "id", None))
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    results.append(item)
-    finally:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        async for message in telethon_client.iter_messages(
+            None,
+            search=query,
+            limit=SEARCH_GLOBAL_MESSAGE_LIMIT,
+        ):
+            entity = getattr(message, "chat", None)
+            if entity is None or not _search_public_entity(entity):
+                continue
 
-    # Add matching public peers even when no message body matched. This makes
-    # channel/group discovery useful for queries such as "@python".
+            item = _search_result_from_message(
+                entity,
+                message,
+                query,
+                len(results) + 1,
+            )
+            if not item:
+                continue
+
+            key = (item["peer_id"], getattr(message, "id", None))
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append(item)
+
+            if len(results) >= SEARCH_MAX_RESULTS:
+                break
+    except Exception as exc:
+        print(f"[SearchV2] global message search skipped: {type(exc).__name__}: {exc}")
+
+    # 2) PUBLIC PEER DISCOVERY FALLBACK.
+    # Useful for direct @username and public channel/group name matches.
+    peers = await _search_discover_public_peers(query)
+
+    if peers and len(results) < SEARCH_MAX_RESULTS:
+        semaphore = asyncio.Semaphore(SEARCH_CONCURRENCY)
+        fallback_peers = list(peers.values())[:SEARCH_DIRECT_PEER_LIMIT]
+        tasks = [
+            asyncio.create_task(_search_public_peer(entity, query, semaphore))
+            for entity in fallback_peers
+        ]
+
+        try:
+            deadline = time.monotonic() + max(1.5, SEARCH_TIMEOUT / 2)
+            pending = set(tasks)
+            while pending and time.monotonic() < deadline and len(results) < SEARCH_MAX_RESULTS:
+                remaining = max(0.1, deadline - time.monotonic())
+                done, pending = await asyncio.wait(
+                    pending,
+                    timeout=remaining,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in done:
+                    entity, messages, error = await task
+                    if error:
+                        continue
+                    for message in messages:
+                        item = _search_result_from_message(
+                            entity,
+                            message,
+                            query,
+                            len(results) + 1,
+                        )
+                        if not item:
+                            continue
+                        key = (item["peer_id"], getattr(message, "id", None))
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        results.append(item)
+                        if len(results) >= SEARCH_MAX_RESULTS:
+                            break
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    # 3) Add matching public peers even when no message was returned.
     _, tokens = _search_terms(query)
     for entity in peers.values():
         if len(results) >= SEARCH_MAX_RESULTS:
             break
+
         marked = _search_peer_marked_id(entity)
         if marked is None:
             continue
+
         name = _search_peer_name(entity)
         username = (getattr(entity, "username", None) or "").lower().lstrip("@")
         haystack = f"{name.lower()} {username}"
-        if not (query.lower() in haystack or any(token in haystack for token in tokens)):
+
+        if not (
+            query.lower() in haystack
+            or any(token in haystack for token in tokens)
+        ):
             continue
-        if not any(item["peer_id"] == marked for item in results):
-            kind = _search_peer_kind(entity)
-            results.append({
-                "kind": "peer",
-                "type": kind,
-                "peer_type": kind,
-                "peer_id": marked,
-                "entity": entity,
-                "message": None,
-                "link": _search_peer_link(entity),
-                "content": f"{'📢' if kind == 'channel' else '👥'} {name}"
-                           + (f"  @{getattr(entity, 'username', None)}" if getattr(entity, "username", None) else ""),
-                "title": name,
-                "username": getattr(entity, "username", None),
-                "date": None,
-                "score": _search_relevance_score(query, entity, None),
-                "server_rank": len(results),
-            })
+
+        if any(item["peer_id"] == marked for item in results):
+            continue
+
+        kind = _search_peer_kind(entity)
+        results.append({
+            "kind": "peer",
+            "type": kind,
+            "peer_type": kind,
+            "peer_id": marked,
+            "entity": entity,
+            "message": None,
+            "link": _search_peer_link(entity),
+            "content": (
+                f"{'📢' if kind == 'channel' else '👥'} {name}"
+                + (
+                    f"  @{getattr(entity, 'username', None)}"
+                    if getattr(entity, "username", None)
+                    else ""
+                )
+            ),
+            "title": name,
+            "username": getattr(entity, "username", None),
+            "date": None,
+            "score": _search_relevance_score(query, entity, None),
+            "server_rank": len(results),
+        })
 
     def sort_key(item):
         result_date = item.get("date")
@@ -4443,21 +4492,27 @@ async def _search_public_index(query):
             date_score = result_date.timestamp() if result_date else 0.0
         except Exception:
             date_score = 0.0
-        return (float(item.get("score", 0)), date_score, -int(item.get("server_rank", 0)))
+        return (
+            float(item.get("score", 0)),
+            date_score,
+            -int(item.get("server_rank", 0)),
+        )
 
     results.sort(key=sort_key, reverse=True)
     results = results[:SEARCH_MAX_RESULTS]
 
     elapsed = time.monotonic() - started
+
     async with _SEARCH_CACHE_LOCK:
         _SEARCH_CACHE[cache_key] = (time.monotonic(), list(results))
-        # Keep the in-memory cache bounded.
         if len(_SEARCH_CACHE) > 128:
-            oldest = min(_SEARCH_CACHE.items(), key=lambda pair: pair[1][0])[0]
+            oldest = min(
+                _SEARCH_CACHE.items(),
+                key=lambda pair: pair[1][0],
+            )[0]
             _SEARCH_CACHE.pop(oldest, None)
 
     return results, elapsed, False
-
 
 async def fetch_search(update, context, query):
     user_id = update.effective_user.id
