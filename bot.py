@@ -24,6 +24,7 @@ from flask import Flask
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageChops
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InlineQueryResultArticle, InputTextMessageContent
 from telegram.constants import ParseMode
+from telegram.error import Conflict
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes, InlineQueryHandler
 from telethon import TelegramClient, events, functions, types
 from telethon.sessions import StringSession
@@ -6766,7 +6767,29 @@ async def main():
     bot_app.add_handler(MessageHandler(filters.PHOTO, photo_router))
     bot_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND & ~filters.PHOTO, handle_link))
     print("Bot running with upgraded multi-source video downloader...")
-    await bot_app.initialize(); await bot_app.start(); await bot_app.updater.start_polling()
+    await bot_app.initialize()
+    # SamiBOT uses long polling. Remove any stale webhook before getUpdates.
+    # Telegram does not allow webhook delivery and getUpdates polling at the same time.
+    try:
+        webhook_info = await bot_app.bot.get_webhook_info()
+        if webhook_info.url:
+            print(f"Removing stale Telegram webhook: {webhook_info.url}")
+        await bot_app.bot.delete_webhook(drop_pending_updates=False)
+    except Exception as exc:
+        print(f"Webhook cleanup warning: {exc}")
+
+    await bot_app.start()
+    try:
+        # Fail fast on a second polling instance instead of retrying forever.
+        await bot_app.updater.start_polling(bootstrap_retries=0)
+    except Conflict as exc:
+        print("FATAL: Telegram rejected polling because another SamiBOT instance is already polling this bot token.")
+        print("Stop the other deployment/process (Render replica, old service, local/VPS copy) and redeploy this service.")
+        try:
+            await bot_app.stop()
+            await bot_app.shutdown()
+        finally:
+            raise RuntimeError("Telegram polling conflict: another bot instance is running") from exc
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
     await asyncio.Event().wait()
 
