@@ -4356,17 +4356,54 @@ async def _search_public_index(query):
     results = []
     seen = set()
 
-    # 1) TRUE GLOBAL MESSAGE SEARCH.
-    # entity=None makes Telethon use Telegram's global search API.
-    # We never inspect dialogs. Returned private/user results are discarded
-    # by the strict public group/channel gate.
-    try:
-        async for message in telethon_client.iter_messages(
-            None,
-            search=query,
+    # 1) TRUE GLOBAL PUBLIC MESSAGE SEARCH.
+    #
+    # Telegram exposes separate global search modes for broadcast channels and
+    # groups. This avoids using the operator's dialogs as the search universe.
+    # We still apply _search_public_entity() because global group/channel
+    # results can include private peers too.
+    async def _global_public_request(*, broadcasts_only=False, groups_only=False):
+        request = functions.messages.SearchGlobalRequest(
+            broadcasts_only=broadcasts_only,
+            groups_only=groups_only,
+            q=query,
+            filter=types.InputMessagesFilterEmpty(),
+            min_date=0,
+            max_date=0,
+            offset_rate=0,
+            offset_peer=types.InputPeerEmpty(),
+            offset_id=0,
             limit=SEARCH_GLOBAL_MESSAGE_LIMIT,
-        ):
-            entity = getattr(message, "chat", None)
+        )
+        return await asyncio.wait_for(
+            telethon_client(request),
+            timeout=SEARCH_TIMEOUT,
+        )
+
+    async def _collect_global(result):
+        chat_map = {}
+        for entity in list(getattr(result, "chats", []) or []):
+            if not _search_public_entity(entity):
+                continue
+            marked = _search_peer_marked_id(entity)
+            if marked is not None:
+                chat_map[marked] = entity
+
+        for message in list(getattr(result, "messages", []) or []):
+            entity = None
+
+            peer_id = getattr(message, "peer_id", None)
+            if peer_id is not None:
+                try:
+                    entity = chat_map.get(int(get_peer_id(peer_id)))
+                except Exception:
+                    entity = None
+
+            if entity is None:
+                candidate = getattr(message, "chat", None)
+                if candidate is not None and _search_public_entity(candidate):
+                    entity = candidate
+
             if entity is None or not _search_public_entity(entity):
                 continue
 
@@ -4385,11 +4422,17 @@ async def _search_public_index(query):
             seen.add(key)
             results.append(item)
 
-            if len(results) >= SEARCH_MAX_RESULTS:
-                break
+    try:
+        channel_result, group_result = await asyncio.gather(
+            _global_public_request(broadcasts_only=True),
+            _global_public_request(groups_only=True),
+        )
+        await _collect_global(channel_result)
+        await _collect_global(group_result)
     except Exception as exc:
-        print(f"[SearchV2] global message search skipped: {type(exc).__name__}: {exc}")
+        print(f"[SearchV2] global public search failed: {type(exc).__name__}: {exc}")
 
+    results = results[:SEARCH_MAX_RESULTS]
     # 2) PUBLIC PEER DISCOVERY FALLBACK.
     # Useful for direct @username and public channel/group name matches.
     peers = await _search_discover_public_peers(query)
