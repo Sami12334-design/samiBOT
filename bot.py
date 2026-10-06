@@ -112,7 +112,7 @@ def init_db():
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS message_manager_rules (id INTEGER PRIMARY KEY CHECK (id=1), messaging INTEGER DEFAULT 1, block_everyone_until REAL DEFAULT 0, blocked_users TEXT DEFAULT '{}', filter_links_until REAL DEFAULT 0, filter_videos_until REAL DEFAULT 0, keyword_rules TEXT DEFAULT '{}')''')
     c.execute("INSERT OR IGNORE INTO message_manager_rules (id) VALUES (1)")
-    c.execute("""CREATE TABLE IF NOT EXISTS chat_locks (user_id INTEGER NOT NULL, chat_id INTEGER NOT NULL, title TEXT NOT NULL, password_hash TEXT NOT NULL, PRIMARY KEY(user_id,chat_id))""")
+    c.execute("DROP TABLE IF EXISTS chat_locks")
     c.execute('''CREATE TABLE IF NOT EXISTS auto_responder (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         trigger_text TEXT NOT NULL,
@@ -125,66 +125,6 @@ def init_db():
     conn.commit()
     conn.close()
 
-
-# --- CHAT LOCKER ---
-def chat_locker_hash(password):
-    return hashlib.pbkdf2_hmac("sha256", password.encode(), b"sami-chat-lock-v1", 200000).hex()
-
-def chat_locker_get(uid):
-    with sqlite3.connect("bot_data.db") as db:
-        return db.execute("SELECT chat_id,title,password_hash FROM chat_locks WHERE user_id=?", (uid,)).fetchall()
-
-async def chat_locker_callback(update, context, data):
-    q=update.callback_query; uid=update.effective_user.id
-    if data=="cl_open":
-        await q.answer()
-        try:
-            dialogs=[]
-            async for d in telethon_client.iter_dialogs(limit=40):
-                if d.is_group or d.is_channel: dialogs.append(d)
-            locked={int(x[0]) for x in chat_locker_get(uid)}
-            rows=[[InlineKeyboardButton(("🔒 " if int(d.id) in locked else "🔓 ")+str(d.title)[:40],callback_data=f"cl_set|{int(d.id)}")] for d in dialogs]
-            rows.append([InlineKeyboardButton("View locked chats",callback_data="cl_list")])
-            await q.message.reply_text("🔐 CHAT LOCKER — choose a chat to set/change its password.",reply_markup=InlineKeyboardMarkup(rows))
-        except Exception:
-            await q.message.reply_text("Could not load chats. Check the connected Telegram account.")
-        return True
-    if data=="cl_list":
-        rows=[[InlineKeyboardButton("🔒 "+title[:40],callback_data=f"cl_unlock|{cid}")] for cid,title,_ in chat_locker_get(uid)]
-        rows.append([InlineKeyboardButton("Back",callback_data="cl_open")])
-        await q.answer(); await q.message.reply_text("Choose a protected chat:",reply_markup=InlineKeyboardMarkup(rows)); return True
-    if data.startswith("cl_set|"):
-        context.user_data["cl_id"]=int(data.split("|",1)[1]); context.user_data["state"]="cl_password_set"
-        await q.answer(); await q.message.reply_text("Send a password (6–128 characters)."); return True
-    if data.startswith("cl_unlock|"):
-        context.user_data["cl_id"]=int(data.split("|",1)[1]); context.user_data["state"]="cl_password_unlock"
-        await q.answer(); await q.message.reply_text("Enter the chat password to view its latest posts."); return True
-    return False
-
-async def chat_locker_password(update, context, state, password):
-    uid=update.effective_user.id; msg=update.effective_message
-    cid=context.user_data.pop("cl_id",None); context.user_data["state"]=None
-    if state=="cl_password_set":
-        if cid is None or not 6<=len(password)<=128:
-            await msg.reply_text("Password must be 6–128 characters. Please start again."); return True
-        try: entity=await telethon_client.get_entity(cid); title=getattr(entity,"title",None) or str(cid)
-        except Exception: title=str(cid)
-        with sqlite3.connect("bot_data.db") as db:
-            db.execute("INSERT INTO chat_locks(user_id,chat_id,title,password_hash) VALUES(?,?,?,?) ON CONFLICT(user_id,chat_id) DO UPDATE SET title=excluded.title,password_hash=excluded.password_hash",(uid,cid,title,chat_locker_hash(password)))
-        await msg.reply_text("🔒 Password saved for "+title+"."); return True
-    if state=="cl_password_unlock":
-        row=next((x for x in chat_locker_get(uid) if cid is not None and int(x[0])==cid),None)
-        if not row or not __import__("hmac").compare_digest(chat_locker_hash(password),row[2]):
-            await msg.reply_text("❌ Incorrect password."); return True
-        try:
-            entity=await telethon_client.get_entity(cid); posts=await telethon_client.get_messages(entity,limit=6)
-            body="\n\n".join(html.escape((p.message or "[media post]")[:700]) for p in reversed(posts) if p) or "No recent posts."
-            await msg.reply_text("<b>🔓 "+html.escape(row[1])+"</b>\n\n"+body,parse_mode=ParseMode.HTML)
-            await msg.reply_text("One-time unlock complete. Re-enter the password to view posts again.")
-        except Exception:
-            await msg.reply_text("Could not load posts. Confirm the connected account still has access.")
-        return True
-    return False
 
 # --- CONTENT SAFETY FILTER ---
 SAFETY_MAX_TERMS = 100
@@ -570,7 +510,6 @@ async def start(update, context):
             [InlineKeyboardButton("👤 Profile", callback_data="profile")],
             [InlineKeyboardButton("👀 Profile Visitors", callback_data="profile_visitors"), InlineKeyboardButton("📖 Story Viewers", callback_data="story_viewers")],
             [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")],
-            [InlineKeyboardButton("🔐 Chat Locker", callback_data="chat_locker")],
             [InlineKeyboardButton("➕ More Commands", callback_data="more")]
         ]
     else:
@@ -703,7 +642,7 @@ async def ar_show_menu(update, context):
         "<b>Example:</b>\n"
         "• Trigger: <code>hi</code>\n"
         "• Response: <code>Hello! How can I help you?</code>\n\n"
-        "Every authenticated user of this bot can add their own rules."
+        "Only admins can create, view, or delete auto-response rules."
     )
     try:
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=ar_main_kb())
@@ -988,8 +927,6 @@ async def menu_callback(update, context):
         return
 
     data = query.data
-    if data and data.startswith("cl_"):
-        if await chat_locker_callback(update, context, data): return
     # Manager text-entry state must never leak into unrelated buttons.
     # Otherwise a later normal message is incorrectly interpreted as a user ID.
     if not (data.startswith("mm_") or data == "message_manager"):
@@ -1006,16 +943,28 @@ async def menu_callback(update, context):
         await handle_video_callback(update, context, data)
         return
     if data == "auto_responder":
+        if not is_admin(user_id):
+            await query.answer("🔒 Admin only", show_alert=True); return
         await ar_show_menu(update, context); return
     if data == "ar_add":
+        if not is_admin(user_id):
+            await query.answer("🔒 Admin only", show_alert=True); return
         await ar_start_add(update, context); return
     if data == "ar_list":
+        if not is_admin(user_id):
+            await query.answer("🔒 Admin only", show_alert=True); return
         await ar_show_list(update, context); return
     if data == "ar_cancel":
+        if not is_admin(user_id):
+            await query.answer("🔒 Admin only", show_alert=True); return
         await ar_cancel(update, context); return
     if data.startswith("ar_match|"):
+        if not is_admin(user_id):
+            await query.answer("🔒 Admin only", show_alert=True); return
         await ar_save_rule(update, context, data.split("|", 1)[1]); return
     if data.startswith("ar_delete|"):
+        if not is_admin(user_id):
+            await query.answer("🔒 Admin only", show_alert=True); return
         try:
             rid = int(data.split("|", 1)[1])
         except ValueError:
@@ -1097,14 +1046,14 @@ async def menu_callback(update, context):
         await query.message.reply_text("🤖 TELEGRAM ASSISTANT", reply_markup=InlineKeyboardMarkup(keyboard))
     elif data == "more":
         kb = [
-            [InlineKeyboardButton("🔎 Search", callback_data="search"),
-             InlineKeyboardButton("🤖 Auto Responder", callback_data="auto_responder")],
+            [InlineKeyboardButton("🔎 Search", callback_data="search")],
             [InlineKeyboardButton("📄 PDF Fetch", callback_data="pdf_fetch")],
             [InlineKeyboardButton("🔄 Converter", callback_data="converter")],
             [InlineKeyboardButton("🎬 Video Downloader", callback_data="video_downloader")],
         ]
         if is_admin(user_id):
             admin_buttons = [
+                [InlineKeyboardButton("🤖 Auto Responder", callback_data="auto_responder")],
                 [InlineKeyboardButton("💬 Message Manager", callback_data="message_manager")],
                 [InlineKeyboardButton("🕰️ Message Time Machine", callback_data="time_machine")],
                 [InlineKeyboardButton("📊 Statistics", callback_data="stats")],
@@ -1225,8 +1174,6 @@ async def menu_callback(update, context):
     elif data == "profile":
         await query.message.reply_text("👤 PROFILE\n\nEnter a Telegram username or ID to generate the Profile Card:")
         context.user_data['state'] = 'profile_query'
-    elif data == "chat_locker":
-        await chat_locker_callback(update, context, "cl_open")
     elif data == "fetch":
         await query.message.reply_text("🔗 Fetch Telegram\n\nSend me a link (e.g., t.me/channel/123 or t.me/channel/123-130):")
         context.user_data['state'] = 'fetch_link'
@@ -6269,12 +6216,6 @@ async def handle_link(update, context):
             await status.edit_text("❌ Crop failed: " + html.escape(str(e)[:1000]), parse_mode=ParseMode.HTML)
         return
     if await handle_mm_input(update, context): return
-    if context.user_data.get("state") in ("cl_password_set","cl_password_unlock"):
-        if not is_authenticated(user_id):
-            context.user_data["state"]=None
-            await update.message.reply_text("🔐 Password required.")
-            return
-        if await chat_locker_password(update,context,context.user_data.get("state"),(text or "").strip()): return
     if context.user_data.get('state') == 'qr_create': await handle_qr_create(update, context); return
     if context.user_data.get('state') == 'qr_scan' and getattr(update.message, 'document', None) and str(getattr(update.message.document, 'mime_type', '')).startswith('image/'):
         f=await context.bot.get_file(update.message.document.file_id); b=BytesIO(); await f.download_to_memory(b)
@@ -6315,13 +6256,15 @@ async def handle_link(update, context):
             await update.message.reply_text("❌ Incorrect password. Please try again.")
         return
     if context.user_data.get('state') == 'ar_awaiting_trigger':
-        if not is_authenticated(user_id):
-            await update.message.reply_text("🔐 Password required.")
+        if not is_admin(user_id):
+            context.user_data['state'] = None
+            await update.message.reply_text("🔒 Admin only.")
             return
         await ar_handle_trigger(update, context); return
     if context.user_data.get('state') == 'ar_awaiting_response':
-        if not is_authenticated(user_id):
-            await update.message.reply_text("🔐 Password required.")
+        if not is_admin(user_id):
+            context.user_data['state'] = None
+            await update.message.reply_text("🔒 Admin only.")
             return
         await ar_handle_response(update, context); return
     if context.user_data.get('reply_to'):
