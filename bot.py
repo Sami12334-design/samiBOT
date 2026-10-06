@@ -6956,7 +6956,7 @@ def check_ai_image(image_path):
     }
 
 async def handle_ai_image_check(update, context):
-    """Check one Telegram image using the bot's existing lightweight AI detector."""
+    """Crash-safe image provenance check using only PIL/metadata in this workflow."""
     if context.user_data.get("state") != "ai_image_check":
         return False
     msg = update.effective_message
@@ -6970,7 +6970,7 @@ async def handle_ai_image_check(update, context):
         await msg.reply_text("🖼️ Please send an image.")
         return True
 
-    status = await msg.reply_text("🔎 Checking image locally…")
+    status = await msg.reply_text("🔎 Checking image safely…")
     try:
         file_id = photo[-1].file_id if photo else document.file_id
         filename = "telegram_photo.jpg"
@@ -6980,22 +6980,62 @@ async def handle_ai_image_check(update, context):
         tg_file = await context.bot.get_file(file_id)
         buf = BytesIO()
         await tg_file.download_to_memory(buf)
+        data = buf.getvalue()
 
-        result = await analyze_image_bytes(buf.getvalue(), filename)
+        if not data:
+            raise ValueError("Telegram returned an empty image.")
+
+        # Validate the image without loading PyTorch, Transformers, ONNX,
+        # OpenCV, SciPy, or any other heavy detector.
+        with Image.open(BytesIO(data)) as img:
+            img.verify()
+
+        lower = data[:8 * 1024 * 1024].decode("utf-8", errors="ignore").lower()
+        hits = [term for term in AI_GENERATOR_TERMS if term in lower]
+
+        try:
+            with Image.open(BytesIO(data)) as img:
+                for key, value in (img.info or {}).items():
+                    field = f"{key}: {value}"
+                    lower_field = field.lower()
+                    if any(term in lower_field for term in AI_GENERATOR_TERMS):
+                        hits.extend(term for term in AI_GENERATOR_TERMS if term in lower_field)
+        except Exception:
+            pass
+
+        hits = list(dict.fromkeys(hits))
+
+        if hits:
+            result_text = (
+                "🤖 <b>AI IMAGE CHECK</b>\n\n"
+                "📌 Result: <b>Likely AI</b>\n"
+                "🎯 Confidence: <b>High</b>\n"
+                "🏷️ AI-generator evidence: <b>"
+                + html.escape(", ".join(hits[:6]))
+                + "</b>\n\n"
+                "💡 A known AI-generator signature was found in the image data.\n"
+                "⚠️ Metadata can be removed or changed, so this is not absolute proof."
+            )
+        else:
+            result_text = (
+                "🖼️ <b>AI IMAGE CHECK</b>\n\n"
+                "📌 Result: <b>Uncertain</b>\n"
+                "🎯 Confidence: <b>Low</b>\n"
+                "🏷️ AI-generator metadata: <b>Not found</b>\n\n"
+                "💡 No known AI-generator signature was found. "
+                "This does <b>not</b> prove that the image is human-made.\n\n"
+                "🛡️ Crash-safe mode is being used to keep the bot online."
+            )
+
         await status.edit_text(
-            format_detection_result(result),
+            result_text,
             parse_mode=ParseMode.HTML,
             reply_markup=tool_done_kb(),
         )
-    except DetectorError as exc:
-        await status.edit_text(
-            "❌ AI image check failed: " + html.escape(str(exc)[:900]),
-            parse_mode=ParseMode.HTML,
-        )
     except Exception as exc:
         await status.edit_text(
-            "❌ AI image check failed safely.\n\n"
-            + html.escape(f"{type(exc).__name__}: {str(exc)[:900]}"),
+            "❌ AI image check could not process this image safely.\n\n"
+            + html.escape(f"{type(exc).__name__}: {str(exc)[:700]}"),
             parse_mode=ParseMode.HTML,
         )
     finally:
