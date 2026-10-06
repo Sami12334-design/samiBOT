@@ -100,6 +100,15 @@ class DetectorError(Exception):
 def _clamp(x, lo=0.0, hi=100.0):
     return max(lo, min(hi, float(x)))
 
+def _image_model_path():
+    return os.getenv(
+        "AI_DETECT_ONNX_IMAGE_MODEL",
+        str(Path(__file__).resolve().parent / "models" / "ai-detector" / "image" / "model_int8.onnx"),
+    )
+
+def _model_available():
+    return Path(_image_model_path()).is_file()
+
 def _raw_text(data):
     return data[:2000000].decode("utf-8", errors="ignore").casefold()
 
@@ -274,34 +283,37 @@ def image_heuristics(data):
     high = float(power[radius > min(h, w) * 0.28].mean())
     low = float(power[radius <= min(h, w) * 0.12].mean()) + 1e-9
     ratio = high / low
+    rgb = arr.astype(np.float32) / 255.0
+    saturation = float(np.std(rgb, axis=2).mean())
+    residual = cv2.Laplacian(gray, cv2.CV_32F)
+    noise = float(np.std(residual))
     score = 50.0
     evidence = []
 
     if lap < 45:
-        score += 4
-        evidence.append(Evidence(
-            "local", "Low Laplacian edge variance (%.1f)." % lap, 4, 54
-        ))
-    elif lap > 900:
-        score -= 3
-        evidence.append(Evidence(
-            "local", "High Laplacian edge variance (%.1f)." % lap, 3, 47
-        ))
-    if 0.001 < ratio < 0.06:
-        score += 4
-        evidence.append(Evidence(
-            "local", "Unusual FFT high/low-frequency ratio (%.4f)." % ratio, 4, 54
-        ))
-    if ent < 5.0:
-        score += 2
-        evidence.append(Evidence(
-            "local", "Low grayscale entropy (%.2f bits)." % ent, 2, 52
-        ))
-    elif ent > 7.5:
+        score += 3
+        evidence.append(Evidence("local", "Low edge variance (%.1f)." % lap, 2, score))
+    elif lap > 1600:
         score -= 2
-        evidence.append(Evidence(
-            "local", "High grayscale entropy (%.2f bits)." % ent, 2, 48
-        ))
+        evidence.append(Evidence("local", "High edge variance (%.1f)." % lap, 1, score))
+    if 0.001 < ratio < 0.035:
+        score += 3
+        evidence.append(Evidence("local", "Unusual FFT frequency profile (%.4f)." % ratio, 2, score))
+    if ent < 4.2:
+        score += 2
+        evidence.append(Evidence("local", "Low grayscale entropy (%.2f bits)." % ent, 1, score))
+    elif ent > 7.8:
+        score -= 2
+        evidence.append(Evidence("local", "High grayscale entropy (%.2f bits)." % ent, 1, score))
+    if noise < 1.5:
+        score += 2
+    evidence.append(Evidence(
+        "local",
+        "Forensic profile: edge %.1f, entropy %.2f, FFT %.4f, residual %.2f."
+        % (lap, ent, ratio, noise),
+        1,
+        score,
+    ))
     return _clamp(score), evidence
 
 def _decode_audio(data):
@@ -522,7 +534,7 @@ async def analyze_image_bytes(data, filename="image"):
     result.evidence.extend(ev)
     result.ai_likelihood = _fuse(local)
 
-    if LOW < result.ai_likelihood < HIGH:
+    if _model_available():
         result.stages.append("local_onnx")
         onnx_score = await asyncio.to_thread(local_onnx_image, data)
         if onnx_score is not None:
