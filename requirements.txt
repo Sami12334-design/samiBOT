@@ -27,3 +27,4 @@ torch>=2.2
 exifread>=3.0.1
 torchvision>=0.17
 phonenumbers>=9.0.0
+pycountry>=24.6.1
