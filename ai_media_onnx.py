@@ -47,8 +47,13 @@ except Exception:
     imageio_ffmpeg = None
 
 
-def _labels():
-    raw = os.getenv("AI_DETECT_ONNX_LABELS", "real,ai")
+def _labels(kind="generic"):
+    key = {
+        "image": "AI_DETECT_ONNX_IMAGE_LABELS",
+        "audio": "AI_DETECT_ONNX_AUDIO_LABELS",
+    }.get(kind, "AI_DETECT_ONNX_LABELS")
+    fallback = "real,ai"
+    raw = os.getenv(key, os.getenv("AI_DETECT_ONNX_LABELS", fallback))
     return [x.strip().casefold() for x in raw.split(",") if x.strip()]
 
 
@@ -112,13 +117,13 @@ def _image_input(data, shape):
 
     mean = np.asarray(
         [float(v) for v in os.getenv(
-            "AI_DETECT_ONNX_IMAGE_MEAN", "0.485,0.456,0.406"
+            "AI_DETECT_ONNX_IMAGE_MEAN", "0.5,0.5,0.5"
         ).split(",")],
         dtype=np.float32,
     )
     std = np.asarray(
         [float(v) for v in os.getenv(
-            "AI_DETECT_ONNX_IMAGE_STD", "0.229,0.224,0.225"
+            "AI_DETECT_ONNX_IMAGE_STD", "0.5,0.5,0.5"
         ).split(",")],
         dtype=np.float32,
     )
@@ -187,7 +192,7 @@ def local_onnx_image(data) -> Optional[float]:
         )
         x = _image_input(data, shape)
         output = session.run(None, {inp.name: x})[0]
-        return _output_to_ai_score(output, _labels())
+        return _output_to_ai_score(output, _labels("image"))
     except Exception:
         return None
 
@@ -210,8 +215,20 @@ def local_onnx_audio(data) -> Optional[float]:
             # Mel-spectrogram and feature-based models need model-specific
             # preprocessing; do not guess it.
             return None
-        output = session.run(None, {inp.name: x[None, :]})[0]
-        return _output_to_ai_score(output, _labels())
+
+        # Wav2Vec2/WavLM-style exported classifiers commonly expose an
+        # attention_mask alongside input_values. Normalize exactly like the
+        # reference Wav2Vec2 feature extractor when requested.
+        if os.getenv("AI_DETECT_ONNX_AUDIO_NORMALIZE", "0") == "1":
+            x = (x - float(x.mean())) / float(np.sqrt(x.var() + 1e-7))
+
+        feeds = {inp.name: x[None, :].astype(np.float32)}
+        for extra in session.get_inputs()[1:]:
+            if extra.name.casefold() == "attention_mask":
+                feeds[extra.name] = np.ones((1, len(x)), dtype=np.int64)
+
+        output = session.run(None, feeds)[0]
+        return _output_to_ai_score(output, _labels("audio"))
     except Exception:
         return None
 
