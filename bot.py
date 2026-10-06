@@ -4078,8 +4078,10 @@ async def send_story_at_index(update,context,index):
 # returned public messages locally for relevance.
 
 SEARCH_PAGE_SIZE = 8
-SEARCH_GLOBAL_LIMIT = 100
-SEARCH_MAX_FETCH = 500
+SEARCH_GLOBAL_LIMIT = 50
+SEARCH_MAX_FETCH = 250
+SEARCH_MAX_PAGES = 5
+SEARCH_MAX_QUERY = 80
 
 
 def _search_peer_marked_id(entity):
@@ -4168,16 +4170,12 @@ def _search_content(message):
 
 
 def _search_public_entity(entity):
-    """Only allow peers that are publicly addressable by username.
-
-    This is the important isolation rule: private dialogs, private groups,
-    and admin-only peers are never exposed by the bot's global search.
-    """
-    username = (getattr(entity, "username", None) or "").strip()
-    if not username:
+    """Strict public-search gate: only public groups and channels."""
+    username = (getattr(entity, "username", None) or "").strip().lstrip("@")
+    if not username or len(username) < 4:
         return False
     kind = _search_peer_kind(entity)
-    return kind in {"channel", "group", "bot", "user"}
+    return kind in {"channel", "group"}
 
 
 def _search_terms(query):
@@ -4317,9 +4315,18 @@ async def _search_public_posts(query):
 
 
 async def fetch_search(update, context, query):
+    user_id = update.effective_user.id
+    if not is_authenticated(user_id):
+        await update.message.reply_text("🔐 Password required.")
+        return
+
     query = re.sub(r"\s+", " ", (query or "").strip())
-    if not query:
-        await update.message.reply_text("🔎 Please enter a keyword, for example: Logic mid")
+    query = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", query)
+    if len(query) < 2:
+        await update.message.reply_text("🔎 Enter at least 2 characters to search public Telegram.")
+        return
+    if len(query) > SEARCH_MAX_QUERY:
+        await update.message.reply_text(f"🔎 Search is limited to {SEARCH_MAX_QUERY} characters for speed.")
         return
 
     search_id = uuid.uuid4().hex[:8]
@@ -4347,7 +4354,7 @@ async def fetch_search(update, context, query):
         page_count = 0
         last_state = None
 
-        while fetched < SEARCH_MAX_FETCH:
+        while fetched < SEARCH_MAX_FETCH and page_count < SEARCH_MAX_PAGES:
             global_result = await _search_global_batch(
                 query, offset_rate, offset_peer, offset_id
             )
@@ -4531,8 +4538,8 @@ async def fetch_search(update, context, query):
         context.user_data["search_query"] = query
         context.user_data["search_filter"] = "all"
         context.user_data["search_page"] = 1
-        context.user_data["search_joined_hidden"] = 0
         context.user_data["search_elapsed"] = round(time.monotonic() - started, 2)
+        context.user_data["search_public_only"] = True
 
         await status_msg.delete()
         await display_search_page(update, context, 1, "all")
@@ -4669,9 +4676,11 @@ async def display_search_page(update, context, page, filter_type=None):
     if callback:
         await callback.answer()
 
-    # Guard against race conditions from other searches
+    # Per-user search state prevents cross-user result mixing.
     if not context.user_data.get("search_results"):
-        await update.message.reply_text("❌ Search session expired. Please search again.")
+        target = callback.message if callback else update.message
+        if target:
+            await target.reply_text("❌ Search session expired. Start a new search.")
         return
 
     results = context.user_data.get("search_results", [])
@@ -4692,10 +4701,8 @@ async def display_search_page(update, context, page, filter_type=None):
     page_items = filtered[start:start + per_page]
 
     elapsed = context.user_data.get("search_elapsed", 0)
-    joined_hidden = context.user_data.get("search_joined_hidden", 0)
-
     lines = [
-        "<b>🌍 TELEGRAM GLOBAL SEARCH</b>",
+        "<b>🌍 TELEGRAM PUBLIC SEARCH</b>",
         f"🔎 <code>{html.escape(search_query)}</code>",
         "",
     ]
@@ -4728,7 +4735,9 @@ async def display_search_page(update, context, page, filter_type=None):
                 lines.append(f"   {html.escape(item['content'])}")
             lines.append("")
 
-    lines.append(f"Page {page}/{total_pages} • {total_results} results")
+    elapsed_text = f"{elapsed:.2f}s" if elapsed else "—"
+    lines.append(f"Page {page}/{total_pages} • {total_results} results • ⚡ {elapsed_text}")
+    lines.append("<i>Public groups/channels only • no private dialogs or admin-only chats</i>")
     text = "\n".join(lines)
 
     kb, counts = _search_filter_buttons(results, active, search_query)
