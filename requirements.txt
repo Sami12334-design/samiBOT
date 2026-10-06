@@ -20,3 +20,5 @@ fonttools>=4.55
 SpeechRecognition>=3.10
 huggingface_hub
 gTTS>=2.5.0
+
+c2pa-python>=0.37.4
