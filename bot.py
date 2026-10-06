@@ -1179,7 +1179,7 @@ async def menu_callback(update, context):
         await query.message.reply_text("🔗 Fetch Telegram\n\nSend me a link (e.g., t.me/channel/123 or t.me/channel/123-130):")
         context.user_data['state'] = 'fetch_link'
     elif data == "search":
-        await query.message.reply_text("🔎 SEARCH\n\nEnter a keyword to search Telegram globally.\n\nPublic results only — private/admin-only chats are excluded, and results are ranked by relevance.\nExample: Logic mid")
+        await query.message.reply_text("🔎 PUBLIC SEARCH\n\nEnter a keyword, hashtag, @username, or public channel name.\n\n🌐 Public groups/channels only — no private dialogs, no admin-only history.\n⚡ Parallel discovery + direct public-history search + relevance ranking.\nExample: Logic mid")
         context.user_data['state'] = 'search_query'
     elif data == "pdf_fetch":
         await query.message.reply_text("📄 PDF FETCH\n\nPlease upload the PDF file directly to this chat.")
