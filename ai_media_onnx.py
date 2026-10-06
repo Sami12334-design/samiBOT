@@ -180,7 +180,10 @@ def _wav_to_float32(data):
 
 
 def local_onnx_image(data) -> Optional[float]:
-    path = os.getenv("AI_DETECT_ONNX_IMAGE_MODEL", "").strip()
+    path = os.getenv(
+        "AI_DETECT_ONNX_IMAGE_MODEL",
+        str(Path(__file__).resolve().parent / "models" / "ai-detector" / "image" / "model_int8.onnx"),
+    ).strip()
     session = _session(path)
     if session is None:
         return None
