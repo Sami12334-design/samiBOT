@@ -261,7 +261,9 @@ def image_heuristics(data):
         if max(pil.size) > 1800:
             pil.thumbnail((1800, 1800), Image.Resampling.LANCZOS)
         arr = np.asarray(pil)
-    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    # Keep the grayscale image in uint8 for OpenCV. OpenCV 5 rejects
+    # the float32 -> float64 Laplacian combination on some builds.
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
     lap = float(cv2.Laplacian(gray, cv2.CV_64F).var())
     ent = _entropy(gray)
     fft = np.fft.fftshift(np.fft.fft2(gray))
