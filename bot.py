@@ -4434,8 +4434,11 @@ async def _search_public_index(query):
 
     results = results[:SEARCH_MAX_RESULTS]
     # 2) PUBLIC PEER DISCOVERY FALLBACK.
-    # Useful for direct @username and public channel/group name matches.
-    peers = await _search_discover_public_peers(query)
+    # Only run this when the global index did not give us enough results, or
+    # when the user explicitly searched a username/channel handle.
+    peers = {}
+    if query.startswith("@") or len(results) < SEARCH_PAGE_SIZE:
+        peers = await _search_discover_public_peers(query)
 
     if peers and len(results) < SEARCH_MAX_RESULTS:
         semaphore = asyncio.Semaphore(SEARCH_CONCURRENCY)
@@ -4583,10 +4586,7 @@ async def fetch_search(update, context, query):
     context.user_data["search_id"] = search_id
 
     status_msg = await update.message.reply_text(
-        f"🔎 Searching the public Telegram index for: <b>{html.escape(query)}</b>\n"
-        "🌐 Public groups/channels only\n"
-        "🔒 No private dialogs • no admin-only history\n"
-        "⚡ Parallel public-peer search + relevance ranking",
+        f"🔎 Searching <b>{html.escape(query)}</b>…",
         parse_mode=ParseMode.HTML,
     )
 
@@ -4601,8 +4601,8 @@ async def fetch_search(update, context, query):
 
         if not results:
             await status_msg.edit_text(
-                f"❌ No public Telegram results found for <b>{html.escape(query)}</b>.\n\n"
-                "Try a channel name, @username, hashtag, or a more specific keyword.",
+                f"❌ No public results for <b>{html.escape(query)}</b>.\n"
+                "Try @username, #hashtag, or another keyword.",
                 parse_mode=ParseMode.HTML,
             )
             return
