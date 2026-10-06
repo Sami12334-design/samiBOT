@@ -9,6 +9,11 @@ if [ ! -x .deno/bin/deno ]; then
   curl -fsSL https://deno.land/install.sh | DENO_INSTALL="$PWD/.deno" sh
 fi
 
+# Install the pinned 15 MB INT8 local image detector during build.
+# This avoids relying on an optional Render environment variable at runtime.
+AI_MODEL_DIR="$PWD/models/ai-detector"
+python scripts/install_ai_detector_models.py --dest "$AI_MODEL_DIR"
+
 # Vosk model (moved to /tmp to avoid read-only file system errors)
 VOSK_DIR="/tmp/vosk-model-small-en-us-0.15"
 if [ ! -d "$VOSK_DIR" ]; then
