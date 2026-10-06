@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
+from ai_media_onnx import local_onnx_image, local_onnx_audio
 from PIL import Image, ExifTags
 
 try:
@@ -518,16 +519,32 @@ async def analyze_image_bytes(data, filename="image"):
     result.ai_likelihood = _fuse(local)
 
     if LOW < result.ai_likelihood < HIGH:
-        result.stages.append("free_hf_inference")
-        remote = await remote_image(data)
-        if remote:
-            result.ai_likelihood = _fuse(local, remote[0])
-            result.evidence.append(Evidence("remote", remote[1], 55, remote[0]))
-            result.remote_used = True
+        result.stages.append("local_onnx")
+        onnx_score = await asyncio.to_thread(local_onnx_image, data)
+        if onnx_score is not None:
+            result.ai_likelihood = _fuse(local, onnx_score)
+            result.evidence.append(Evidence(
+                "onnx",
+                "Local CPU ONNX detector score: %.1f%% AI-like." % onnx_score,
+                40,
+                onnx_score,
+            ))
         else:
             result.warnings.append(
-                "Free external inference was unavailable or rate-limited; local evidence only."
+                "No compatible local ONNX image model is configured; continuing to free inference."
             )
+
+        if LOW < result.ai_likelihood < HIGH:
+            result.stages.append("free_hf_inference")
+            remote = await remote_image(data)
+            if remote:
+                result.ai_likelihood = _fuse(local, remote[0])
+                result.evidence.append(Evidence("remote", remote[1], 55, remote[0]))
+                result.remote_used = True
+            else:
+                result.warnings.append(
+                    "Free external inference was unavailable or rate-limited; local evidence only."
+                )
     result.warnings.append("No AI signature does not prove human origin.")
     result.elapsed_ms = int((time.perf_counter() - started) * 1000)
     return _finish(result)
@@ -559,16 +576,32 @@ async def analyze_audio_bytes(data, filename="voice.ogg"):
     result.ai_likelihood = _fuse(local)
 
     if LOW < result.ai_likelihood < HIGH:
-        result.stages.append("free_hf_inference")
-        remote = await remote_audio(wav)
-        if remote:
-            result.ai_likelihood = _fuse(local, remote[0])
-            result.evidence.append(Evidence("remote", remote[1], 55, remote[0]))
-            result.remote_used = True
+        result.stages.append("local_onnx")
+        onnx_score = await asyncio.to_thread(local_onnx_audio, wav)
+        if onnx_score is not None:
+            result.ai_likelihood = _fuse(local, onnx_score)
+            result.evidence.append(Evidence(
+                "onnx",
+                "Local CPU ONNX voice detector score: %.1f%% AI-like." % onnx_score,
+                40,
+                onnx_score,
+            ))
         else:
             result.warnings.append(
-                "Free external inference was unavailable or rate-limited; local evidence only."
+                "No compatible local ONNX voice model is configured; continuing to free inference."
             )
+
+        if LOW < result.ai_likelihood < HIGH:
+            result.stages.append("free_hf_inference")
+            remote = await remote_audio(wav)
+            if remote:
+                result.ai_likelihood = _fuse(local, remote[0])
+                result.evidence.append(Evidence("remote", remote[1], 55, remote[0]))
+                result.remote_used = True
+            else:
+                result.warnings.append(
+                    "Free external inference was unavailable or rate-limited; local evidence only."
+                )
     result.warnings.append(
         "Voice detectors are sensitive to codec, microphone, language and post-processing."
     )
