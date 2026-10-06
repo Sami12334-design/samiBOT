@@ -193,11 +193,42 @@ def local_onnx_image(data) -> Optional[float]:
             int(v) if isinstance(v, (int, np.integer)) else None
             for v in inp.shape
         )
-        x = _image_input(data, shape)
-        output = session.run(None, {inp.name: x})[0]
-        return _output_to_ai_score(output, _labels("image"))
-    except Exception:
-        return None
+        with Image.open(io.BytesIO(data)) as original:
+            original = original.convert("RGB")
+            w, h = original.size
+            views = [original]
+            if min(w, h) >= 256:
+                side = int(min(w, h) * 0.82)
+                left = (w - side) // 2
+                top = (h - side) // 2
+                views.append(original.crop((left, top, left + side, top + side)))
+                # Four corner views improve robustness when the AI artifact is
+                # localized instead of centered.
+                views.extend([
+                    original.crop((0, 0, side, side)),
+                    original.crop((w - side, 0, w, side)),
+                    original.crop((0, h - side, side, h)),
+                    original.crop((w - side, h - side, w, h)),
+                ])
+        scores = []
+        labels = _labels("image")
+        for view in views:
+            import io as _io
+            buf = _io.BytesIO()
+            view.save(buf, format="PNG")
+            x = _image_input(buf.getvalue(), shape)
+            output = session.run(None, {inp.name: x})[0]
+            score = _output_to_ai_score(output, labels)
+            if score is not None:
+                scores.append(float(score))
+        if not scores:
+            return None
+        # Trim extreme crop outliers, then average. This prevents one strange
+        # crop from flipping the entire decision.
+        scores.sort()
+        if len(scores) >= 5:
+            scores = scores[1:-1]
+        return float(np.mean(scores))
 
 
 def local_onnx_audio(data) -> Optional[float]:
