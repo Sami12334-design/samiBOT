@@ -462,10 +462,12 @@ async def remote_audio(data):
     except Exception:
         return None
 
-def _fuse(local, remote=None):
-    score = 50.0 * 0.72 + local * 0.28
-    if remote is not None:
-        score = score * 0.45 + remote * 0.55
+def _fuse(local, detector=None):
+    # Local signal heuristics remain weak evidence. A real detector model gets
+    # more weight, but the final score is still pulled toward uncertainty.
+    score = 50.0 * 0.35 + local * 0.65
+    if detector is not None:
+        score = score * 0.35 + detector * 0.65
     return _clamp(score)
 
 def _finish(result):
@@ -529,11 +531,6 @@ async def analyze_image_bytes(data, filename="image"):
                 40,
                 onnx_score,
             ))
-        else:
-            result.warnings.append(
-                "No compatible local ONNX image model is configured; continuing to free inference."
-            )
-
         if LOW < result.ai_likelihood < HIGH:
             result.stages.append("free_hf_inference")
             remote = await remote_image(data)
@@ -586,11 +583,6 @@ async def analyze_audio_bytes(data, filename="voice.ogg"):
                 40,
                 onnx_score,
             ))
-        else:
-            result.warnings.append(
-                "No compatible local ONNX voice model is configured; continuing to free inference."
-            )
-
         if LOW < result.ai_likelihood < HIGH:
             result.stages.append("free_hf_inference")
             remote = await remote_audio(wav)
