@@ -44,6 +44,7 @@ from PIL import ImageDraw
 import yt_dlp
 import imageio_ffmpeg
 import qrcode
+from ai_media_detector import analyze_image_bytes, analyze_audio_bytes, format_detection_result, DetectorError
 
 try:
     from telethon.tl.functions.stories import GetPeerStoriesRequest, GetStoriesByIDRequest
@@ -6258,9 +6259,76 @@ async def time_machine_fetch(update, context, date_text):
         context.user_data["state"] = None
         await status.edit_text("❌ Could not search this chat: " + html.escape(f"{type(exc).__name__}: {str(exc)[:500]}"))
 
+
+async def _auto_detect_uploaded_media(update, context):
+    """Run AI-media screening for direct uploads when no other tool state is active."""
+    if context.user_data.get("state"):
+        return False
+    msg = update.effective_message
+    if not msg:
+        return False
+    try:
+        if getattr(msg, "photo", None):
+            file = await context.bot.get_file(msg.photo[-1].file_id)
+            buf = BytesIO()
+            await file.download_to_memory(buf)
+            status = await msg.reply_text("🔎 Checking image for AI-generation signals…")
+            try:
+                result = await analyze_image_bytes(buf.getvalue(), "telegram_photo.jpg")
+                await status.edit_text(
+                    format_detection_result(result),
+                    parse_mode=ParseMode.HTML,
+                )
+            except DetectorError as exc:
+                await status.edit_text("❌ Image check failed: " + html.escape(str(exc)))
+            return True
+        if getattr(msg, "voice", None):
+            file = await context.bot.get_file(msg.voice.file_id)
+            buf = BytesIO()
+            await file.download_to_memory(buf)
+            status = await msg.reply_text("🔎 Checking voice for synthetic-speech signals…")
+            try:
+                result = await analyze_audio_bytes(buf.getvalue(), "telegram_voice.ogg")
+                await status.edit_text(
+                    format_detection_result(result),
+                    parse_mode=ParseMode.HTML,
+                )
+            except DetectorError as exc:
+                await status.edit_text("❌ Voice check failed: " + html.escape(str(exc)))
+            return True
+        doc = getattr(msg, "document", None)
+        mime = str(getattr(doc, "mime_type", "") or "")
+        if doc and mime.startswith("image/"):
+            file = await context.bot.get_file(doc.file_id)
+            buf = BytesIO()
+            await file.download_to_memory(buf)
+            status = await msg.reply_text("🔎 Checking image for AI-generation signals…")
+            try:
+                result = await analyze_image_bytes(
+                    buf.getvalue(),
+                    getattr(doc, "file_name", None) or "telegram_image",
+                )
+                await status.edit_text(
+                    format_detection_result(result),
+                    parse_mode=ParseMode.HTML,
+                )
+            except DetectorError as exc:
+                await status.edit_text("❌ Image check failed: " + html.escape(str(exc)))
+            return True
+    except Exception as exc:
+        try:
+            await msg.reply_text(
+                "❌ Media check failed safely: " + html.escape(str(exc)[:500])
+            )
+        except Exception:
+            pass
+        return True
+    return False
+
 async def handle_link(update, context):
     user_id = update.effective_user.id
     text = update.message.text if update.message.text else ""
+    if await _auto_detect_uploaded_media(update, context): return
     self_ping()
     state = context.user_data.get("state")
     if state in ("awaiting_crop_width", "awaiting_crop_height"):
@@ -6479,6 +6547,8 @@ async def main():
     async def photo_router(update, context):
         if context.user_data.get('state') == 'qr_scan':
             await handle_qr_photo(update, context); return
+        if await _auto_detect_uploaded_media(update, context):
+            return
         await handle_link(update, context)
     bot_app.add_handler(MessageHandler(filters.PHOTO, photo_router))
     bot_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND & ~filters.PHOTO, handle_link))
