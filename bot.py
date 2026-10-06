@@ -6528,3 +6528,250 @@ async def handle_ai_content_check(update, context):
     finally:
         context.user_data["state"] = None
     return True
+
+async def handle_link(update, context):
+    user_id = update.effective_user.id
+    text = update.message.text if update.message.text else ""
+    if await _auto_detect_uploaded_media(update, context): return
+    self_ping()
+    state = context.user_data.get("state")
+    if state in ("awaiting_crop_width", "awaiting_crop_height"):
+        raw = (text or "").strip()
+        if not raw.isdigit():
+            await update.message.reply_text("❌ Please send a whole number of pixels.")
+            return
+        value = int(raw)
+        if not 1 <= value <= 5000:
+            await update.message.reply_text("❌ Use a dimension from 1 to 5000 pixels.")
+            return
+        if state == "awaiting_crop_width":
+            context.user_data["crop_width"] = value
+            context.user_data["state"] = "awaiting_crop_height"
+            await update.message.reply_text("Now send the target height in pixels (1–5000).")
+            return
+        width = int(context.user_data.pop("crop_width", 0))
+        height = value
+        context.user_data["state"] = None
+        if width * height > 20000000:
+            context.user_data["state"] = "awaiting_crop_width"
+            await update.message.reply_text("❌ That output is too large (maximum 20 million pixels). Send a smaller width.")
+            return
+        source = context.user_data.get("edit_image")
+        if source is None:
+            await update.message.reply_text("❌ The photo is no longer available. Upload it again.")
+            return
+        status = await update.message.reply_text("✂️ Cropping photo…")
+        try:
+            cropped = await asyncio.to_thread(lambda: ImageOps.fit(source.convert("RGB"), (width, height), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5)))
+            out = BytesIO()
+            cropped.save(out, format="JPEG", quality=95)
+            out.seek(0)
+            await update.message.reply_photo(photo=out, caption=f"✅ Cropped to {width} × {height} px.", reply_markup=tool_done_kb())
+            await status.edit_text("✅ Crop complete.")
+        except Exception as e:
+            await status.edit_text("❌ Crop failed: " + html.escape(str(e)[:1000]), parse_mode=ParseMode.HTML)
+        return
+    if await handle_mm_input(update, context): return
+    if context.user_data.get('state') == 'qr_create': await handle_qr_create(update, context); return
+    if context.user_data.get('state') == 'qr_scan' and getattr(update.message, 'document', None) and str(getattr(update.message.document, 'mime_type', '')).startswith('image/'):
+        f=await context.bot.get_file(update.message.document.file_id); b=BytesIO(); await f.download_to_memory(b)
+        status=await update.message.reply_text('🔍 Scanning QR code…')
+        try:
+            vals=await asyncio.to_thread(scan_qr_image_sync,b.getvalue())
+            if vals: await status.edit_text('✅ QR code detected:\n\n'+'\n\n'.join(vals),reply_markup=tool_done_kb())
+            else: await status.edit_text('❌ No readable QR code was found in this image.')
+        except Exception as e: await status.edit_text('❌ QR scan failed: '+str(e)[:1000])
+        context.user_data['state']=None; return
+    if context.user_data.get('state') == 'awaiting_text_pdf': await handle_text_pdf_input(update, context); return
+    if context.user_data.get('state') == 'awaiting_text_to_image': await handle_text_to_image(update, context); return
+    if context.user_data.get('state') == 'awaiting_image_to_pdf': await handle_image_collect(update, context); return
+    if context.user_data.get('state') == 'awaiting_pdf': await handle_pdf_upload(update, context); return
+    if context.user_data.get('state') == 'awaiting_pdf_pages': await handle_pdf_pages(update, context); return
+    if context.user_data.get('state') == 'awaiting_pdf_to_word': await handle_pdf_to_word(update, context); return
+    if context.user_data.get('state') == 'awaiting_image_to_text': await handle_image_to_text(update, context); return
+    if context.user_data.get('state') == 'awaiting_edit_photo': await handle_edit_photo(update, context); return
+    if context.user_data.get('state') == 'awaiting_bg_upload': await handle_bg_upload(update, context); return
+    if context.user_data.get('state') == 'awaiting_front_upload': await handle_front_upload(update, context); return
+    if context.user_data.get('state') == 'awaiting_tts_en': await handle_tts(update, context, 'en'); return
+    if context.user_data.get('state') == 'awaiting_tts_am': await handle_tts(update, context, 'am'); return
+    if context.user_data.get('state') == 'awaiting_img_png_jpg': await handle_image_convert(update, context, 'png_jpg'); return
+    if context.user_data.get('state') == 'awaiting_img_jpg_png': await handle_image_convert(update, context, 'jpg_png'); return
+    if context.user_data.get('state') == 'awaiting_img_gif': await handle_image_convert(update, context, 'gif'); return
+    if context.user_data.get('state') == 'awaiting_doc_pdf_pptx': await handle_pdf_to_pptx(update, context); return
+    if context.user_data.get('state') == 'awaiting_doc_pptx_pdf': await handle_pptx_to_pdf(update, context); return
+    if context.user_data.get('state') == 'awaiting_voice_en': await handle_voice_to_text(update, context, 'en-US'); return
+    if context.user_data.get('state') == 'awaiting_voice_am': await handle_voice_to_text(update, context, 'am-ET'); return
+    if context.user_data.get('state') == 'awaiting_video_link': await handle_video_download(update, context); return
+    if context.user_data.get('state') == 'awaiting_password':
+        if text == BOT_PASSWORD:
+            add_authenticated_user(user_id); context.user_data['state'] = None
+            await update.message.reply_text("✅ Access granted!")
+            keyboard = [[InlineKeyboardButton("📥 Inbox", callback_data="inbox"), InlineKeyboardButton("👤 Profile", callback_data="profile")], [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")], [InlineKeyboardButton("➕ More Commands", callback_data="more")]]
+            await update.message.reply_text("🤖 TELEGRAM ASSISTANT", reply_markup=InlineKeyboardMarkup(keyboard))
+        else:
+            await update.message.reply_text("❌ Incorrect password. Please try again.")
+        return
+    if context.user_data.get('state') == 'ar_awaiting_trigger':
+        if not is_admin(user_id):
+            context.user_data['state'] = None
+            await update.message.reply_text("🔒 Admin only.")
+            return
+        await ar_handle_trigger(update, context); return
+    if context.user_data.get('state') == 'ar_awaiting_response':
+        if not is_admin(user_id):
+            context.user_data['state'] = None
+            await update.message.reply_text("🔒 Admin only.")
+            return
+        await ar_handle_response(update, context); return
+    if context.user_data.get('reply_to'):
+        target_chat = context.user_data['reply_to']
+        try:
+            await telethon_client.send_message(target_chat, text); context.user_data['reply_to'] = None
+            await update.message.reply_text("✅ Reply sent!")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Failed: {e}")
+        return
+    state = context.user_data.get("state")
+    if state in ("tm_group", "tm_user", "tm_date"):
+        if not is_admin(user_id):
+            context.user_data["state"] = None
+            await update.message.reply_text("🔒 Admin only."); return
+        value = (text or "").strip()
+        if state == "tm_group":
+            try:
+                entity = await telethon_client.get_entity(value)
+                context.user_data["tm_group"] = entity
+                context.user_data["state"] = "tm_user"
+                await update.message.reply_text("2/3 Send the target user's @username or numeric ID.")
+            except Exception as exc:
+                await update.message.reply_text("Could not access that group/channel. Check the identifier and account access, then try again.")
+            return
+        if state == "tm_user":
+            try:
+                entity = await telethon_client.get_entity(value)
+                context.user_data["tm_user"] = entity
+                context.user_data["state"] = "tm_date"
+                await update.message.reply_text("3/3 Choose time: all, one day (YYYY-MM-DD), or inclusive range (YYYY-MM-DD..YYYY-MM-DD).")
+            except Exception:
+                await update.message.reply_text("Could not resolve that user. Try @username or numeric ID."); return
+            return
+        context.user_data["state"] = None
+        await time_machine_fetch(update, context, value)
+        return
+    state = context.user_data.get('state')
+    if state in ("audio_cut_waiting_times", "audio_cut_waiting_file"):
+        await handle_audio_cut(update, context)
+        return
+    if state == "audio_video_to_audio":
+        await handle_video_to_audio(update, context)
+        return
+    if state == "ai_content_check":
+        await handle_ai_content_check(update, context)
+        return
+    if state:
+        context.user_data['state'] = None
+        if state == 'profile_query': await fetch_profile(update, context, text)
+        elif state == 'common_query': await handle_common_groups_query(update, context, text)
+        elif state == 'search_query': await fetch_search(update, context, text)
+        elif state == 'words': await fetch_words(update, context, text)
+        elif state == 'friends': await fetch_friends(update, context, text)
+        elif state == 'names': await fetch_names(update, context, text)
+        return
+
+    if "t.me" in text:
+        username, msg_id, comment_id = parse_tg_link(text)
+        if not username:
+            await update.message.reply_text("Invalid link format."); return
+        try:
+            entity = await telethon_client.get_entity(username)
+            if msg_id and comment_id and "-" in text:
+                # Range fetch (e.g., t.me/channel/7-11)
+                status_msg = await update.message.reply_text(f"⏳ Fetching {msg_id} to {comment_id}...")
+                messages = await telethon_client.get_messages(entity, min_id=msg_id, max_id=comment_id + 1)
+                if not messages:
+                    await status_msg.edit_text("❌ No messages in that range."); return
+                for idx, msg in enumerate(messages, 1):
+                    if idx % 5 == 0: await status_msg.edit_text(f"Fetching {idx}/{len(messages)}...")
+                    await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=msg.id)
+                    await asyncio.sleep(1)
+                await status_msg.edit_text(f"✅ Range complete! Fetched {len(messages)} messages."); return
+            elif msg_id and comment_id:
+                # Comment fetch (e.g., t.me/channel/123/456)
+                status_msg = await update.message.reply_text(f"⏳ Fetching comment {comment_id}...")
+                try:
+                    msg = await telethon_client.get_messages(entity, ids=comment_id)
+                    if msg:
+                        await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=comment_id)
+                        await status_msg.edit_text("✅ Comment fetched!")
+                    else:
+                        await status_msg.edit_text("❌ Comment ID not found.")
+                except Exception as e:
+                    await status_msg.edit_text(f"❌ Could not fetch comment: {e}")
+            elif msg_id:
+                # Single message fetch (e.g., t.me/channel/123)
+                msg = await telethon_client.get_messages(entity, ids=msg_id)
+                if not msg:
+                    await update.message.reply_text("❌ Message not found."); return
+                await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=msg_id)
+            else:
+                # Batch fetch (channel link, fetch last 10 messages)
+                status_msg = await update.message.reply_text("Fetching batch (max 10)...")
+                messages = await telethon_client.get_messages(entity, limit=10)
+                if not messages:
+                    await status_msg.edit_text("No messages found."); return
+                for idx, msg in enumerate(messages, 1):
+                    if idx % 5 == 0: await status_msg.edit_text(f"Fetching {idx}/{len(messages)}...")
+                    await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=msg.id)
+                    await asyncio.sleep(1)
+                await status_msg.edit_text(f"✅ Batch complete!")
+        except Exception as e:
+            await handle_telethon_error(update, e)
+    else:
+        await update.message.reply_text("👋 Use the menu buttons, or send a Telegram link.")
+# --- MAIN EXECUTION ---
+async def main():
+    init_db()
+    def keep_alive():
+        while True:
+            self_ping()
+            time.sleep(600)
+    threading.Thread(target=keep_alive, daemon=True).start()
+    try:
+        await telethon_client.start(); print("Telethon connected!")
+    except Exception as e:
+        print(f"Telethon fail: {e}"); return
+    bot_app = Application.builder().token(BOT_TOKEN).build()
+    global PTB_BOT
+    PTB_BOT = bot_app.bot
+    bot_app.add_handler(CommandHandler("start", start))
+    for shortcut in ("lastseen", "ls", "seen", "online", "status", "last"):
+        bot_app.add_handler(CommandHandler(shortcut, last_seen_shortcut))
+    bot_app.add_handler(CommandHandler("safety", safety_command))
+    bot_app.add_handler(CommandHandler("whisper", whisper_command))
+    bot_app.add_handler(InlineQueryHandler(whisper_inline_query))
+    bot_app.add_handler(CommandHandler("logout", logout))
+    bot_app.add_handler(CommandHandler("broadcast", broadcast_command))
+    bot_app.add_handler(CommandHandler("setname", set_bot_name))
+    bot_app.add_handler(CommandHandler("setdesc", set_bot_description))
+    bot_app.add_handler(CommandHandler("setphoto", set_bot_photo))
+    bot_app.add_handler(CommandHandler("restart", restart_command))
+    bot_app.add_handler(CallbackQueryHandler(menu_callback))
+    bot_app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, safety_group_monitor), group=-1)
+    async def photo_router(update, context):
+        if context.user_data.get('state') == 'qr_scan':
+            await handle_qr_photo(update, context); return
+        if await _auto_detect_uploaded_media(update, context):
+            return
+        await handle_link(update, context)
+    bot_app.add_handler(MessageHandler(filters.PHOTO, photo_router))
+    bot_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND & ~filters.PHOTO, handle_link))
+    print("Bot running with upgraded multi-source video downloader...")
+    await bot_app.initialize(); await bot_app.start(); await bot_app.updater.start_polling()
+    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
+    await asyncio.Event().wait()
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        print(f"Bot crashed: {e}")
