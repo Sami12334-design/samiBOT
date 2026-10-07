@@ -1518,6 +1518,30 @@ async def menu_callback(update, context):
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="more")]]),
         )
+    elif data == "pdf_search_all":
+        pdf_bytes = context.user_data.get("pdf_bytes")
+        if not pdf_bytes:
+            await query.message.reply_text("❌ PDF session expired. Please upload it again.")
+            context.user_data["state"] = None
+            return
+        try:
+            pdf_bytes.seek(0)
+            doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+            total = len(doc)
+            doc.close()
+            context.user_data["pdf_find_pages"] = list(range(total))
+            context.user_data["state"] = "awaiting_pdf_find_query"
+            await query.message.reply_text(
+                f"✅ Search scope: <b>all {total} pages</b>\n\n"
+                "Step 3 of 3 — <b>What should I find?</b>\n\n"
+                "Send a <b>word, phrase, or full sentence</b>. "
+                "I’ll find exact and similar wording, then fetch the matching pages.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="more")]]),
+            )
+        except Exception as e:
+            await query.message.reply_text("❌ Could not read PDF: " + html.escape(str(e)[:700]), parse_mode=ParseMode.HTML)
+            context.user_data["state"] = None
     elif data == "pdf_extract_pages":
         context.user_data["state"] = "awaiting_pdf_pages"
         await query.message.reply_text("📄 Send a page number (3), range (1-5), or all.")
