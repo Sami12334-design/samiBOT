@@ -6059,8 +6059,7 @@ async def display_search_page(update, context, page, filter_type=None):
         )
     )
 
-    text = "
-".join(lines)
+    text = "\n".join(lines)
 
     if callback:
         try:
