@@ -468,30 +468,64 @@ def encode_multipart_formdata(fields, files):
     body += f"--{boundary}--\r\n".encode()
     return body, f"multipart/form-data; boundary={boundary}"
 
+def _original_media_filename(msg):
+    """Recover Telegram's original uploaded filename instead of inventing one."""
+    # Telethon normally exposes the original name through msg.file.name.
+    try:
+        name = getattr(getattr(msg, "file", None), "name", None)
+        if name:
+            return str(name)
+    except Exception:
+        pass
+
+    # Fallback: Telegram stores document filenames in DocumentAttributeFilename.
+    try:
+        for attr in getattr(getattr(msg, "document", None), "attributes", []) or []:
+            name = getattr(attr, "file_name", None)
+            if name:
+                return str(name)
+    except Exception:
+        pass
+
+    return None
+
+
 async def safe_send(chat_id, bot, msg, from_chat_id, message_id):
-    """Copy a Telegram message to the bot chat while preserving media + caption."""
+    """Copy a Telegram message while preserving the original media filename/extension."""
     text = (getattr(msg, "message", None) or "").strip()
     try:
-        # Telegram Bot API captions are shorter than normal messages. If a caption
-        # is too long, send the media first and then the full text separately.
         caption = text if len(text) <= 1024 else None
+        original_filename = _original_media_filename(msg)
 
         if msg.photo or msg.video or msg.document or msg.voice or msg.audio or msg.gif:
             media_bytes = BytesIO()
             await telethon_client.download_media(msg, file=media_bytes)
             media_bytes.seek(0)
+
             if msg.photo:
                 sent = await bot.send_photo(chat_id, photo=media_bytes, caption=caption)
             elif msg.video:
-                sent = await bot.send_video(chat_id, video=media_bytes, caption=caption)
+                # Keep the original video filename when Telegram provides one.
+                video_file = InputFile(media_bytes, filename=original_filename) if original_filename else media_bytes
+                sent = await bot.send_video(chat_id, video=video_file, caption=caption)
             elif msg.gif:
-                sent = await bot.send_animation(chat_id, animation=media_bytes, caption=caption)
+                animation_file = InputFile(media_bytes, filename=original_filename) if original_filename else media_bytes
+                sent = await bot.send_animation(chat_id, animation=animation_file, caption=caption)
             elif msg.voice:
                 sent = await bot.send_voice(chat_id, voice=media_bytes, caption=caption)
             elif msg.audio:
-                sent = await bot.send_audio(chat_id, audio=media_bytes, caption=caption)
+                audio_file = InputFile(media_bytes, filename=original_filename) if original_filename else media_bytes
+                sent = await bot.send_audio(chat_id, audio=audio_file, caption=caption)
             else:
-                sent = await bot.send_document(chat_id, document=media_bytes, caption=caption)
+                # IMPORTANT: send documents through InputFile with the exact
+                # original filename. Passing a raw BytesIO makes Telegram
+                # display generic names such as "application.octet-stream".
+                document_file = InputFile(
+                    media_bytes,
+                    filename=original_filename or "file",
+                )
+                sent = await bot.send_document(chat_id, document=document_file, caption=caption)
+
             if text and caption is None:
                 await bot.send_message(chat_id, text=text)
             return sent
@@ -511,6 +545,7 @@ async def safe_send(chat_id, bot, msg, from_chat_id, message_id):
             await bot.send_message(chat_id, "🔒 This Telegram message has protected media and cannot be copied.")
         else:
             await bot.send_message(chat_id, f"⚠️ Could not display one message: {type(e).__name__}: {e}")
+
 
 async def handle_telethon_error(update, error):
     if isinstance(error, FloodWaitError):
