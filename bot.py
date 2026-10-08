@@ -1542,7 +1542,7 @@ async def menu_callback(update, context):
         context.user_data['state'] = 'search_query'
     elif data == "pdf_fetch":
         context.user_data["state"] = "awaiting_pdf"
-        for key in ("pdf_bytes", "pdf_filter", "pdf_find_pages"):
+        for key in ("pdf_bytes", "pdf_filename", "pdf_filter", "pdf_find_pages"):
             context.user_data.pop(key, None)
         await query.message.reply_text(
             "📄 <b>PDF SMART FETCH</b>\n\n"
@@ -3559,6 +3559,7 @@ async def handle_pdf_upload(update, context):
         doc.close()
 
         context.user_data["pdf_bytes"] = pdf_bytes
+        context.user_data["pdf_filename"] = document.file_name or "document.pdf"
         context.user_data["state"] = "awaiting_pdf_filter"
 
         await update.message.reply_text(
@@ -3663,10 +3664,11 @@ async def send_pdf_filtered_pages(query_or_update, context, pages=None):
             pdf_bytes.seek(0)
             output = BytesIO(pdf_bytes.getvalue())
             output.seek(0)
-            output.name = "original.pdf"
+            original_filename = context.user_data.get("pdf_filename") or "document.pdf"
+            output.name = original_filename
             await status.edit_text("✅ Original PDF ready.")
             await query_or_update.message.reply_document(
-                document=InputFile(output, filename="original.pdf"),
+                document=InputFile(output, filename=original_filename),
                 caption=f"📖 <b>Original PDF</b>\n📄 {total} page(s)",
                 parse_mode=ParseMode.HTML,
             )
