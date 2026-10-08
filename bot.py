@@ -1507,49 +1507,57 @@ async def menu_callback(update, context):
         context.user_data['state'] = 'search_query'
     elif data == "pdf_fetch":
         context.user_data["state"] = "awaiting_pdf"
-        context.user_data.pop("pdf_bytes", None)
-        context.user_data.pop("pdf_find_pages", None)
+        for key in ("pdf_bytes", "pdf_filter", "pdf_find_pages"):
+            context.user_data.pop(key, None)
         await query.message.reply_text(
             "📄 <b>PDF SMART FETCH</b>\n\n"
-            "Step 1 of 3 — <b>Send your PDF</b>.\n\n"
-            "After you upload it, I’ll ask which pages to search, then "
-            "what word, phrase, or sentence you want to find.\n\n"
-            "🔎 I’ll also detect similar wording, not only exact matches.",
+            "Step 1 — <b>Send your PDF</b>.\n\n"
+            "After I receive it, you choose exactly how you want to filter it.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="more")]]),
         )
-    elif data == "pdf_search_all":
-        pdf_bytes = context.user_data.get("pdf_bytes")
-        if not pdf_bytes:
+    elif data == "pdf_filter_page":
+        if not context.user_data.get("pdf_bytes"):
             await query.message.reply_text("❌ PDF session expired. Please upload it again.")
             context.user_data["state"] = None
             return
-        try:
-            pdf_bytes.seek(0)
-            doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-            total = len(doc)
-            doc.close()
-            context.user_data["pdf_find_pages"] = list(range(total))
-            context.user_data["state"] = "awaiting_pdf_find_query"
-            await query.message.reply_text(
-                f"✅ Search scope: <b>all {total} pages</b>\n\n"
-                "Step 3 of 3 — <b>What should I find?</b>\n\n"
-                "Send a <b>word, phrase, or full sentence</b>. "
-                "I’ll find exact and similar wording, then fetch the matching pages.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="more")]]),
-            )
-        except Exception as e:
-            await query.message.reply_text("❌ Could not read PDF: " + html.escape(str(e)[:700]), parse_mode=ParseMode.HTML)
-            context.user_data["state"] = None
-    elif data == "pdf_extract_pages":
-        context.user_data["state"] = "awaiting_pdf_pages"
-        await query.message.reply_text("📄 Send a page number (3), range (1-5), or all.")
-    elif data == "pdf_find_text":
-        context.user_data["state"] = "awaiting_pdf_find_pages"
+        context.user_data["state"] = "awaiting_pdf_page_filter"
+        context.user_data["pdf_filter"] = "page"
         await query.message.reply_text(
-            "🔎 FIND WORD / PHRASE / SENTENCE\n\n"
-            "First send a page number, range like 1-5, or all."
+            "📄 <b>Specific Page</b>\n\nSend the page number, for example: <code>7</code>.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="more")]]),
+        )
+    elif data == "pdf_filter_range":
+        if not context.user_data.get("pdf_bytes"):
+            await query.message.reply_text("❌ PDF session expired. Please upload it again.")
+            context.user_data["state"] = None
+            return
+        context.user_data["state"] = "awaiting_pdf_page_filter"
+        context.user_data["pdf_filter"] = "range"
+        await query.message.reply_text(
+            "📚 <b>Page Range</b>\n\nSend the range, for example: <code>5-12</code>.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="more")]]),
+        )
+    elif data == "pdf_filter_all":
+        if not context.user_data.get("pdf_bytes"):
+            await query.message.reply_text("❌ PDF session expired. Please upload it again.")
+            context.user_data["state"] = None
+            return
+        await send_pdf_filtered_pages(query, context, None)
+    elif data == "pdf_filter_text":
+        if not context.user_data.get("pdf_bytes"):
+            await query.message.reply_text("❌ PDF session expired. Please upload it again.")
+            context.user_data["state"] = None
+            return
+        context.user_data["state"] = "awaiting_pdf_find_query"
+        await query.message.reply_text(
+            "🔎 <b>Find Word / Phrase / Sentence</b>\n\n"
+            "Send the word, phrase, or sentence you want to find.\n"
+            "I’ll search the whole PDF for exact matches and similar wording, then fetch the matching pages.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="more")]]),
         )
     elif data.startswith("posts_"):
         try: page=max(1,int(data.split("_",1)[1]))
@@ -3497,29 +3505,44 @@ def do_download_for_quality(job, output_dir, quality):
 async def handle_pdf_upload(update, context):
     if context.user_data.get("state") != "awaiting_pdf":
         return
-    if not update.message.document:
-        await update.message.reply_text("❌ Please upload a valid PDF document.")
+    document = getattr(update.message, "document", None)
+    if not document:
+        await update.message.reply_text("❌ Please send the PDF as a document.")
         return
-    if update.message.document.mime_type != "application/pdf":
-        await update.message.reply_text("❌ The file you uploaded is not a PDF.")
+    filename = (document.file_name or "").lower()
+    if document.mime_type != "application/pdf" and not filename.endswith(".pdf"):
+        await update.message.reply_text("❌ That file is not a PDF. Please send a PDF.")
         return
 
     try:
-        file = await context.bot.get_file(update.message.document.file_id)
+        file = await context.bot.get_file(document.file_id)
         pdf_bytes = BytesIO()
         await file.download_to_memory(pdf_bytes)
         pdf_bytes.seek(0)
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        total = len(doc)
+        doc.close()
+
         context.user_data["pdf_bytes"] = pdf_bytes
-        context.user_data["state"] = "awaiting_pdf_find_pages"
+        context.user_data["state"] = "awaiting_pdf_filter"
+
         await update.message.reply_text(
-            "✅ <b>PDF received!</b>\n\n"
-            "Step 2 of 3 — <b>Which pages should I search?</b>\n\n"
-            "• <code>5</code> — page 5 only\n"
-            "• <code>5-12</code> — pages 5 to 12\n"
-            "• <code>all</code> — search the whole PDF",
+            f"✅ <b>PDF received</b> — {total} page(s).\n\n"
+            "<b>How do you want to filter it?</b>\n\n"
+            "📄 <b>Specific Page</b> → get one page\n"
+            "📚 <b>Page Range</b> → get pages like 5–12\n"
+            "📖 <b>All Pages</b> → get the complete PDF\n"
+            "🔎 <b>Find Text</b> → find a word, phrase, or sentence and fetch matching pages",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📚 All Pages", callback_data="pdf_search_all")],
+                [
+                    InlineKeyboardButton("📄 Specific Page", callback_data="pdf_filter_page"),
+                    InlineKeyboardButton("📚 Page Range", callback_data="pdf_filter_range"),
+                ],
+                [
+                    InlineKeyboardButton("📖 All Pages", callback_data="pdf_filter_all"),
+                    InlineKeyboardButton("🔎 Find Text", callback_data="pdf_filter_text"),
+                ],
                 [InlineKeyboardButton("❌ Cancel", callback_data="more")],
             ]),
         )
@@ -3527,60 +3550,103 @@ async def handle_pdf_upload(update, context):
         await update.message.reply_text("❌ Could not receive the PDF: " + html.escape(str(e)[:500]), parse_mode=ParseMode.HTML)
         context.user_data["state"] = None
 
-async def handle_pdf_find_pages(update, context):
-    if context.user_data.get("state") != "awaiting_pdf_find_pages":
-        return
+
+async def send_pdf_filtered_pages(query_or_update, context, pages=None):
     pdf_bytes = context.user_data.get("pdf_bytes")
     if not pdf_bytes:
-        await update.message.reply_text("❌ PDF search session expired. Please upload it again.")
+        await query_or_update.message.reply_text("❌ PDF session expired. Please upload it again.")
         context.user_data["state"] = None
         return
 
-    value = (update.message.text or "").strip().lower()
-    if value == "all":
-        selection = None
-    else:
-        match = re.fullmatch(r"(\d+)(?:\s*-\s*(\d+))?", value)
-        if not match:
-            await update.message.reply_text(
-                "❌ Invalid page selection. Use <code>5</code>, <code>5-12</code>, or <code>all</code>.",
-                parse_mode=ParseMode.HTML,
-            )
+    status = await query_or_update.message.reply_text("📄 Preparing your PDF…")
+    try:
+        pdf_bytes.seek(0)
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        total = len(doc)
+        if pages is None:
+            pages = list(range(total))
+        else:
+            pages = sorted(set(int(p) for p in pages if 0 <= int(p) < total))
+        if not pages:
+            doc.close()
+            await status.edit_text("❌ No valid pages were selected.")
             return
-        start = int(match.group(1))
-        end = int(match.group(2) or match.group(1))
-        if end < start:
-            await update.message.reply_text("❌ End page must be greater than or equal to start page.")
-            return
-        selection = (start, end)
+
+        new_doc = pymupdf.open()
+        for page_index in pages:
+            new_doc.insert_pdf(doc, from_page=page_index, to_page=page_index)
+        output = BytesIO(new_doc.tobytes(garbage=4, deflate=True))
+        new_doc.close()
+        doc.close()
+        output.seek(0)
+
+        if len(pages) == total:
+            filename = "complete_pdf.pdf"
+            caption = f"📖 <b>Complete PDF</b>\n📄 {total} page(s)"
+        elif len(pages) == 1:
+            filename = f"page_{pages[0] + 1}.pdf"
+            caption = f"📄 <b>Page {pages[0] + 1}</b>"
+        else:
+            filename = f"pages_{pages[0] + 1}-{pages[-1] + 1}.pdf"
+            caption = f"📚 <b>Pages {pages[0] + 1}–{pages[-1] + 1}</b>\n📄 {len(pages)} page(s)"
+
+        output.name = filename
+        await status.edit_text("✅ PDF ready.")
+        await query_or_update.message.reply_document(
+            document=output,
+            filename=filename,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        await status.edit_text("❌ PDF fetch failed: " + html.escape(str(e)[:900]), parse_mode=ParseMode.HTML)
+    finally:
+        for key in ("pdf_bytes", "pdf_filter", "pdf_find_pages"):
+            context.user_data.pop(key, None)
+        context.user_data["state"] = None
+
+
+async def handle_pdf_page_filter(update, context):
+    if context.user_data.get("state") != "awaiting_pdf_page_filter":
+        return
+    pdf_bytes = context.user_data.get("pdf_bytes")
+    if not pdf_bytes:
+        await update.message.reply_text("❌ PDF session expired. Please upload the PDF again.")
+        context.user_data["state"] = None
+        return
+
+    value = (update.message.text or "").strip()
+    match = re.fullmatch(r"(\d+)(?:\s*-\s*(\d+))?", value)
+    if not match:
+        await update.message.reply_text(
+            "❌ Invalid selection. Use <code>7</code> for one page or <code>5-12</code> for a range.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    start = int(match.group(1))
+    end = int(match.group(2) or match.group(1))
+    if start < 1 or end < start:
+        await update.message.reply_text("❌ Please enter a valid page or range.")
+        return
+
+    selected_mode = context.user_data.get("pdf_filter")
+    if selected_mode == "page" and start != end:
+        await update.message.reply_text("❌ You chose Specific Page. Send one page number, such as <code>7</code>.", parse_mode=ParseMode.HTML)
+        return
+    if selected_mode == "range" and start == end:
+        await update.message.reply_text("❌ You chose Page Range. Send a range such as <code>5-12</code>.", parse_mode=ParseMode.HTML)
+        return
 
     try:
         pdf_bytes.seek(0)
         doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
         total = len(doc)
-        if selection is None:
-            pages = list(range(total))
-            scope_text = f"all {total} pages"
-        else:
-            start, end = selection
-            if start < 1 or end > total:
-                doc.close()
-                await update.message.reply_text(f"❌ This PDF has {total} pages.")
-                return
-            pages = list(range(start - 1, end))
-            scope_text = f"pages {start}-{end}" if start != end else f"page {start}"
         doc.close()
-
-        context.user_data["pdf_find_pages"] = pages
-        context.user_data["state"] = "awaiting_pdf_find_query"
-        await update.message.reply_text(
-            f"✅ Search scope: <b>{scope_text}</b>\n\n"
-            "Step 3 of 3 — <b>What should I find?</b>\n\n"
-            "Send a <b>word, phrase, or full sentence</b>.\n"
-            "I’ll check exact matches and similar wording, then fetch the matching pages.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="more")]]),
-        )
+        if end > total:
+            await update.message.reply_text(f"❌ This PDF has only {total} page(s).")
+            return
+        await send_pdf_filtered_pages(update, context, list(range(start - 1, end)))
     except Exception as e:
         await update.message.reply_text("❌ Could not read PDF: " + html.escape(str(e)[:700]), parse_mode=ParseMode.HTML)
         context.user_data["state"] = None
@@ -3603,11 +3669,10 @@ def _pdf_similarity_score(query_text, page_text):
     if not tokens:
         return 0.0, None
 
-    q_set = set(q_tokens)
-    token_hits = sum(1 for tok in q_tokens if tok in set(tokens))
+    token_set = set(tokens)
+    token_hits = sum(1 for tok in q_tokens if tok in token_set)
     token_score = token_hits / max(1, len(q_tokens))
 
-    # Compare the query against lines/sentences and nearby word windows.
     candidates = re.split(r"(?<=[.!?])\s+|\n+", page_text)
     best = 0.0
     best_text = None
@@ -3631,18 +3696,15 @@ def _pdf_similarity_score(query_text, page_text):
             window_text = chunk
 
     score = max(best * 0.7 + token_score * 0.3, window_best * 0.75 + token_score * 0.25)
-    snippet = best_text or window_text
-    return score, snippet
+    return score, best_text or window_text
 
 
 async def handle_pdf_find_query(update, context):
     if context.user_data.get("state") != "awaiting_pdf_find_query":
         return
     pdf_bytes = context.user_data.get("pdf_bytes")
-    pages = context.user_data.get("pdf_find_pages")
     query_text = (update.message.text or "").strip()
-
-    if not pdf_bytes or pages is None:
+    if not pdf_bytes:
         await update.message.reply_text("❌ PDF search session expired. Please upload the PDF again.")
         context.user_data["state"] = None
         return
@@ -3650,43 +3712,42 @@ async def handle_pdf_find_query(update, context):
         await update.message.reply_text("❌ Enter a word, phrase, or sentence to search for.")
         return
 
-    status = await update.message.reply_text("🔎 Searching for exact and similar wording…")
+    status = await update.message.reply_text("🔎 Searching the PDF for exact and similar wording…")
     try:
         pdf_bytes.seek(0)
         doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
         matches = []
-        for page_index in pages:
+        for page_index in range(len(doc)):
             page_text = doc.load_page(page_index).get_text("text") or ""
             score, snippet = _pdf_similarity_score(query_text, page_text)
             if score >= 0.62:
                 matches.append((score, page_index, snippet or ""))
-        matches.sort(key=lambda item: (-item[0], item[1]))
 
+        matches.sort(key=lambda item: (-item[0], item[1]))
         if not matches:
+            doc.close()
             await status.edit_text(
                 f"❌ No strong match found for <b>{html.escape(query_text[:250])}</b>.\n\n"
                 "Try a shorter keyword or a more specific phrase.",
                 parse_mode=ParseMode.HTML,
             )
-            doc.close()
             return
 
         await status.edit_text(
-            f"✅ Found <b>{len(matches)}</b> relevant page(s). Fetching them…",
+            f"✅ Found <b>{len(matches)}</b> matching page(s). Fetching the strongest results…",
             parse_mode=ParseMode.HTML,
         )
-
-        # Fetch the matching pages as individual one-page PDFs, plus a short context message.
-        for rank, (score, page_index, snippet) in enumerate(matches[:10], 1):
-            page_number = page_index + 1
+        for score, page_index, snippet in matches[:10]:
             new_doc = pymupdf.open()
             new_doc.insert_pdf(doc, from_page=page_index, to_page=page_index)
             page_pdf = BytesIO(new_doc.tobytes(garbage=4, deflate=True))
             new_doc.close()
-            page_pdf.name = f"matching_page_{page_number}.pdf"
+            page_pdf.seek(0)
+            page_number = page_index + 1
+            filename = f"matching_page_{page_number}.pdf"
             await update.message.reply_document(
                 document=page_pdf,
-                filename=f"matching_page_{page_number}.pdf",
+                filename=filename,
                 caption=(
                     f"📄 <b>Matching page {page_number}</b>\n"
                     f"🎯 Match: <b>{score * 100:.0f}%</b>\n"
@@ -3695,16 +3756,18 @@ async def handle_pdf_find_query(update, context):
                 ),
                 parse_mode=ParseMode.HTML,
             )
-
         if len(matches) > 10:
-            await update.message.reply_text(f"ℹ️ {len(matches) - 10} additional matching pages were found. I fetched the top 10 strongest matches.")
+            await update.message.reply_text(f"ℹ️ {len(matches) - 10} more matching page(s) found. The 10 strongest matches were fetched.")
         doc.close()
     except Exception as e:
-        await status.edit_text("❌ PDF search failed: " + html.escape(str(e)[:800]), parse_mode=ParseMode.HTML)
+        try:
+            await status.edit_text("❌ PDF search failed: " + html.escape(str(e)[:900]), parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
     finally:
+        for key in ("pdf_bytes", "pdf_filter", "pdf_find_pages"):
+            context.user_data.pop(key, None)
         context.user_data["state"] = None
-        context.user_data.pop("pdf_find_pages", None)
-        context.user_data.pop("pdf_bytes", None)
 
 
 async def handle_pdf_pages(update, context):
@@ -7510,7 +7573,7 @@ async def handle_link(update, context):
     if context.user_data.get('state') == 'awaiting_text_to_image': await handle_text_to_image(update, context); return
     if context.user_data.get('state') == 'awaiting_image_to_pdf': await handle_image_collect(update, context); return
     if context.user_data.get('state') == 'awaiting_pdf': await handle_pdf_upload(update, context); return
-    if context.user_data.get("state") == "awaiting_pdf_find_pages": await handle_pdf_find_pages(update, context); return
+    if context.user_data.get("state") == "awaiting_pdf_page_filter": await handle_pdf_page_filter(update, context); return
     if context.user_data.get("state") == "awaiting_pdf_find_query": await handle_pdf_find_query(update, context); return
     if context.user_data.get('state') == 'awaiting_pdf_pages': await handle_pdf_pages(update, context); return
     if context.user_data.get('state') == 'awaiting_pdf_to_word': await handle_pdf_to_word(update, context); return
