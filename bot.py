@@ -3586,55 +3586,133 @@ async def handle_pdf_upload(update, context):
         context.user_data["state"] = None
 
 
+def _pdf_page_is_image_based(page):
+    """Return True when the page is primarily visual/scanned rather than selectable text."""
+    try:
+        text = " ".join((page.get_text("text") or "").split())
+        image_count = len(page.get_images(full=True))
+        # A page with no meaningful extracted text is normally a scanned/image page.
+        if len(text) < 25:
+            return True
+        # If the page contains images and very little text, preserve it visually.
+        if image_count and len(text) < 120:
+            return True
+        return False
+    except Exception:
+        return True
+
+
+async def _send_pdf_page_as_content(target, page, page_number, prefix=""):
+    """Send one PDF page in its natural content form: text or rendered image."""
+    try:
+        text_content = (page.get_text("text") or "").strip()
+        if not _pdf_page_is_image_based(page) and text_content:
+            # Telegram message limit is 4096 characters. Keep page text intact
+            # by splitting it instead of converting the page into a PDF.
+            clean_text = text_content.replace("\x00", "").strip()
+            header = f"📄 <b>Page {page_number}</b>"
+            if prefix:
+                header += f"\n{prefix}"
+            chunks = [clean_text[i:i + 3800] for i in range(0, len(clean_text), 3800)]
+            for idx, chunk in enumerate(chunks):
+                if idx == 0:
+                    body = f"{header}\n\n{html.escape(chunk)}"
+                else:
+                    body = html.escape(chunk)
+                await target.reply_text(body, parse_mode=ParseMode.HTML)
+            return "text"
+
+        # Scanned/image-based page: render the actual page, not a new PDF.
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(1.5, 1.5), alpha=False)
+        image = BytesIO(pix.tobytes("png"))
+        image.seek(0)
+        caption = f"📄 <b>Page {page_number}</b>"
+        if prefix:
+            caption += f"\n{prefix}"
+        await target.reply_photo(photo=image, caption=caption, parse_mode=ParseMode.HTML)
+        return "image"
+    except Exception as exc:
+        await target.reply_text(
+            f"⚠️ Could not render page {page_number}: {html.escape(str(exc)[:500])}",
+            parse_mode=ParseMode.HTML,
+        )
+        return "error"
+
+
 async def send_pdf_filtered_pages(query_or_update, context, pages=None):
+    """Return filtered PDF pages as their original content type.
+
+    'all' keeps the original PDF. Filtered pages are never wrapped back into
+    artificial PDFs: text pages become Telegram text and scanned/image pages
+    become Telegram images.
+    """
     pdf_bytes = context.user_data.get("pdf_bytes")
     if not pdf_bytes:
         await query_or_update.message.reply_text("❌ PDF session expired. Please upload it again.")
         context.user_data["state"] = None
         return
 
-    status = await query_or_update.message.reply_text("📄 Preparing your PDF…")
+    status = await query_or_update.message.reply_text("📄 Reading the PDF content…")
     try:
         pdf_bytes.seek(0)
         doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
         total = len(doc)
+
         if pages is None:
-            pages = list(range(total))
-        else:
-            pages = sorted(set(int(p) for p in pages if 0 <= int(p) < total))
+            # All Pages means the user wants the actual PDF, untouched.
+            pdf_bytes.seek(0)
+            output = BytesIO(pdf_bytes.getvalue())
+            output.seek(0)
+            output.name = "original.pdf"
+            await status.edit_text("✅ Original PDF ready.")
+            await query_or_update.message.reply_document(
+                document=InputFile(output, filename="original.pdf"),
+                caption=f"📖 <b>Original PDF</b>\n📄 {total} page(s)",
+                parse_mode=ParseMode.HTML,
+            )
+            doc.close()
+            return
+
+        pages = sorted(set(int(p) for p in pages if 0 <= int(p) < total))
         if not pages:
             doc.close()
             await status.edit_text("❌ No valid pages were selected.")
             return
 
-        new_doc = pymupdf.open()
+        await status.edit_text(
+            f"🔎 Extracting <b>{len(pages)}</b> selected page(s) in their original content form…",
+            parse_mode=ParseMode.HTML,
+        )
+
+        text_count = 0
+        image_count = 0
         for page_index in pages:
-            new_doc.insert_pdf(doc, from_page=page_index, to_page=page_index)
-        output = BytesIO(new_doc.tobytes(garbage=4, deflate=True))
-        new_doc.close()
+            page = doc.load_page(page_index)
+            result = await _send_pdf_page_as_content(
+                query_or_update.message,
+                page,
+                page_index + 1,
+            )
+            if result == "text":
+                text_count += 1
+            elif result == "image":
+                image_count += 1
+
         doc.close()
-        output.seek(0)
-
-        if len(pages) == total:
-            filename = "complete_pdf.pdf"
-            caption = f"📖 <b>Complete PDF</b>\n📄 {total} page(s)"
-        elif len(pages) == 1:
-            filename = f"page_{pages[0] + 1}.pdf"
-            caption = f"📄 <b>Page {pages[0] + 1}</b>"
-        else:
-            filename = f"pages_{pages[0] + 1}-{pages[-1] + 1}.pdf"
-            caption = f"📚 <b>Pages {pages[0] + 1}–{pages[-1] + 1}</b>\n📄 {len(pages)} page(s)"
-
-        output.name = filename
-        await status.edit_text("✅ PDF ready.")
-        await query_or_update.message.reply_document(
-            document=output,
-            filename=filename,
-            caption=caption,
+        await query_or_update.message.reply_text(
+            f"✅ Done — <b>{len(pages)}</b> page(s) fetched.\n"
+            f"📝 Text pages: <b>{text_count}</b>\n"
+            f"🖼️ Image/scanned pages: <b>{image_count}</b>",
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
-        await status.edit_text("❌ PDF fetch failed: " + html.escape(str(e)[:900]), parse_mode=ParseMode.HTML)
+        try:
+            await status.edit_text(
+                "❌ PDF fetch failed: " + html.escape(str(e)[:900]),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
     finally:
         for key in ("pdf_bytes", "pdf_filter", "pdf_find_pages"):
             context.user_data.pop(key, None)
@@ -3773,24 +3851,43 @@ async def handle_pdf_find_query(update, context):
             parse_mode=ParseMode.HTML,
         )
         for score, page_index, snippet in matches[:10]:
-            new_doc = pymupdf.open()
-            new_doc.insert_pdf(doc, from_page=page_index, to_page=page_index)
-            page_pdf = BytesIO(new_doc.tobytes(garbage=4, deflate=True))
-            new_doc.close()
-            page_pdf.seek(0)
-            page_number = page_index + 1
-            filename = f"matching_page_{page_number}.pdf"
-            await update.message.reply_document(
-                document=page_pdf,
-                filename=filename,
-                caption=(
-                    f"📄 <b>Matching page {page_number}</b>\n"
-                    f"🎯 Match: <b>{score * 100:.0f}%</b>\n"
-                    f"🔎 Query: <code>{html.escape(query_text[:200])}</code>\n"
-                    f"📝 {html.escape(' '.join(snippet.split())[:700])}"
-                ),
-                parse_mode=ParseMode.HTML,
+            page = doc.load_page(page_index)
+            match_note = (
+                f"🎯 Match: <b>{score * 100:.0f}%</b>\n"
+                f"🔎 Query: <code>{html.escape(query_text[:200])}</code>"
             )
+
+            if _pdf_page_is_image_based(page):
+                # Search can only find extracted text, but if the matching page
+                # is visually represented, return the original page as an image.
+                pix = page.get_pixmap(matrix=pymupdf.Matrix(1.5, 1.5), alpha=False)
+                page_image = BytesIO(pix.tobytes("png"))
+                page_image.seek(0)
+                await update.message.reply_photo(
+                    photo=page_image,
+                    caption=(
+                        f"📄 <b>Matching page {page_index + 1}</b>\n"
+                        f"{match_note}\n"
+                        f"📝 {html.escape(' '.join(snippet.split())[:500])}"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                page_text = (page.get_text("text") or "").strip()
+                # Return the actual extracted page text; never manufacture a PDF.
+                clean_text = page_text.replace("\x00", "").strip()
+                chunks = [clean_text[i:i + 3500] for i in range(0, len(clean_text), 3500)]
+                for chunk_index, chunk in enumerate(chunks):
+                    if chunk_index == 0:
+                        message = (
+                            f"📄 <b>Matching page {page_index + 1}</b>\n"
+                            f"{match_note}\n\n"
+                            f"{html.escape(chunk)}"
+                        )
+                    else:
+                        message = html.escape(chunk)
+                    await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+
         if len(matches) > 10:
             await update.message.reply_text(f"ℹ️ {len(matches) - 10} more matching page(s) found. The 10 strongest matches were fetched.")
         doc.close()
