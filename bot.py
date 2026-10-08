@@ -5084,10 +5084,10 @@ async def send_story_at_index(update,context,index):
 SEARCH_PAGE_SIZE = 8
 SEARCH_MAX_QUERY = 80
 SEARCH_MAX_RESULTS = 160
-SEARCH_PUBLIC_PEER_LIMIT = 50
-SEARCH_MESSAGES_PER_PEER = 12
+SEARCH_PUBLIC_PEER_LIMIT = 20
+SEARCH_MESSAGES_PER_PEER = 3
 SEARCH_GLOBAL_MESSAGE_LIMIT = 120
-SEARCH_CONCURRENCY = 8
+SEARCH_CONCURRENCY = 10
 SEARCH_TIMEOUT = 7.5
 SEARCH_CACHE_TTL = 45.0
 SEARCH_DIRECT_PEER_LIMIT = 12
@@ -5250,68 +5250,97 @@ def _search_cache_key(query):
 
 async def _search_discover_public_peers(query):
     """
-    Discover public Telegram groups/channels by name/username.
+    STEP 1 — AGGRESSIVE GLOBAL DIRECTORY DISCOVERY
 
-    This deliberately does NOT inspect dialogs, participants, private chats,
-    or admin-only history. The result is a public peer directory, not a copy
-    of the operator's account.
+    Telegram's contacts.SearchRequest is the discovery source. It returns
+    public channels/supergroups even when the account has not joined them.
+
+    No iter_dialogs(), local dialog cache, or admin chat list is used.
     """
     found = {}
-    q = (query or "").strip()
+
+    q = re.sub(
+        r"\\s+",
+        " ",
+        (query or "").strip(),
+    )
+
     if not q:
         return found
 
-    # Telegram's global contact search is useful for finding public usernames.
-    # Only the returned public group/channel peers are retained.
     try:
         result = await asyncio.wait_for(
-            telethon_client(functions.contacts.SearchRequest(q=q, limit=SEARCH_PUBLIC_PEER_LIMIT, hash=0)),
+            telethon_client(
+                functions.contacts.SearchRequest(
+                    q=q,
+                    limit=20,
+                    hash=0,
+                )
+            ),
             timeout=SEARCH_TIMEOUT,
         )
-        for entity in list(getattr(result, "chats", []) or []) + list(getattr(result, "users", []) or []):
-            if _search_public_entity(entity):
-                marked = _search_peer_marked_id(entity)
-                if marked is not None:
-                    found[marked] = entity
-    except Exception as exc:
-        print(f"[SearchV2] public peer discovery skipped: {type(exc).__name__}: {exc}")
 
-    # A direct @username is deterministic and avoids depending on discovery
-    # ranking. This also makes public channel lookup feel instant.
-    direct = q.split()[0] if q.startswith("@") else None
-    if direct:
-        try:
-            entity = await asyncio.wait_for(
-                telethon_client.get_entity(direct),
-                timeout=SEARCH_TIMEOUT,
-            )
-            if _search_public_entity(entity):
-                marked = _search_peer_marked_id(entity)
-                if marked is not None:
-                    found[marked] = entity
-        except Exception:
-            pass
+        for entity in list(
+            getattr(result, "chats", []) or []
+        ):
+            if not _search_public_entity(entity):
+                continue
+
+            username = (
+                getattr(entity, "username", None)
+                or ""
+            ).strip().lstrip("@")
+
+            if not username:
+                continue
+
+            peer_id = _search_peer_marked_id(entity)
+
+            if peer_id is not None:
+                found[int(peer_id)] = entity
+
+    except FloodWaitError as exc:
+        print(
+            f"[SearchV3] directory flood wait: "
+            f"{int(getattr(exc, 'seconds', 0))}s"
+        )
+
+    except Exception as exc:
+        print(
+            f"[SearchV3] directory discovery failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
 
     return found
 
-
 async def _search_public_peer(entity, query, semaphore):
-    """Search one public peer without requiring membership."""
+    """
+    STEP 2 — DIRECT MESSAGE SEARCH
+
+    Search one public channel/supergroup discovered by
+    contacts.SearchRequest using get_messages().
+    """
     async with semaphore:
         try:
-            messages = []
-            async for message in telethon_client.iter_messages(
-                entity,
-                search=query,
-                limit=SEARCH_MESSAGES_PER_PEER,
-            ):
-                messages.append(message)
-                if len(messages) >= SEARCH_MESSAGES_PER_PEER:
-                    break
-            return entity, messages, None
-        except Exception as exc:
+            messages = await asyncio.wait_for(
+                telethon_client.get_messages(
+                    entity,
+                    search=query,
+                    limit=3,
+                ),
+                timeout=SEARCH_TIMEOUT,
+            )
+
+            if not messages:
+                return entity, [], None
+
+            return entity, list(messages), None
+
+        except FloodWaitError as exc:
             return entity, [], exc
 
+        except Exception as exc:
+            return entity, [], exc
 
 def _search_result_from_message(entity, message, query, rank):
     marked = _search_peer_marked_id(entity)
@@ -5338,13 +5367,15 @@ def _search_result_from_message(entity, message, query, rank):
 
 async def _search_public_index(query):
     """
-    TRUE TELEGRAM GLOBAL PUBLIC SEARCH.
+    TRUE GLOBAL PUBLIC MESSAGE SEARCH V3.
 
-    Important: this function never uses dialogs, local entity cache, or a
-    locally joined-chat list as the search universe. SearchGlobalRequest is
-    Telegram's server-side global message index. The entity objects returned
-    alongside those messages are used directly, so an unseen public channel
-    or group is still eligible.
+    1. contacts.SearchRequest(q=query, limit=20)
+       discovers unjoined public channels/supergroups.
+    2. get_messages(entity, search=query, limit=3) runs concurrently
+       against every discovered public peer.
+    3. SearchGlobalRequest supplies Telegram's global message index.
+    4. Both sources are combined and deduplicated by (peer_id, message_id).
+    5. Results are ranked and returned for the compact UI.
     """
     cache_key = _search_cache_key(query)
     now = time.monotonic()
@@ -5358,267 +5389,297 @@ async def _search_public_index(query):
     results = []
     seen = set()
 
-    async def _global_public_request(*, broadcasts_only=False, groups_only=False):
-        request = functions.messages.SearchGlobalRequest(
-            q=query,
-            filter=types.InputMessagesFilterEmpty(),
-            min_date=0,
-            max_date=0,
-            offset_rate=0,
-            offset_peer=types.InputPeerEmpty(),
-            offset_id=0,
-            limit=SEARCH_GLOBAL_MESSAGE_LIMIT,
-            broadcasts_only=broadcasts_only,
-            groups_only=groups_only,
+    def add_message_result(entity, message, rank):
+        if entity is None or message is None:
+            return
+        if not _search_public_entity(entity):
+            return
+
+        message_id = getattr(message, "id", None)
+        peer_id = _search_peer_marked_id(entity)
+
+        if not message_id or peer_id is None:
+            return
+
+        key = (int(peer_id), int(message_id))
+
+        if key in seen:
+            return
+
+        link = _search_message_link(entity, message_id)
+
+        if not link:
+            return
+
+        item = _search_result_from_message(
+            entity,
+            message,
+            query,
+            rank,
         )
-        return await asyncio.wait_for(
-            telethon_client(request),
-            timeout=SEARCH_TIMEOUT,
-        )
 
-    def _response_entities(result):
-        """
-        Build the peer index ONLY from entities bundled in Telegram's
-        SearchGlobal response. This is not the bot's dialog/cache.
-        """
-        entities = {}
-        for entity in list(getattr(result, "chats", []) or []):
-            if not _search_public_entity(entity):
-                continue
-
-            marked = _search_peer_marked_id(entity)
-            if marked is not None:
-                entities[int(marked)] = entity
-
-            raw_id = getattr(entity, "id", None)
-            if raw_id is not None:
-                entities[int(raw_id)] = entity
-                if getattr(entity, "broadcast", None) is not None:
-                    entities[-1000000000000 - abs(int(raw_id))] = entity
-
-        return entities
-
-    def _entity_for_global_message(message, result_entities):
-        """
-        Resolve the peer from Telegram's response data, never from dialogs.
-        Message._entities is also response-scoped and is checked before the
-        Telethon account cache.
-        """
-        peer = getattr(message, "peer_id", None)
-
-        try:
-            marked = int(get_peer_id(peer)) if peer is not None else None
-        except Exception:
-            marked = None
-
-        if marked is not None:
-            entity = result_entities.get(marked)
-            if entity is not None and _search_public_entity(entity):
-                return entity
-
-        # SearchGlobal's Message object may carry its own response entity map.
-        for entity in list(getattr(message, "_entities", {}).values() or []):
-            if not _search_public_entity(entity):
-                continue
-            try:
-                if marked is not None and int(_search_peer_marked_id(entity)) == marked:
-                    return entity
-            except Exception:
-                continue
-
-        # This is the message's response-bound chat object, not a dialog lookup.
-        for candidate in (
-            getattr(message, "_chat", None),
-            getattr(message, "chat", None),
-        ):
-            if candidate is not None and _search_public_entity(candidate):
-                return candidate
-
-        return None
-
-    async def _collect_global(result):
-        response_entities = _response_entities(result)
-
-        for message in list(getattr(result, "messages", []) or []):
-            entity = _entity_for_global_message(message, response_entities)
-
-            # Do NOT call get_entity(), iter_dialogs(), or consult a local
-            # chat_map here. If Telegram did not return a public peer object,
-            # we cannot safely manufacture a public message link.
-            if entity is None:
-                continue
-
-            item = _search_result_from_message(
-                entity,
-                message,
-                query,
-                len(results) + 1,
-            )
-            if not item or not item.get("link"):
-                continue
-
-            key = (
-                int(item["peer_id"]),
-                int(getattr(message, "id", 0) or 0),
-            )
-            if key in seen:
-                continue
-
+        if item:
+            item["_dedupe_key"] = key
             seen.add(key)
             results.append(item)
 
-    # Telegram's global index has separate public broadcast-channel and
-    # group/megagroup modes. Query both concurrently.
-    channel_result, group_result = await asyncio.gather(
-        _global_public_request(broadcasts_only=True),
-        _global_public_request(groups_only=True),
-        return_exceptions=True,
-    )
+    # =========================================================
+    # STEP 1 — GLOBAL DIRECTORY DISCOVERY
+    # =========================================================
+    discovered = await _search_discover_public_peers(query)
 
-    for label, result in (
-        ("channels", channel_result),
-        ("groups", group_result),
-    ):
-        if isinstance(result, Exception):
-            print(
-                f"[SearchV2] global {label} search failed: "
-                f"{type(result).__name__}: {result}"
-            )
-            continue
-        await _collect_global(result)
+    # =========================================================
+    # STEP 2 — CONCURRENT DIRECT SEARCH
+    # =========================================================
+    if discovered:
+        semaphore = asyncio.Semaphore(
+            SEARCH_CONCURRENCY
+        )
 
-    # Global message search is the primary source. Public peer discovery is
-    # only a supplement for queries that identify a public chat by username or
-    # title but happen to have no indexed message in the response.
-    peers = {}
-    if query.startswith("@") or len(results) < SEARCH_PAGE_SIZE:
-        peers = await _search_discover_public_peers(query)
-
-    if peers and len(results) < SEARCH_MAX_RESULTS:
-        semaphore = asyncio.Semaphore(SEARCH_CONCURRENCY)
-        fallback_peers = list(peers.values())[:SEARCH_DIRECT_PEER_LIMIT]
+        peers = list(
+            discovered.values()
+        )[:SEARCH_PUBLIC_PEER_LIMIT]
 
         tasks = [
             asyncio.create_task(
-                _search_public_peer(entity, query, semaphore)
+                _search_public_peer(
+                    entity,
+                    query,
+                    semaphore,
+                )
             )
-            for entity in fallback_peers
+            for entity in peers
         ]
 
         try:
-            deadline = time.monotonic() + max(1.5, SEARCH_TIMEOUT / 2)
-            pending = set(tasks)
+            direct_results = await asyncio.gather(
+                *tasks,
+                return_exceptions=True,
+            )
 
-            while (
-                pending
-                and time.monotonic() < deadline
-                and len(results) < SEARCH_MAX_RESULTS
-            ):
-                remaining = max(0.1, deadline - time.monotonic())
-                done, pending = await asyncio.wait(
-                    pending,
-                    timeout=remaining,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
+            rank = 0
 
-                for task in done:
-                    entity, messages, error = await task
-                    if error:
-                        continue
+            for response in direct_results:
+                if isinstance(response, Exception):
+                    print(
+                        f"[SearchV3] direct task failed: "
+                        f"{type(response).__name__}: {response}"
+                    )
+                    continue
 
-                    for message in messages:
-                        item = _search_result_from_message(
-                            entity,
-                            message,
-                            query,
-                            len(results) + 1,
-                        )
-                        if not item or not item.get("link"):
-                            continue
+                entity, messages, error = response
 
-                        key = (
-                            int(item["peer_id"]),
-                            int(getattr(message, "id", 0) or 0),
-                        )
-                        if key in seen:
-                            continue
+                if error:
+                    print(
+                        f"[SearchV3] direct peer search failed: "
+                        f"{type(error).__name__}: {error}"
+                    )
+                    continue
 
-                        seen.add(key)
-                        results.append(item)
+                for message in messages:
+                    rank += 1
+                    add_message_result(
+                        entity,
+                        message,
+                        rank,
+                    )
 
-                        if len(results) >= SEARCH_MAX_RESULTS:
-                            break
         finally:
             for task in tasks:
                 if not task.done():
                     task.cancel()
+
             if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.gather(
+                    *tasks,
+                    return_exceptions=True,
+                )
 
-    # Add public peer-only results when the query matches the public title or
-    # username. These are deliberately separate from message results.
-    _, tokens = _search_terms(query)
+    # =========================================================
+    # STEP 3 — TELEGRAM GLOBAL MESSAGE INDEX
+    # =========================================================
+    async def _global_search(
+        *,
+        broadcasts_only=False,
+        groups_only=False,
+    ):
+        try:
+            request = functions.messages.SearchGlobalRequest(
+                q=query,
+                filter=types.InputMessagesFilterEmpty(),
+                min_date=0,
+                max_date=0,
+                offset_rate=0,
+                offset_peer=types.InputPeerEmpty(),
+                offset_id=0,
+                limit=SEARCH_GLOBAL_MESSAGE_LIMIT,
+                broadcasts_only=broadcasts_only,
+                groups_only=groups_only,
+            )
 
-    for entity in peers.values():
-        if len(results) >= SEARCH_MAX_RESULTS:
-            break
+            return await asyncio.wait_for(
+                telethon_client(request),
+                timeout=SEARCH_TIMEOUT,
+            )
 
-        marked = _search_peer_marked_id(entity)
-        if marked is None:
-            continue
+        except Exception as exc:
+            print(
+                f"[SearchV3] global search failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return None
 
-        name = _search_peer_name(entity)
-        username = (
-            getattr(entity, "username", None) or ""
-        ).lower().lstrip("@")
-        haystack = f"{name.lower()} {username}"
+    channel_result, group_result = await asyncio.gather(
+        _global_search(broadcasts_only=True),
+        _global_search(groups_only=True),
+        return_exceptions=True,
+    )
 
-        if not (
-            query.lower() in haystack
-            or any(token in haystack for token in tokens)
+    def _response_entities(result):
+        entities = {}
+
+        if result is None or isinstance(result, Exception):
+            return entities
+
+        for entity in list(
+            getattr(result, "chats", []) or []
         ):
+            if not _search_public_entity(entity):
+                continue
+
+            peer_id = _search_peer_marked_id(entity)
+
+            if peer_id is not None:
+                entities[int(peer_id)] = entity
+
+        return entities
+
+    def _resolve_global_entity(message, entity_map):
+        peer = getattr(
+            message,
+            "peer_id",
+            None,
+        )
+
+        try:
+            marked = (
+                int(get_peer_id(peer))
+                if peer is not None
+                else None
+            )
+        except Exception:
+            marked = None
+
+        if marked is not None:
+            entity = entity_map.get(marked)
+
+            if (
+                entity is not None
+                and _search_public_entity(entity)
+            ):
+                return entity
+
+        try:
+            message_entities = (
+                getattr(
+                    message,
+                    "_entities",
+                    {},
+                )
+                or {}
+            )
+
+            for entity in message_entities.values():
+                if not _search_public_entity(entity):
+                    continue
+
+                entity_id = _search_peer_marked_id(
+                    entity
+                )
+
+                if (
+                    marked is not None
+                    and entity_id == marked
+                ):
+                    return entity
+
+        except Exception:
+            pass
+
+        for candidate in (
+            getattr(message, "_chat", None),
+            getattr(message, "chat", None),
+        ):
+            if (
+                candidate is not None
+                and _search_public_entity(candidate)
+            ):
+                return candidate
+
+        return None
+
+    global_rank = 0
+
+    for result in (
+        channel_result,
+        group_result,
+    ):
+        if result is None or isinstance(result, Exception):
             continue
 
-        if any(item.get("peer_id") == marked for item in results):
-            continue
+        entity_map = _response_entities(result)
 
-        kind = _search_peer_kind(entity)
+        for message in list(
+            getattr(result, "messages", []) or []
+        ):
+            entity = _resolve_global_entity(
+                message,
+                entity_map,
+            )
 
-        results.append({
-            "kind": "peer",
-            "type": kind,
-            "peer_type": kind,
-            "peer_id": marked,
-            "entity": entity,
-            "message": None,
-            "link": _search_peer_link(entity),
-            "content": "",
-            "title": name,
-            "username": getattr(entity, "username", None),
-            "member_count": _search_member_count(entity),
-            "date": None,
-            "score": _search_relevance_score(query, entity, None),
-            "server_rank": len(results),
-        })
+            if entity is None:
+                continue
 
-    def sort_key(item):
-        result_date = item.get("date")
+            global_rank += 1
+
+            add_message_result(
+                entity,
+                message,
+                global_rank,
+            )
+
+    # =========================================================
+    # STEP 4 — DEDUPLICATE + RANK
+    # =========================================================
+    def _sort_key(item):
+        date_value = item.get("date")
+
         try:
             date_score = (
-                result_date.timestamp()
-                if result_date
+                date_value.timestamp()
+                if date_value
                 else 0.0
             )
         except Exception:
             date_score = 0.0
 
         return (
-            float(item.get("score", 0)),
+            float(
+                item.get("score", 0)
+                or 0
+            ),
             date_score,
-            -int(item.get("server_rank", 0)),
+            -int(
+                item.get("server_rank", 0)
+                or 0
+            ),
         )
 
-    results.sort(key=sort_key, reverse=True)
+    results.sort(
+        key=_sort_key,
+        reverse=True,
+    )
+
     results = results[:SEARCH_MAX_RESULTS]
 
     elapsed = time.monotonic() - started
@@ -5630,11 +5691,15 @@ async def _search_public_index(query):
         )
 
         if len(_SEARCH_CACHE) > 128:
-            oldest = min(
+            oldest_key = min(
                 _SEARCH_CACHE.items(),
                 key=lambda pair: pair[1][0],
             )[0]
-            _SEARCH_CACHE.pop(oldest, None)
+
+            _SEARCH_CACHE.pop(
+                oldest_key,
+                None,
+            )
 
     return results, elapsed, False
 
@@ -5841,100 +5906,149 @@ def _search_filter_buttons(results, active, query, page=1, total_pages=1):
 
 
 async def display_search_page(update, context, page, filter_type=None):
-    callback = update.callback_query
-    if callback:
-        await callback.answer()
+    """
+    Compact public-search renderer.
 
-    results = context.user_data.get("search_results", [])
+    Result format:
+        [emoji] [hyperlinked message text]
+
+    Maximum visible width:
+        55 characters per result line.
+    """
+    callback = update.callback_query
+
+    if callback:
+        try:
+            await callback.answer()
+        except Exception:
+            pass
+
+    results = context.user_data.get(
+        "search_results",
+        [],
+    )
+
     if not results:
-        target = callback.message if callback else update.message
+        target = (
+            callback.message
+            if callback
+            else update.message
+        )
+
         if target:
-            await target.reply_text("❌ Search session expired. Start a new search.")
+            await target.reply_text(
+                "❌ Search session expired. Start a new search."
+            )
         return
 
-    search_query = context.user_data.get("search_query", "")
-    active = filter_type or context.user_data.get("search_filter", "all")
+    search_query = context.user_data.get(
+        "search_query",
+        "",
+    )
+
+    active = (
+        filter_type
+        or context.user_data.get(
+            "search_filter",
+            "all",
+        )
+    )
 
     filtered = [
         item
         for item in results
-        if _search_filter_match(item, active)
+        if _search_filter_match(
+            item,
+            active,
+        )
     ]
 
     per_page = SEARCH_PAGE_SIZE
     total_results = len(filtered)
+
     total_pages = max(
         1,
-        (total_results + per_page - 1) // per_page,
+        (
+            total_results
+            + per_page
+            - 1
+        )
+        // per_page,
     )
-    page = max(1, min(int(page), total_pages))
+
+    try:
+        page = int(page)
+    except Exception:
+        page = 1
+
+    page = max(
+        1,
+        min(
+            page,
+            total_pages,
+        ),
+    )
 
     context.user_data["search_page"] = page
     context.user_data["search_filter"] = active
 
-    start = (page - 1) * per_page
-    page_items = filtered[start:start + per_page]
+    start = (
+        page - 1
+    ) * per_page
+
+    page_items = filtered[
+        start:start + per_page
+    ]
 
     lines = []
 
     for item in page_items:
-        if item.get("kind") == "message":
-            icon = _search_message_icon(item)
-            raw = (
-                getattr(item.get("message"), "message", None)
-                or item.get("content")
-                or _search_peer_name(item.get("entity"))
-                or "Message"
+        if item.get("kind") != "message":
+            continue
+
+        message = item.get("message")
+
+        raw = (
+            getattr(
+                message,
+                "message",
+                None,
             )
-            visible = _search_truncate(raw, 55)
-            link = item.get("link")
+            or item.get("content")
+            or "Message"
+        )
 
-            if link:
-                lines.append(
-                    f'{icon} <a href="{html.escape(link, quote=True)}">'
-                    f'{html.escape(visible)}</a>'
-                )
-            else:
-                lines.append(f"{icon} {html.escape(visible)}")
+        icon = _search_message_icon(item)
 
-        else:
-            icon = (
-                "👥"
-                if item.get("peer_type") == "group"
-                else "📢"
-            )
-            title = _search_truncate(
-                item.get("title")
-                or _search_peer_name(item.get("entity"))
-                or "Unknown",
-                55,
-            )
-            count = item.get("member_count")
-            if count is None:
-                count = _search_member_count(item.get("entity"))
+        # Reserve space for "emoji + space" so the complete visible
+        # result line is <= 55 characters.
+        available = max(
+            1,
+            55 - len(icon) - 1,
+        )
 
-            link = item.get("link")
-            title_html = html.escape(title)
+        visible = _search_truncate(
+            raw,
+            available,
+        )
 
-            if link:
-                title_html = (
-                    f'<a href="{html.escape(link, quote=True)}">'
-                    f'{title_html}</a>'
-                )
+        link = item.get("link")
 
-            lines.append(
-                f"{icon} {title_html}{_format_search_count(count)}"
-            )
+        if not link:
+            continue
+
+        lines.append(
+            f'{icon} '
+            f'<a href="{html.escape(link, quote=True)}">'
+            f'{html.escape(visible)}'
+            f'</a>'
+        )
 
     if not lines:
-        lines.append("No results.")
+        lines.append(
+            "❌ No matching messages."
+        )
 
-    # The footer is intentionally the only non-result text.
-    lines.append("")
-    lines.append(f"Page {page}/{total_pages}")
-    lines.append("Sort by relevance and activity")
-
-    text = "\n".join(lines)
     markup = InlineKeyboardMarkup(
         _search_filter_buttons(
             results,
@@ -5945,6 +6059,9 @@ async def display_search_page(update, context, page, filter_type=None):
         )
     )
 
+    text = "
+".join(lines)
+
     if callback:
         try:
             await callback.edit_message_text(
@@ -5954,7 +6071,10 @@ async def display_search_page(update, context, page, filter_type=None):
                 disable_web_page_preview=True,
             )
         except Exception as exc:
-            if "message is not modified" not in str(exc).lower():
+            if (
+                "message is not modified"
+                not in str(exc).lower()
+            ):
                 raise
     else:
         await update.message.reply_text(
