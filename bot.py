@@ -3643,9 +3643,9 @@ async def _send_pdf_page_as_content(target, page, page_number, prefix=""):
 async def send_pdf_filtered_pages(query_or_update, context, pages=None):
     """Return filtered PDF pages as their original content type.
 
-    'all' keeps the original PDF. Filtered pages are never wrapped back into
-    artificial PDFs: text pages become Telegram text and scanned/image pages
-    become Telegram images.
+    Every selected page is returned in its natural content form.
+    "All Pages" means every page is fetched; it does not return the source PDF.
+    Text pages become Telegram text and scanned/image pages become Telegram images.
     """
     pdf_bytes = context.user_data.get("pdf_bytes")
     if not pdf_bytes:
@@ -3660,20 +3660,10 @@ async def send_pdf_filtered_pages(query_or_update, context, pages=None):
         total = len(doc)
 
         if pages is None:
-            # All Pages means the user wants the actual PDF, untouched.
-            pdf_bytes.seek(0)
-            output = BytesIO(pdf_bytes.getvalue())
-            output.seek(0)
-            original_filename = context.user_data.get("pdf_filename") or "document.pdf"
-            output.name = original_filename
-            await status.edit_text("✅ Original PDF ready.")
-            await query_or_update.message.reply_document(
-                document=InputFile(output, filename=original_filename),
-                caption=f"📖 <b>Original PDF</b>\n📄 {total} page(s)",
-                parse_mode=ParseMode.HTML,
-            )
-            doc.close()
-            return
+            # "All Pages" means fetch every page as its actual content type.
+            # Do not return the source PDF: text pages become text messages and
+            # scanned/image pages become images, exactly like filtered pages.
+            pages = list(range(total))
 
         pages = sorted(set(int(p) for p in pages if 0 <= int(p) < total))
         if not pages:
