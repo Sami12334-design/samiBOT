@@ -26,7 +26,7 @@ from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageChops
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InlineQueryResultArticle, InputTextMessageContent
 from telegram.constants import ParseMode
 from telegram.error import Conflict
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes, InlineQueryHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes, InlineQueryHandler, TypeHandler, ApplicationHandlerStop
 from telethon import TelegramClient, events, functions, types
 from telethon.sessions import StringSession
 from telethon.utils import get_peer_id
@@ -94,6 +94,95 @@ def self_ping():
 
 def is_admin(user_id):
     return user_id in ADMIN_IDS
+
+# --- FORCE JOIN CHANNELS ---
+# Configure in Render:
+# FORCE_JOIN_CHANNELS=@channel_one;@channel_two
+# FORCE_JOIN_CHANNEL_LINKS=https://t.me/channel_one;https://t.me/channel_two
+# Public channel usernames can be inferred from links. Private invite links alone are
+# not enough to verify membership; include their numeric channel IDs in FORCE_JOIN_CHANNELS.
+def _split_env_list(value):
+    return [item.strip() for item in re.split(r"[;,\\n]+", value or "") if item.strip()]
+
+FORCE_JOIN_CHANNELS = _split_env_list(
+    os.environ.get("FORCE_JOIN_CHANNELS", "") or os.environ.get("FORCE_JOIN_CHANNEL", "")
+)
+FORCE_JOIN_CHANNEL_LINKS = _split_env_list(os.environ.get("FORCE_JOIN_CHANNEL_LINKS", ""))
+
+def _channel_username_from_link(link):
+    match = re.match(r"^https?://(?:www\\.)?t\\.me/([A-Za-z0-9_]{5,})/?$", link.strip(), re.I)
+    return "@" + match.group(1) if match else None
+
+if not FORCE_JOIN_CHANNELS:
+    FORCE_JOIN_CHANNELS = [
+        username for username in (_channel_username_from_link(link) for link in FORCE_JOIN_CHANNEL_LINKS)
+        if username
+    ]
+
+def _force_join_keyboard():
+    rows = [
+        [InlineKeyboardButton(f"📢 Join Channel {i + 1}", url=link)]
+        for i, link in enumerate(FORCE_JOIN_CHANNEL_LINKS)
+    ]
+    rows.append([InlineKeyboardButton("✅ I've Joined — Verify", callback_data="force_join_verify")])
+    return InlineKeyboardMarkup(rows)
+
+async def _force_join_missing(bot, user_id):
+    missing = []
+    for channel in FORCE_JOIN_CHANNELS:
+        try:
+            member = await bot.get_chat_member(chat_id=channel, user_id=user_id)
+            if str(member.status).lower() not in ("member", "administrator", "creator", "owner"):
+                missing.append(channel)
+        except Exception as exc:
+            # Fail closed when a configured channel cannot be verified.
+            print(f"Force-join membership check failed for {channel}: {exc}")
+            missing.append(channel)
+    return missing
+
+async def force_join_guard(update, context):
+    if not FORCE_JOIN_CHANNELS:
+        return
+    user = update.effective_user
+    chat = update.effective_chat
+    # Apply to private bot usage, not messages in groups/channels.
+    if not user or (chat and chat.type != "private"):
+        return
+    if not chat:
+        return
+    query = update.callback_query
+    if query and query.data == "force_join_verify":
+        missing = await _force_join_missing(context.bot, user.id)
+        if missing:
+            try:
+                await query.answer("You still need to join every required channel.", show_alert=True)
+            except Exception:
+                pass
+            try:
+                await query.message.reply_text(
+                    "🔒 Please join all required channels, then tap Verify again.",
+                    reply_markup=_force_join_keyboard()
+                )
+            except Exception:
+                pass
+        else:
+            await query.answer("Membership verified!")
+            await query.message.reply_text("✅ Membership verified! Now send /start to open SamiBOT.")
+        raise ApplicationHandlerStop
+    missing = await _force_join_missing(context.bot, user.id)
+    if missing:
+        msg = update.effective_message
+        if msg:
+            await msg.reply_text(
+                "🔒 *Join Required Channels First*\n\n"
+                "To use SamiBOT, please join every channel below, then tap "
+                "“✅ I've Joined — Verify”.",
+                parse_mode="Markdown",
+                reply_markup=_force_join_keyboard()
+            )
+        elif query:
+            await query.answer("Join the required channels before using SamiBOT.", show_alert=True)
+        raise ApplicationHandlerStop
 
 def init_db():
     conn = sqlite3.connect('bot_data.db')
@@ -8110,7 +8199,7 @@ async def main():
     bot_app = Application.builder().token(BOT_TOKEN).build()
     global PTB_BOT
     PTB_BOT = bot_app.bot
-    bot_app.add_handler(CommandHandler("start", start))
+    bot_app.add_handler(TypeHandler(Update, force_join_guard), group=-100)\n    bot_app.add_handler(CommandHandler("start", start))
     for shortcut in ("lastseen", "ls", "seen", "online", "status", "last"):
         bot_app.add_handler(CommandHandler(shortcut, last_seen_shortcut))
     bot_app.add_handler(CommandHandler("safety", safety_command))
