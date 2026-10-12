@@ -3013,6 +3013,15 @@ def ytdlp_base_options():
                 options["js_runtimes"] = {runtime_name: {"path": runtime_path}}
                 break
 
+    # Optional remote BgUtils PO-token provider. Set YTDLP_POT_PROVIDER_URL
+    # to the private URL of the bgutil provider service (port 4416).
+    # The provider plugin is installed from requirements.txt.
+    pot_provider_url = os.getenv("YTDLP_POT_PROVIDER_URL", "").strip().rstrip("/")
+    if pot_provider_url:
+        options.setdefault("extractor_args", {}).setdefault(
+            "youtubepot-bgutilhttp", {}
+        )["base_url"] = [pot_provider_url]
+
     # IMPORTANT: Do not force a hard-coded YouTube player client here.
     # Current yt-dlp has its own adaptive client strategy (currently starting
     # with visionos/web) and may add fallbacks based on the video's state.
@@ -3044,7 +3053,7 @@ def extract_ytdlp_info(url: str):
     for client in clients:
         opts = ytdlp_base_options()
         if client != "default":
-            opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+            opts.setdefault("extractor_args", {}).setdefault("youtube", {})["player_client"] = [client]
         # YouTube's TV clients do not support account cookies reliably; passing
         # logged-in cookies can trigger DRM or playability failures. Keep cookies
         # for normal web clients, but omit them for TV fallback clients.
