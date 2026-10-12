@@ -3038,7 +3038,7 @@ def extract_ytdlp_info(url: str):
     # Only if that native strategy fails do we try a small set of known
     # no-PO-token / fallback clients. android_vr is intentionally NOT forced:
     # current yt-dlp marks its GVS formats as PO-token-sensitive.
-    clients = ["default", "tv", "web_embedded", "tv_simply"]
+    clients = ["default", "tv", "web_safari", "web_embedded", "tv_simply"]
     errors = []
 
     for client in clients:
@@ -3075,7 +3075,7 @@ def ytdlp_download(url: str, output_dir: str, *, height=None, audio=False, title
     # Native/default strategy first. The old implementation started with
     # android_vr/web_embedded/web_safari, which is exactly the pattern that is
     # now failing on the user's Render deployment.
-    clients = ["default", "tv", "web_embedded", "tv_simply"] if platform == "youtube" else [None]
+    clients = ["default", "tv", "web_safari", "web_embedded", "tv_simply"] if platform == "youtube" else [None]
     errors = []
     for client in clients:
         try:
