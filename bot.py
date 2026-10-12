@@ -23,7 +23,7 @@ import cv2
 from datetime import datetime, timedelta, timezone
 from flask import Flask
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageChops
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InlineQueryResultArticle, InputTextMessageContent
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InlineQueryResultArticle, InputTextMessageContent, BotCommand
 from telegram.constants import ParseMode
 from telegram.error import Conflict
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes, InlineQueryHandler, TypeHandler, ApplicationHandlerStop
@@ -685,6 +685,28 @@ async def start(update, context):
             [InlineKeyboardButton("➕ More Commands", callback_data="more")]
         ]
     await update.message.reply_text("🤖 TELEGRAM ASSISTANT\n\nChoose an option:", reply_markup=InlineKeyboardMarkup(keyboard))
+def make_feature_command(callback_data, button_text):
+    """Create a simple slash-command shortcut that opens an existing feature."""
+    async def feature_command(update, context):
+        if not update.message or not update.effective_user:
+            return
+        user_id = update.effective_user.id
+        if not is_authenticated(user_id):
+            context.user_data['state'] = 'awaiting_password'
+            await update.message.reply_text(
+                "🔐 TELEGRAM ASSISTANT\n\nPassword required.\nPlease enter the password to continue."
+            )
+            return
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(button_text, callback_data=callback_data)
+        ]])
+        await update.message.reply_text(
+            f"{button_text}\n\nTap the button below to open the tool.",
+            reply_markup=keyboard
+        )
+    return feature_command
+
+
 async def logout(update, context):
     user_id = update.effective_user.id
     remove_authenticated_user(user_id)
@@ -8293,6 +8315,12 @@ async def main():
     PTB_BOT = bot_app.bot
     bot_app.add_handler(TypeHandler(Update, force_join_guard), group=-100)
     bot_app.add_handler(CommandHandler("start", start))
+    # Easy user-facing shortcuts. Keep this order synced with the Telegram command menu.
+    bot_app.add_handler(CommandHandler("video", make_feature_command("video_downloader", "🎬 Video Downloader")))
+    bot_app.add_handler(CommandHandler("pdffetch", make_feature_command("pdf_fetch", "📄 PDF Fetch")))
+    bot_app.add_handler(CommandHandler("imagetotext", make_feature_command("image_to_text", "🖼️ Image to Text")))
+    bot_app.add_handler(CommandHandler("audio", make_feature_command("audio_tools", "🎵 Audio Tool")))
+    bot_app.add_handler(CommandHandler("editphoto", make_feature_command("image_edit", "🖼️ Edit Photo")))
     for shortcut in ("lastseen", "ls", "seen", "online", "status", "last"):
         bot_app.add_handler(CommandHandler(shortcut, last_seen_shortcut))
     bot_app.add_handler(CommandHandler("safety", safety_command))
@@ -8316,6 +8344,17 @@ async def main():
     bot_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND & ~filters.PHOTO, handle_link))
     print("Bot running with upgraded multi-source video downloader...")
     await bot_app.initialize()
+    try:
+        await bot_app.bot.set_my_commands([
+            BotCommand("start", "Open the main menu"),
+            BotCommand("video", "Download a video"),
+            BotCommand("pdffetch", "Fetch or filter a PDF"),
+            BotCommand("imagetotext", "Extract text from an image"),
+            BotCommand("audio", "Open audio tools"),
+            BotCommand("editphoto", "Edit a photo"),
+        ])
+    except Exception as exc:
+        print(f"Command menu setup warning: {exc}")
     # SamiBOT uses long polling. Remove any stale webhook before getUpdates.
     # Telegram does not allow webhook delivery and getUpdates polling at the same time.
     try:
