@@ -2906,6 +2906,62 @@ def youtube_video_id(url: str):
     return None
 
 
+def _resolve_ytdlp_cookie_file():
+    """Resolve YouTube cookies from a mounted file or Render environment secret.
+
+    Supported variables:
+      - YTDLP_COOKIES_FILE: path to a Netscape-format cookies.txt file
+      - YTDLP_COOKIES_BASE64: base64-encoded contents of cookies.txt
+      - YTDLP_COOKIES_CONTENT: raw Netscape-format contents of cookies.txt
+    Cookie contents are secrets: never print them to logs.
+    """
+    cookie_path = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
+    if cookie_path and os.path.isfile(cookie_path) and os.path.getsize(cookie_path) > 0:
+        return cookie_path
+
+    encoded = os.environ.get("YTDLP_COOKIES_BASE64", "").strip()
+    raw = os.environ.get("YTDLP_COOKIES_CONTENT", "")
+    if encoded:
+        try:
+            raw = base64.b64decode(encoded, validate=True).decode("utf-8-sig")
+        except Exception:
+            # A malformed secret should not crash all video downloads.
+            raw = ""
+
+    if not raw.strip():
+        return None
+
+    # Avoid rewriting the temporary file for every extractor/client attempt.
+    cached_path = globals().get("_YTDLP_ENV_COOKIE_PATH")
+    if cached_path and os.path.isfile(cached_path) and os.path.getsize(cached_path) > 0:
+        return cached_path
+
+    # yt-dlp expects Netscape cookie-jar format, not a browser-export JSON file.
+    if "Netscape HTTP Cookie File" not in raw and "#HttpOnly_" not in raw:
+        return None
+
+    try:
+        fd, path = tempfile.mkstemp(prefix="ytdlp_cookies_", suffix=".txt")
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\\n") as handle:
+                handle.write(raw)
+        except Exception:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+            return None
+        globals()["_YTDLP_ENV_COOKIE_PATH"] = path
+        return path
+    except Exception:
+        return None
+
+
 def ytdlp_base_options():
     options = {
         "quiet": True,
@@ -2959,8 +3015,8 @@ def ytdlp_base_options():
     # only after yt-dlp's native default strategy has had a chance.
     options["extractor_retries"] = 1
 
-    cookies = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
-    if cookies and os.path.isfile(cookies):
+    cookies = _resolve_ytdlp_cookie_file()
+    if cookies:
         options["cookiefile"] = cookies
     # Do NOT set `impersonate='chrome'` blindly. That was the source of the
     # user's "Impersonate target chrome is not available" error.
