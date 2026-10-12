@@ -2944,7 +2944,7 @@ def _resolve_ytdlp_cookie_file():
         fd, path = tempfile.mkstemp(prefix="ytdlp_cookies_", suffix=".txt")
         try:
             os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8", newline="\\n") as handle:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(raw)
         except Exception:
             try:
