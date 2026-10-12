@@ -8134,6 +8134,10 @@ async def handle_link(update, context):
     if state == "ai_content_check":
         await handle_ai_content_check(update, context)
         return
+    if state == "fetch_link":
+        # The Fetch Telegram menu asks for a link; let it reach the link parser below.
+        context.user_data["state"] = None
+        state = None
     if state:
         context.user_data['state'] = None
         if state == 'profile_query': await fetch_profile(update, context, text)
