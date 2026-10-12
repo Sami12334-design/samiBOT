@@ -512,7 +512,7 @@ def parse_tg_link(text):
     raw = str(text or "").strip()
     # Accept a bare t.me link, a normal URL, or a Markdown link pasted from chat.
     match = re.search(
-        r"(?:https?://)?(?:www\\.)?t\\.me/([A-Za-z0-9_]+)/(?:(\\d+)(?:-(\\d+)|/(\\d+))?)?",
+        r"(?:https?://)?(?:www\.)?t\.me/([A-Za-z0-9_]+)/(?:(\d+)(?:-(\d+)|/(\d+))?)?",
         raw,
         re.I,
     )
@@ -531,7 +531,7 @@ def parse_tg_link(text):
 def is_tg_message_range(text):
     """Return True only for a /<first>-<last> message range URL."""
     return bool(re.search(
-        r"(?:https?://)?(?:www\\.)?t\\.me/[A-Za-z0-9_]+/(\\d+)-(\\d+)(?:\\b|$)",
+        r"(?:https?://)?(?:www\.)?t\.me/[A-Za-z0-9_]+/(\d+)-(\d+)(?:\b|$)",
         str(text or ""),
         re.I,
     ))
@@ -8144,7 +8144,7 @@ async def handle_link(update, context):
         elif state == 'names': await fetch_names(update, context, text)
         return
 
-    if "t.me/" in text or re.search(r"(?:https?://)?(?:www\\.)?t\\.me/", text, re.I):
+    if "t.me/" in text or re.search(r"(?:https?://)?(?:www\.)?t\.me/", text, re.I):
         username, msg_id, comment_id = parse_tg_link(text)
         if not username:
             await update.message.reply_text(
