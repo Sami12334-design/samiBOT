@@ -3045,6 +3045,11 @@ def extract_ytdlp_info(url: str):
         opts = ytdlp_base_options()
         if client != "default":
             opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+        # YouTube's TV clients do not support account cookies reliably; passing
+        # logged-in cookies can trigger DRM or playability failures. Keep cookies
+        # for normal web clients, but omit them for TV fallback clients.
+        if client in {"tv", "tv_simply"}:
+            opts.pop("cookiefile", None)
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -3082,6 +3087,9 @@ def ytdlp_download(url: str, output_dir: str, *, height=None, audio=False, title
             opts = ytdlp_base_options()
             if client and client != "default":
                 opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+            # TV clients are not compatible with account cookies in many cases.
+            if client in {"tv", "tv_simply"}:
+                opts.pop("cookiefile", None)
             opts.update({
                 "format": build_ytdlp_format(height, audio, platform),
                 "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
@@ -3610,12 +3618,17 @@ async def handle_video_download(update, context):
         if "Sign in to confirm" in msg or "LOGIN_REQUIRED" in msg:
             cookie_path = _resolve_ytdlp_cookie_file()
             if cookie_path:
+                # Preserve the actual extractor/fallback error. A detected cookie
+                # file is not proof that the session is valid, and a generic
+                # message hides whether this is a login wall, PO-token issue, or
+                # an unavailable fallback service.
                 msg = (
-                    "YouTube rejected the request even though SamiBOT detected a cookies file. "
-                    "The cookie session may be expired/rotated, or YouTube may be requiring "
-                    "a Proof-of-Origin (PO) token for this video. Export a fresh Netscape-format "
-                    "cookies.txt, redeploy, then check the Render logs for the underlying yt-dlp error. "
-                    "Do not share the cookie file."
+                    "YouTube rejected the request. SamiBOT found a cookie file, "
+                    "but that does not confirm the session is valid. The underlying "
+                    "extractor/fallback error was: " + msg[:650] +
+                    "\n\nTV fallback clients now retry without account cookies. "
+                    "If this persists, check Render logs for the exact yt-dlp error. "
+                    "Never share your cookie file."
                 )
             else:
                 msg = (
@@ -3623,7 +3636,7 @@ async def handle_video_download(update, context):
                     "YTDLP_COOKIES_BASE64 / YTDLP_COOKIES_CONTENT / YTDLP_COOKIES_FILE. "
                     "Check that the Render variable name is exact, the Base64 value is one line, "
                     "and the decoded file begins with '# Netscape HTTP Cookie File' or "
-                    "'# HTTP Cookie File'. Then save and redeploy."
+                    "'# HTTP Cookie File'. Original error: " + msg[:400]
                 )
         await status_msg.edit_text(f"❌ Could not prepare download.\n\n{msg[:900]}")
 
