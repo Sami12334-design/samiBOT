@@ -508,23 +508,33 @@ def stats_counts():
     conn.close()
     return out
 def parse_tg_link(text):
-    comment_pattern = r'https?://t\.me/([a-zA-Z0-9_]+)/(\d+)/(\d+)'
-    match = re.search(comment_pattern, text)
-    if match:
-        return match.group(1), int(match.group(2)), int(match.group(3))
-    range_pattern = r'https?://t\.me/([a-zA-Z0-9_]+)/(\d+)-(\d+)'
-    match = re.search(range_pattern, text)
-    if match:
-        return match.group(1), int(match.group(2)), int(match.group(3))
-    single_pattern = r'https?://t\.me/([a-zA-Z0-9_]+)/(\d+)'
-    match = re.search(single_pattern, text)
-    if match:
-        return match.group(1), int(match.group(2)), None
-    channel_pattern = r'https?://t\.me/([a-zA-Z0-9_]+)'
-    match = re.search(channel_pattern, text)
-    if match:
-        return match.group(1), None, None
-    return None, None, None
+    """Parse public Telegram channel/group links, including one message or an inclusive range."""
+    raw = str(text or "").strip()
+    # Accept a bare t.me link, a normal URL, or a Markdown link pasted from chat.
+    match = re.search(
+        r"(?:https?://)?(?:www\\.)?t\\.me/([A-Za-z0-9_]+)/(?:(\\d+)(?:-(\\d+)|/(\\d+))?)?",
+        raw,
+        re.I,
+    )
+    if not match:
+        return None, None, None
+    username = match.group(1)
+    first = int(match.group(2)) if match.group(2) else None
+    range_end = int(match.group(3)) if match.group(3) else None
+    comment_id = int(match.group(4)) if match.group(4) else None
+    if range_end is not None:
+        return username, first, range_end
+    if comment_id is not None:
+        return username, first, comment_id
+    return username, first, None
+
+def is_tg_message_range(text):
+    """Return True only for a /<first>-<last> message range URL."""
+    return bool(re.search(
+        r"(?:https?://)?(?:www\\.)?t\\.me/[A-Za-z0-9_]+/(\\d+)-(\\d+)(?:\\b|$)",
+        str(text or ""),
+        re.I,
+    ))
 
 def get_media_type(event):
     if event.photo: return "📷"
@@ -8134,54 +8144,132 @@ async def handle_link(update, context):
         elif state == 'names': await fetch_names(update, context, text)
         return
 
-    if "t.me" in text:
+    if "t.me/" in text or re.search(r"(?:https?://)?(?:www\\.)?t\\.me/", text, re.I):
         username, msg_id, comment_id = parse_tg_link(text)
         if not username:
-            await update.message.reply_text("Invalid link format."); return
+            await update.message.reply_text(
+                "❌ Invalid Telegram link. Send a public channel/group link, a message link like "
+                "https://t.me/channel/109, or a range like https://t.me/channel/109-113."
+            )
+            return
         try:
             entity = await telethon_client.get_entity(username)
-            if msg_id and comment_id and "-" in text:
-                # Range fetch (e.g., t.me/channel/7-11)
-                status_msg = await update.message.reply_text(f"⏳ Fetching {msg_id} to {comment_id}...")
-                messages = await telethon_client.get_messages(entity, min_id=msg_id, max_id=comment_id + 1)
-                if not messages:
-                    await status_msg.edit_text("❌ No messages in that range."); return
-                for idx, msg in enumerate(messages, 1):
-                    if idx % 5 == 0: await status_msg.edit_text(f"Fetching {idx}/{len(messages)}...")
-                    await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=msg.id)
-                    await asyncio.sleep(1)
-                await status_msg.edit_text(f"✅ Range complete! Fetched {len(messages)} messages."); return
-            elif msg_id and comment_id:
-                # Comment fetch (e.g., t.me/channel/123/456)
-                status_msg = await update.message.reply_text(f"⏳ Fetching comment {comment_id}...")
+            if msg_id is not None and comment_id is not None and is_tg_message_range(text):
+                first_id, last_id = msg_id, comment_id
+                if first_id < 1 or last_id < 1:
+                    await update.message.reply_text("❌ Message IDs must be positive numbers.")
+                    return
+                if last_id < first_id:
+                    await update.message.reply_text(
+                        f"❌ Invalid range: the end ID ({last_id}) is smaller than the start ID ({first_id}). "
+                        f"Use {last_id}-{first_id} if that is the range you intended."
+                    )
+                    return
+                count = last_id - first_id + 1
+                if count > 100:
+                    await update.message.reply_text(
+                        f"❌ This range contains {count} message IDs. Please send a range of 100 IDs or fewer "
+                        "so each requested message can be checked and fetched reliably."
+                    )
+                    return
+                status_msg = await update.message.reply_text(
+                    f"⏳ Fetching the exact message range {first_id}-{last_id} from {username}…"
+                )
+                fetched = 0
+                missing = []
+                failed = []
+                for current_id in range(first_id, last_id + 1):
+                    try:
+                        msg = await telethon_client.get_messages(entity, ids=current_id)
+                        if not msg:
+                            missing.append(current_id)
+                            continue
+                        await safe_send(
+                            update.effective_chat.id, context.bot, msg,
+                            from_chat_id=entity.id, message_id=current_id
+                        )
+                        fetched += 1
+                    except Exception as exc:
+                        failed.append((current_id, str(exc)[:120]))
+                    if (current_id - first_id + 1) % 5 == 0:
+                        await status_msg.edit_text(
+                            f"⏳ Checking requested IDs {current_id - first_id + 1}/{count}… "
+                            f"Fetched {fetched}"
+                        )
+                    await asyncio.sleep(0.25)
+                summary = f"✅ Range processed: {first_id}-{last_id}. Fetched {fetched}/{count} requested messages."
+                if missing:
+                    summary += "\n\n⚠️ Not found/deleted: " + ", ".join(map(str, missing[:30]))
+                    if len(missing) > 30:
+                        summary += f" and {len(missing) - 30} more"
+                if failed:
+                    summary += "\n\n❌ Failed IDs: " + ", ".join(str(item[0]) for item in failed[:20])
+                    if len(failed) > 20:
+                        summary += f" and {len(failed) - 20} more"
+                    summary += "\nSome failures may be due to unavailable media, restricted content, or Telegram access limits."
+                await status_msg.edit_text(summary)
+                return
+            elif msg_id is not None and comment_id is not None:
+                # Preserve support for t.me/channel/post_id/comment_id links.
+                status_msg = await update.message.reply_text(f"⏳ Fetching linked message {comment_id}…")
                 try:
                     msg = await telethon_client.get_messages(entity, ids=comment_id)
                     if msg:
-                        await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=comment_id)
-                        await status_msg.edit_text("✅ Comment fetched!")
+                        await safe_send(
+                            update.effective_chat.id, context.bot, msg,
+                            from_chat_id=entity.id, message_id=comment_id
+                        )
+                        await status_msg.edit_text("✅ Linked message fetched.")
                     else:
-                        await status_msg.edit_text("❌ Comment ID not found.")
-                except Exception as e:
-                    await status_msg.edit_text(f"❌ Could not fetch comment: {e}")
-            elif msg_id:
-                # Single message fetch (e.g., t.me/channel/123)
+                        await status_msg.edit_text(f"❌ Message ID {comment_id} was not found.")
+                except Exception as exc:
+                    await status_msg.edit_text(
+                        "❌ Could not fetch that linked message: " + html.escape(str(exc)[:700]),
+                        parse_mode=ParseMode.HTML
+                    )
+                return
+            elif msg_id is not None:
+                # Fetch exactly the single ID provided by the user.
+                status_msg = await update.message.reply_text(f"⏳ Fetching message {msg_id} from {username}…")
                 msg = await telethon_client.get_messages(entity, ids=msg_id)
                 if not msg:
-                    await update.message.reply_text("❌ Message not found."); return
-                await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=msg_id)
+                    await status_msg.edit_text(
+                        f"❌ Message ID {msg_id} was not found in {username}. It may be deleted, "
+                        "inaccessible, or the link may be incorrect."
+                    )
+                    return
+                await safe_send(
+                    update.effective_chat.id, context.bot, msg,
+                    from_chat_id=entity.id, message_id=msg_id
+                )
+                await status_msg.edit_text(f"✅ Fetched exactly message {msg_id}.")
+                return
             else:
-                # Batch fetch (channel link, fetch last 10 messages)
-                status_msg = await update.message.reply_text("Fetching batch (max 10)...")
+                # A channel/group link without a message ID retains the existing last-10 behavior.
+                status_msg = await update.message.reply_text("⏳ Fetching the latest 10 messages…")
                 messages = await telethon_client.get_messages(entity, limit=10)
                 if not messages:
-                    await status_msg.edit_text("No messages found."); return
-                for idx, msg in enumerate(messages, 1):
-                    if idx % 5 == 0: await status_msg.edit_text(f"Fetching {idx}/{len(messages)}...")
-                    await safe_send(update.message.chat_id, context.bot, msg, from_chat_id=entity.id, message_id=msg.id)
-                    await asyncio.sleep(1)
-                await status_msg.edit_text(f"✅ Batch complete!")
+                    await status_msg.edit_text("❌ No accessible messages were found in that channel/group.")
+                    return
+                fetched = 0
+                failed = []
+                for msg in reversed(messages):
+                    try:
+                        await safe_send(
+                            update.effective_chat.id, context.bot, msg,
+                            from_chat_id=entity.id, message_id=msg.id
+                        )
+                        fetched += 1
+                    except Exception as exc:
+                        failed.append(f"{msg.id}: {str(exc)[:100]}")
+                    await asyncio.sleep(0.25)
+                summary = f"✅ Fetched {fetched}/{len(messages)} latest messages from {username}."
+                if failed:
+                    summary += "\n⚠️ Some messages could not be copied: " + "; ".join(failed[:5])
+                await status_msg.edit_text(summary)
         except Exception as e:
             await handle_telethon_error(update, e)
+
     else:
         await update.message.reply_text("👋 Use the menu buttons, or send a Telegram link.")
 # --- MAIN EXECUTION ---
