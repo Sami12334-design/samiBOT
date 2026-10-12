@@ -2938,7 +2938,7 @@ def _resolve_ytdlp_cookie_file():
 
     # yt-dlp expects Mozilla/Netscape cookie-jar format, not browser-export JSON.
     # Exporters use several valid first-line variants, including "# HTTP Cookie File".
-    first_line = raw.lstrip("\\ufeff").splitlines()[0].strip().lower() if raw.strip() else ""
+    first_line = raw.lstrip("\ufeff").splitlines()[0].strip().lower() if raw.strip() else ""
     valid_header = first_line in {
         "# netscape http cookie file",
         "# http cookie file",
