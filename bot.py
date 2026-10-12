@@ -102,7 +102,7 @@ def is_admin(user_id):
 # Public channel usernames can be inferred from links. Private invite links alone are
 # not enough to verify membership; include their numeric channel IDs in FORCE_JOIN_CHANNELS.
 def _split_env_list(value):
-    return [item.strip() for item in re.split(r"[;,\\n]+", value or "") if item.strip()]
+    return [item.strip() for item in re.split(r"[;,\n]+", value or "") if item.strip()]
 
 FORCE_JOIN_CHANNELS = _split_env_list(
     os.environ.get("FORCE_JOIN_CHANNELS", "") or os.environ.get("FORCE_JOIN_CHANNEL", "")
@@ -110,7 +110,7 @@ FORCE_JOIN_CHANNELS = _split_env_list(
 FORCE_JOIN_CHANNEL_LINKS = _split_env_list(os.environ.get("FORCE_JOIN_CHANNEL_LINKS", ""))
 
 def _channel_username_from_link(link):
-    match = re.match(r"^https?://(?:www\\.)?t\\.me/([A-Za-z0-9_]{5,})/?$", link.strip(), re.I)
+    match = re.match(r"^https?://(?:www\.)?t\.me/([A-Za-z0-9_]{5,})/?$", link.strip(), re.I)
     return "@" + match.group(1) if match else None
 
 if not FORCE_JOIN_CHANNELS:
@@ -271,9 +271,9 @@ async def safety_command(update, context):
         terms = [row[0] for row in c.fetchall()]
         c.execute("SELECT enabled FROM safety_settings WHERE id=1")
         enabled = bool(c.fetchone()[0])
-        await msg.reply_text("🛡️ Filter: " + ("ON" if enabled else "OFF") + "\\n" + ("\\n".join("• " + html.escape(x) for x in terms) if terms else "No saved phrases."))
+        await msg.reply_text("🛡️ Filter: " + ("ON" if enabled else "OFF") + "\n" + ("\n".join("• " + html.escape(x) for x in terms) if terms else "No saved phrases."))
     else:
-        await msg.reply_text("Safety controls (admin):\\n/safety add <word or phrase>\\n/safety remove <phrase>\\n/safety list\\n/safety on\\n/safety off\\n\\nWhen enabled, a matching group message is deleted if possible and the bot leaves that group. Start with specific phrases to reduce false matches.")
+        await msg.reply_text("Safety controls (admin):\n/safety add <word or phrase>\n/safety remove <phrase>\n/safety list\n/safety on\n/safety off\n\nWhen enabled, a matching group message is deleted if possible and the bot leaves that group. Start with specific phrases to reduce false matches.")
     conn.close()
 
 async def safety_group_monitor(update, context):
@@ -1619,7 +1619,7 @@ async def menu_callback(update, context):
         if not is_admin(user_id):
             await query.answer("🔒 Admin only", show_alert=True); return
         context.user_data["state"] = "tm_group"
-        await query.message.reply_text("🕰️ MESSAGE TIME MACHINE\\n\\n1/3 Send the group or channel @username, public link, or numeric chat ID. The connected Telegram account must have access.")
+        await query.message.reply_text("🕰️ MESSAGE TIME MACHINE\n\n1/3 Send the group or channel @username, public link, or numeric chat ID. The connected Telegram account must have access.")
     elif data == "profile":
         await query.message.reply_text("👤 PROFILE\n\nEnter a Telegram username or ID to generate the Profile Card:")
         context.user_data['state'] = 'profile_query'
@@ -3422,7 +3422,7 @@ async def handle_admin_youtube_audio(update, context):
         return
 
     raw_url = (update.message.text or "").strip()
-    if not re.match(r"^https?://(www\\.)?(youtube\\.com|youtu\\.be)/", raw_url, re.I):
+    if not re.match(r"^https?://(www\.)?(youtube\.com|youtu\.be)/", raw_url, re.I):
         await update.message.reply_text("❌ Please send a valid YouTube video link.")
         return
 
@@ -3480,7 +3480,7 @@ async def handle_admin_youtube_audio(update, context):
             )
         await status_msg.edit_text("✅ YouTube audio downloaded successfully.")
     except Exception as e:
-        await status_msg.edit_text(f"❌ Audio download failed.\\n\\n{str(e)[:1000]}")
+        await status_msg.edit_text(f"❌ Audio download failed.\n\n{str(e)[:1000]}")
     finally:
         context.user_data["state"] = None
         shutil.rmtree(output_dir, ignore_errors=True)
@@ -4353,7 +4353,7 @@ async def last_seen_shortcut(update, context):
     if not args:
         context.user_data["state"] = "profile_query"
         await update.effective_message.reply_text(
-            "Send a Telegram @username or numeric ID to check its visible last-seen status.\\n"
+            "Send a Telegram @username or numeric ID to check its visible last-seen status.\n"
             "Shortcuts: /lastseen, /ls, /seen, /online, /status, /last"
         )
         return
@@ -4385,7 +4385,7 @@ async def fetch_profile(update, context, target):
                 status_text = "🟢 Online now"
                 until = getattr(status, "expires", None)
                 if until:
-                    status_text += f"\\n⏳ Online status expires: {until.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+                    status_text += f"\n⏳ Online status expires: {until.strftime('%Y-%m-%d %H:%M:%S %Z')}"
             elif isinstance(status, types.UserStatusOffline):
                 was_online = getattr(status, "was_online", None)
                 if was_online:
@@ -4398,7 +4398,7 @@ async def fetch_profile(update, context, target):
                     seconds = max(0, (now - was_online).total_seconds())
                     exact = local_seen.strftime("%Y-%m-%d %H:%M:%S %Z").strip()
                     ago = str(timedelta(seconds=int(seconds)))
-                    status_text = f"⚪ Last seen: {exact}\\n🕒 {ago} ago"
+                    status_text = f"⚪ Last seen: {exact}\n🕒 {ago} ago"
                 else:
                     status_text = "⚪ Last seen a long time ago"
             elif isinstance(status, types.UserStatusRecently):
@@ -7644,7 +7644,7 @@ async def time_machine_fetch(update, context, date_text):
             link = ""
             uname = getattr(chat, "username", None)
             if uname: link = f" https://t.me/{uname}/{item.id}"
-            matches.append(f"• {stamp} | msg {item.id}\\n{body[:1200]}{link}")
+            matches.append(f"• {stamp} | msg {item.id}\n{body[:1200]}{link}")
             if len(matches) >= 300: break
         context.user_data["state"] = None
         if not matches:
@@ -7652,7 +7652,7 @@ async def time_machine_fetch(update, context, date_text):
         await status.edit_text(f"✅ Found {len(matches)} message(s). Sending results in batches. (Scan capped at 5,000 history items / 300 matches.)")
         for offset in range(0, len(matches), 8):
             chunk = matches[offset:offset+8]
-            text = f"🕰️ Results {offset+1}–{offset+len(chunk)} of {len(matches)}\\n\\n" + "\\n\\n".join(chunk)
+            text = f"🕰️ Results {offset+1}–{offset+len(chunk)} of {len(matches)}\n\n" + "\n\n".join(chunk)
             await update.message.reply_text(text[:3900], disable_web_page_preview=True)
     except Exception as exc:
         context.user_data["state"] = None
@@ -8199,7 +8199,8 @@ async def main():
     bot_app = Application.builder().token(BOT_TOKEN).build()
     global PTB_BOT
     PTB_BOT = bot_app.bot
-    bot_app.add_handler(TypeHandler(Update, force_join_guard), group=-100)\n    bot_app.add_handler(CommandHandler("start", start))
+    bot_app.add_handler(TypeHandler(Update, force_join_guard), group=-100)
+    bot_app.add_handler(CommandHandler("start", start))
     for shortcut in ("lastseen", "ls", "seen", "online", "status", "last"):
         bot_app.add_handler(CommandHandler(shortcut, last_seen_shortcut))
     bot_app.add_handler(CommandHandler("safety", safety_command))
