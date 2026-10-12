@@ -8406,7 +8406,17 @@ async def main():
         await telethon_client.start(); print("Telethon connected!")
     except Exception as e:
         print(f"Telethon fail: {e}"); return
-    bot_app = Application.builder().token(BOT_TOKEN).build()
+    # Optional local Telegram Bot API server for large-file support.
+    # Example API URL: http://bot-api-host:8081/bot
+    # Example file URL: http://bot-api-host:8081/file/bot
+    bot_builder = Application.builder().token(BOT_TOKEN)
+    telegram_api_base = os.getenv("TELEGRAM_API_BASE_URL", "").strip().rstrip("/")
+    telegram_file_base = os.getenv("TELEGRAM_FILE_BASE_URL", "").strip().rstrip("/")
+    if telegram_api_base:
+        bot_builder = bot_builder.base_url(telegram_api_base)
+    if telegram_file_base:
+        bot_builder = bot_builder.base_file_url(telegram_file_base)
+    bot_app = bot_builder.build()
     global PTB_BOT
     PTB_BOT = bot_app.bot
     bot_app.add_handler(TypeHandler(Update, force_join_guard), group=-100)
