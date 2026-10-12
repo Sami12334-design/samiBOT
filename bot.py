@@ -2936,8 +2936,15 @@ def _resolve_ytdlp_cookie_file():
     if cached_path and os.path.isfile(cached_path) and os.path.getsize(cached_path) > 0:
         return cached_path
 
-    # yt-dlp expects Netscape cookie-jar format, not a browser-export JSON file.
-    if "Netscape HTTP Cookie File" not in raw and "#HttpOnly_" not in raw:
+    # yt-dlp expects Mozilla/Netscape cookie-jar format, not browser-export JSON.
+    # Exporters use several valid first-line variants, including "# HTTP Cookie File".
+    first_line = raw.lstrip("\\ufeff").splitlines()[0].strip().lower() if raw.strip() else ""
+    valid_header = first_line in {
+        "# netscape http cookie file",
+        "# http cookie file",
+        "# netscape cookie file",
+    }
+    if not valid_header and "#httponly_" not in raw.lower():
         return None
 
     try:
@@ -3601,12 +3608,23 @@ async def handle_video_download(update, context):
         context.user_data["state"] = None
         msg = str(e)
         if "Sign in to confirm" in msg or "LOGIN_REQUIRED" in msg:
-            msg = (
-                "YouTube is currently requiring authentication from this server. "
-                "The bot already tried its normal extractor and the public fallback. "
-                "For videos that remain protected, the supported option is to provide "
-                "a fresh cookies file through YTDLP_COOKIES_FILE."
-            )
+            cookie_path = _resolve_ytdlp_cookie_file()
+            if cookie_path:
+                msg = (
+                    "YouTube rejected the request even though SamiBOT detected a cookies file. "
+                    "The cookie session may be expired/rotated, or YouTube may be requiring "
+                    "a Proof-of-Origin (PO) token for this video. Export a fresh Netscape-format "
+                    "cookies.txt, redeploy, then check the Render logs for the underlying yt-dlp error. "
+                    "Do not share the cookie file."
+                )
+            else:
+                msg = (
+                    "SamiBOT could not load a valid Netscape-format YouTube cookie file from "
+                    "YTDLP_COOKIES_BASE64 / YTDLP_COOKIES_CONTENT / YTDLP_COOKIES_FILE. "
+                    "Check that the Render variable name is exact, the Base64 value is one line, "
+                    "and the decoded file begins with '# Netscape HTTP Cookie File' or "
+                    "'# HTTP Cookie File'. Then save and redeploy."
+                )
         await status_msg.edit_text(f"❌ Could not prepare download.\n\n{msg[:900]}")
 
 
