@@ -164,8 +164,9 @@ def register_fayda_printing(application, admin_ids: set[int] | list[int]) -> Non
         context.user_data["fayda_mode"] = "pdf" if query.data == "fayda_pdf" else "image"
         context.user_data["fayda_files"] = []
         hint = ("Send one PDF (up to 15 MB, maximum 40 pages)." if query.data == "fayda_pdf"
-                else "Send 1 or 2 screenshots as photos or image files (front/back). "
-                     "When both are sent, press Done.")
+                else "Send the FRONT side first, then the BACK side as a second photo/image file. "
+                     "The print sheet will place BACK on the LEFT and FRONT on the RIGHT. "
+                     "Send both sides, then press Done. If you only have one side, send it and press Done.")
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Done", callback_data="fayda_done"),
                                           InlineKeyboardButton("Cancel", callback_data="fayda_cancel")]])
         await query.edit_message_text(hint, reply_markup=keyboard)
