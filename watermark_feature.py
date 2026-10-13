@@ -105,10 +105,20 @@ async def watermark_callback(update: Update, context, data):
             await q.message.reply_text("❌ Session expired. Start again with /watermark.")
             return True
         wm["action"] = action
-        context.user_data["state"] = "wm_text_add" if action == "add" else "wm_text_remove"
-        prompt = ("Send the watermark text to add (up to 80 characters)." if action == "add"
-                  else "Send the exact watermark text to look for and remove. Removal works best for readable text; complex or embedded image watermarks may remain.")
-        await q.message.reply_text(prompt, reply_markup=_keyboard([[("❌ Cancel", "wm_cancel")]]))
+        if action == "add":
+            context.user_data["state"] = "wm_text_add"
+            await q.message.reply_text(
+                "Send the new watermark text (up to 80 characters).",
+                reply_markup=_keyboard([[("❌ Cancel", "wm_cancel")]])
+            )
+        else:
+            context.user_data["state"] = "wm_choose_remove_mode"
+            await q.message.reply_text(
+                "Choose how to remove the watermark:",
+                reply_markup=_keyboard([[( "1️⃣ Specific watermark text", "wm_remove_mode|specific")],
+                                        [( "2️⃣ Automatic (look for the word watermark)", "wm_remove_mode|auto")],
+                                        [( "❌ Cancel", "wm_cancel")]])
+            )
         return True
     if data.startswith("wm_pos|"):
         pos = data.split("|", 1)[1]
