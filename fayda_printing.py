@@ -121,6 +121,8 @@ def register_fayda_printing(application, admin_ids: set[int] | list[int]) -> Non
     WAITING_MODE, WAITING_FILES = range(2)
 
     async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.callback_query:
+            await update.callback_query.answer()
         user = update.effective_user
         if not user or user.id not in admins:
             if update.effective_message:
@@ -242,7 +244,8 @@ def register_fayda_printing(application, admin_ids: set[int] | list[int]) -> Non
         return ConversationHandler.END
 
     conversation = ConversationHandler(
-        entry_points=[CommandHandler("fayda", start)],
+        entry_points=[CommandHandler("fayda", start),
+                      CallbackQueryHandler(start, pattern=r"^fayda_open$")],
         states={
             WAITING_MODE: [CallbackQueryHandler(choose, pattern=r"^fayda_(pdf|image|cancel)$")],
             WAITING_FILES: [
