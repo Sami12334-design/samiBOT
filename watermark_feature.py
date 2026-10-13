@@ -317,16 +317,33 @@ async def _process_uploaded(message, context, file_id, wm, kind, filename=""):
         raw = await _download_file(message, context, file_id)
         if kind == "image":
             if wm.get("action") == "add":
-                result = await asyncio.to_thread(_add_image_watermark, raw, wm)
-                caption = "✅ Watermark added."
+                await status.edit_text("💧 Adding watermark to your image…")
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(_add_image_watermark, raw, wm), timeout=45
+                )
+                # Validate the result before sending it, so an empty/invalid output
+                # can never be reported as a successful watermark operation.
+                with Image.open(BytesIO(result)) as check_image:
+                    check_image.verify()
+                caption = "✅ Watermark added to your image."
             else:
-                result, count = await asyncio.to_thread(_remove_image_text, raw, wm["text"])
+                await status.edit_text("🔎 Scanning image for the requested watermark text… This can take a little time.")
+                result, count = await asyncio.wait_for(
+                    asyncio.to_thread(_remove_image_text, raw, wm["text"]), timeout=90
+                )
+                with Image.open(BytesIO(result)) as check_image:
+                    check_image.verify()
                 caption = f"✅ Removed matching text from {count} detected region(s). Some background repair may be visible."
             output = BytesIO(result)
             output.name = "watermarked_image.png" if wm.get("action") == "add" else "watermark_removed.png"
             await message.reply_document(document=output, filename=output.name, caption=caption)
         else:
-            result = await asyncio.to_thread(_process_pdf, raw, wm)
+            await status.edit_text("📄 Processing your PDF…")
+            result = await asyncio.wait_for(
+                asyncio.to_thread(_process_pdf, raw, wm), timeout=90
+            )
+            if not result:
+                raise RuntimeError("The PDF processor returned an empty file. Please retry with a smaller PDF.")
             if wm.get("action") == "remove":
                 # PDF text search can find no matches; avoid implying success in that case.
                 with pymupdf.open(stream=raw, filetype="pdf") as check_doc:
@@ -342,8 +359,14 @@ async def _process_uploaded(message, context, file_id, wm, kind, filename=""):
             output.name = "watermarked.pdf" if wm.get("action") == "add" else "watermark_removed.pdf"
             await message.reply_document(document=output, filename=output.name, caption=caption)
         await status.edit_text("✅ Finished.")
+    except asyncio.TimeoutError:
+        await status.edit_text(
+            "⏱️ Processing timed out on the current hosting service. "
+            "Try a smaller image/PDF. For image watermark removal, make sure the deployment "
+            "has enough memory for OCR and that Render finished installing its dependencies."
+        )
     except Exception as exc:
-        error = str(exc).strip() or "Unknown processing error."
+        error = str(exc).strip() or type(exc).__name__ or "Unknown processing error."
         await status.edit_text("❌ Could not process this file: " + error[:900])
     finally:
         context.user_data["state"] = None
