@@ -674,6 +674,7 @@ async def start(update, context):
     if is_admin(user_id):
         keyboard = [
             [InlineKeyboardButton("📥 Inbox", callback_data="inbox"), InlineKeyboardButton("💬 Message Control", callback_data="message_manager")],
+            [InlineKeyboardButton("🤖 Auto Responder", callback_data="auto_responder")],
             [InlineKeyboardButton("💧 Watermark Studio", callback_data="watermark")],
             [InlineKeyboardButton("🪪 Fayida / National ID Printer", callback_data="fayda_open")],
             [InlineKeyboardButton("👤 Profile", callback_data="profile")],
