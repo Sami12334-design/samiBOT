@@ -45,12 +45,10 @@ def _keyboard(rows):
 
 async def watermark_start(update: Update, context):
     context.user_data["wm"] = {}
-    context.user_data["state"] = "wm_choose_type"
+    context.user_data["state"] = "wm_upload_first"
     await update.effective_message.reply_text(
-        "💧 *WATERMARK STUDIO*\n\nWhat do you want to process?",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=_keyboard([[("🖼️ Image", "wm_type|image"), ("📄 PDF", "wm_type|pdf")],
-                                [("❌ Cancel", "wm_cancel")]])
+        "💧 WATERMARK STUDIO\nFirst, upload the image or PDF you want to process.",
+        reply_markup=_keyboard([[("❌ Cancel", "wm_cancel")]])
     )
 
 
@@ -61,16 +59,28 @@ async def watermark_callback(update: Update, context, data):
         context.user_data["wm"] = {}
         context.user_data["state"] = "wm_choose_type"
         await q.message.reply_text(
-            "💧 *WATERMARK STUDIO*\nChoose a file type:",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=_keyboard([[("🖼️ Image", "wm_type|image"), ("📄 PDF", "wm_type|pdf")],
-                                    [("❌ Cancel", "wm_cancel")]])
+            "💧 WATERMARK STUDIO\nFirst, upload the image or PDF you want to process.",
+            reply_markup=_keyboard([[("❌ Cancel", "wm_cancel")]])
         )
         return True
     if data == "wm_cancel":
         context.user_data.pop("wm", None)
         context.user_data["state"] = None
         await q.message.reply_text("❌ Watermark operation cancelled.")
+        return True
+    if data.startswith("wm_remove_mode|"):
+        mode = data.split("|", 1)[1]
+        if mode not in ("specific", "auto") or not wm.get("file_id"):
+            await q.message.reply_text("❌ Session expired. Start again with /watermark.")
+            return True
+        wm["action"] = "remove"
+        wm["remove_mode"] = mode
+        if mode == "specific":
+            context.user_data["state"] = "wm_text_remove"
+            await q.message.reply_text("Send the exact watermark text to remove.", reply_markup=_keyboard([[("❌ Cancel", "wm_cancel")]]))
+        else:
+            context.user_data["state"] = "wm_processing"
+            await _process_uploaded(q.message, context, wm["file_id"], wm, wm["kind"], wm.get("filename", ""))
         return True
     if data.startswith("wm_type|"):
         kind = data.split("|", 1)[1]
@@ -156,11 +166,13 @@ async def watermark_text_input(update: Update, context):
                 [("📐 Diagonal", "wm_pos|diagonal")], [("❌ Cancel", "wm_cancel")]]
         await update.effective_message.reply_text("Choose watermark position:", reply_markup=_keyboard(rows))
     else:
-        context.user_data["state"] = "wm_awaiting_file"
-        await update.effective_message.reply_text(
-            f"🔎 I'll look for this exact text: “{text}”. Upload the {'image' if wm.get('kind') == 'image' else 'PDF'} now.",
-            reply_markup=_keyboard([[("❌ Cancel", "wm_cancel")]])
-        )
+        if wm.get("file_id"):
+            context.user_data["state"] = "wm_processing"
+            await update.effective_message.reply_text(f"🔎 Looking for “{text}”…")
+            await _process_uploaded(update.effective_message, context, wm["file_id"], wm, wm["kind"], wm.get("filename", ""))
+        else:
+            context.user_data["state"] = "wm_awaiting_file"
+            await update.effective_message.reply_text("Upload the image or PDF now.", reply_markup=_keyboard([[("❌ Cancel", "wm_cancel")]]))
     return True
 
 
@@ -281,26 +293,39 @@ async def _download_file(message, context, file_id):
 
 
 async def watermark_photo_input(update: Update, context):
-    if context.user_data.get("state") != "wm_awaiting_file":
+    state = context.user_data.get("state")
+    if state not in ("wm_upload_first", "wm_awaiting_file"):
         return False
-    wm = context.user_data.get("wm", {})
-    if wm.get("kind") != "image":
-        await update.effective_message.reply_text("📄 This session expects a PDF. Send a PDF document or tap Cancel.")
+    wm = context.user_data.setdefault("wm", {})
+    file_id = update.effective_message.photo[-1].file_id
+    if state == "wm_upload_first":
+        wm.update({"kind": "image", "file_id": file_id})
+        context.user_data["state"] = "wm_choose_remove_mode"
+        await update.effective_message.reply_text("Choose removal method:", reply_markup=_keyboard([[("1️⃣ Specific watermark", "wm_remove_mode|specific")], [("2️⃣ Automatic detection", "wm_remove_mode|auto")], [("❌ Cancel", "wm_cancel")]]))
         return True
-    await _process_uploaded(update.effective_message, context, update.effective_message.photo[-1].file_id, wm, "image")
+    await _process_uploaded(update.effective_message, context, file_id, wm, "image")
     return True
 
 
 async def watermark_document_input(update: Update, context):
-    if context.user_data.get("state") != "wm_awaiting_file":
+    state = context.user_data.get("state")
+    if state not in ("wm_upload_first", "wm_awaiting_file"):
         return False
     message = update.effective_message
-    wm = context.user_data.get("wm", {})
+    wm = context.user_data.setdefault("wm", {})
     doc = message.document
     mime = (doc.mime_type or "").lower()
     filename = (doc.file_name or "").lower()
     is_pdf = mime == "application/pdf" or filename.endswith(".pdf")
     is_image = mime.startswith("image/") or filename.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"))
+    if state == "wm_upload_first":
+        if not (is_pdf or is_image):
+            await message.reply_text("❌ Upload an image or PDF.")
+            return True
+        wm.update({"kind": "pdf" if is_pdf else "image", "file_id": doc.file_id, "filename": doc.file_name or ""})
+        context.user_data["state"] = "wm_choose_remove_mode"
+        await message.reply_text("Choose removal method:", reply_markup=_keyboard([[("1️⃣ Specific watermark", "wm_remove_mode|specific")], [("2️⃣ Automatic detection", "wm_remove_mode|auto")], [("❌ Cancel", "wm_cancel")]]))
+        return True
     if wm.get("kind") == "pdf" and not is_pdf:
         await message.reply_text("❌ Please upload a PDF document for this operation.")
         return True
