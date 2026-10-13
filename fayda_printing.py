@@ -272,10 +272,10 @@ def register_fayda_printing(application, admin_ids: set[int] | list[int]) -> Non
             return ConversationHandler.END
         images = context.user_data.get("fayda_images", [])
         if len(images) % 2:
-            await query.answer("Please upload the BACK image for the current ID first.", show_alert=True)
+            await query.edit_message_text("Please upload the BACK image for the current ID first.")
             return WAITING_FILES
         if len(images) >= MAX_IMAGES:
-            await query.answer("Maximum 3 ID pairs per A4 page.", show_alert=True)
+            await query.edit_message_text("Maximum 3 ID pairs per A4 page. Press Finish A4 sheet.")
             return WAITING_FILES
         context.user_data["fayda_next_side"] = "FRONT"
         await query.edit_message_text(f"Upload ID {len(images) // 2 + 1} FRONT image.")
@@ -297,7 +297,7 @@ def register_fayda_printing(application, admin_ids: set[int] | list[int]) -> Non
             await query.edit_message_text("No images received. Start again with /fayda.")
             return ConversationHandler.END
         if len(images) % 2:
-            await query.answer("The current ID is missing its BACK image.", show_alert=True)
+            await query.edit_message_text("The current ID is missing its BACK image. Please upload it, then finish the sheet.")
             return WAITING_FILES
         try:
             pdf_result = images_to_a4_pdf(images)
