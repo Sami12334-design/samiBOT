@@ -85,6 +85,37 @@ def images_to_a4_pdf(image_bytes: Iterable[bytes], *, add_copy_notice: bool = Tr
     c.save()
     return out.getvalue()
 
+
+def images_to_side_by_side_png(image_bytes: Iterable[bytes]) -> bytes:
+    """Create a clean digital side-by-side sheet from the original uploaded images.
+    No ID text, portraits, QR codes, or barcodes are generated or rewritten.
+    """
+    items = list(image_bytes)
+    if not 1 <= len(items) <= MAX_IMAGES:
+        raise ValueError("Send one or two images (front first, then back).")
+    images = [_open_image(b) for b in items]
+
+    # 300-DPI landscape canvas. A generous white margin and proportional fit
+    # avoid stretching, cropping, or rewriting the original source content.
+    out_w, out_h = 3508, 2480
+    margin, gap = 100, 70
+    box_w = (out_w - 2 * margin - gap) // 2
+    box_h = out_h - 2 * margin
+    canvas_img = Image.new("RGB", (out_w, out_h), "white")
+
+    # Upload order is front then back; reference layout is back left, front right.
+    ordered = list(reversed(images)) if len(images) == 2 else images
+    for i, image in enumerate(ordered):
+        image.thumbnail((box_w, box_h), Image.Resampling.LANCZOS)
+        x0 = margin + i * (box_w + gap)
+        x = x0 + (box_w - image.width) // 2
+        y = margin + (box_h - image.height) // 2
+        canvas_img.paste(image, (x, y))
+
+    output = io.BytesIO()
+    canvas_img.save(output, format="PNG", dpi=(300, 300), optimize=True)
+    return output.getvalue()
+
 def pdf_to_a4_pdf(source: bytes) -> bytes:
     """Scale original PDF pages onto A4 without changing their content."""
     if not source or len(source) > MAX_UPLOAD_BYTES:
@@ -240,10 +271,13 @@ def register_fayda_printing(application, admin_ids: set[int] | list[int]) -> Non
             await query.edit_message_text("No images received. Start again with /fayda.")
             return ConversationHandler.END
         try:
-            result = images_to_a4_pdf(files)
+            result = images_to_a4_pdf(files, add_copy_notice=False)
+            preview = images_to_side_by_side_png(files)
         except ValueError as exc:
             await query.edit_message_text(str(exc))
             return ConversationHandler.END
+        await query.message.reply_document(document=io.BytesIO(preview), filename="fayda_side_by_side.png",
+            caption="Clean side-by-side image made from the original uploads. Source ID details are preserved.")
         await query.message.reply_document(document=io.BytesIO(result), filename="fayda_a4_print_copy.pdf",
             caption="A4 print sheet made from the original images. It is not an official ID.")
         context.user_data.pop("fayda_files", None)
