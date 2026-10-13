@@ -48,6 +48,7 @@ import imageio_ffmpeg
 import qrcode
 from ai_media_detector import analyze_image_bytes, analyze_audio_bytes, format_detection_result, DetectorError
 from watermark_feature import watermark_start, watermark_callback, watermark_text_input, watermark_photo_input, watermark_document_input
+from fayda_printing import register_fayda_printing
 
 try:
     from telethon.tl.functions.stories import GetPeerStoriesRequest, GetStoriesByIDRequest
@@ -672,6 +673,7 @@ async def start(update, context):
         keyboard = [
             [InlineKeyboardButton("📥 Inbox", callback_data="inbox"), InlineKeyboardButton("💬 Message Control", callback_data="message_manager")],
             [InlineKeyboardButton("💧 Watermark Studio", callback_data="watermark")],
+            [InlineKeyboardButton("🪪 Fayida / National ID Printer", callback_data="fayda_open")],
             [InlineKeyboardButton("👤 Profile", callback_data="profile")],
             [InlineKeyboardButton("👀 Profile Visitors", callback_data="profile_visitors"), InlineKeyboardButton("📖 Story Viewers", callback_data="story_viewers")],
             [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")],
@@ -8423,6 +8425,8 @@ async def main():
     if telegram_file_base:
         bot_builder = bot_builder.base_file_url(telegram_file_base)
     bot_app = bot_builder.build()
+    # Register the admin-only Fayda print-preparation conversation before catch-all handlers.
+    register_fayda_printing(bot_app, ADMIN_IDS)
     global PTB_BOT
     PTB_BOT = bot_app.bot
     bot_app.add_handler(TypeHandler(Update, force_join_guard), group=-100)
@@ -8471,6 +8475,7 @@ async def main():
             BotCommand("audio", "Open audio tools"),
             BotCommand("editphoto", "Edit a photo"),
             BotCommand("watermark", "Add or remove image/PDF watermarks"),
+            BotCommand("fayda", "Prepare original Fayda images/PDF for A4 printing"),
         ])
     except Exception as exc:
         print(f"Command menu setup warning: {exc}")
