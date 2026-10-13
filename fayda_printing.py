@@ -48,29 +48,42 @@ def _draw_fit(c: canvas.Canvas, image: Image.Image, x: float, y: float,
 
 
 def images_to_a4_pdf(image_bytes: Iterable[bytes], *, add_copy_notice: bool = True) -> bytes:
-    """Place one or two unmodified source images on a single A4 page for printing."""
+    """Place front (first upload) on the right and back (second upload) on the left
+    on one landscape A4 page, using only the supplied source images.
+    """
     items = list(image_bytes)
     if not 1 <= len(items) <= MAX_IMAGES:
-        raise ValueError("Send one or two images (for example, front and back).")
+        raise ValueError("Send one or two images (front first, then back).")
     images = [_open_image(b) for b in items]
+
+    # Landscape A4 matches the requested side-by-side print layout.
+    page_w, page_h = PAGE_H, PAGE_W
     out = io.BytesIO()
-    c = canvas.Canvas(out, pagesize=A4, pageCompression=1)
-    margin = 24
-    gap = 16
-    usable_h = PAGE_H - 2 * margin - (gap if len(images) == 2 else 0)
-    box_h = usable_h / len(images)
-    for i, image in enumerate(images):
-        y = PAGE_H - margin - box_h - i * (box_h + gap)
-        _draw_fit(c, image, margin, y, PAGE_W - 2 * margin, box_h)
+    c = canvas.Canvas(out, pagesize=(page_w, page_h), pageCompression=1)
+    margin = 22
+    gap = 12
+    notice_h = 18 if add_copy_notice else 0
+    usable_h = page_h - 2 * margin - notice_h
+    box_w = (page_w - 2 * margin - gap) / 2
+
+    # Upload order is front first, back second; print back left and front right.
+    ordered = list(reversed(images)) if len(images) == 2 else images
+    for i, image in enumerate(ordered):
+        x = margin + i * (box_w + gap)
+        y = margin + notice_h
+        _draw_fit(c, image, x, y, box_w, usable_h)
         c.setStrokeColorRGB(0.72, 0.72, 0.72)
-        c.rect(margin, y, PAGE_W - 2 * margin, box_h, stroke=1, fill=0)
+        c.rect(x, y, box_w, usable_h, stroke=1, fill=0)
+
     if add_copy_notice:
-        c.setFont("Helvetica-Bold", 8)
+        c.setFont("Helvetica-Bold", 7)
         c.setFillColorRGB(0.35, 0.35, 0.35)
-        c.drawCentredString(PAGE_W / 2, 9, "PRINT COPY OF SOURCE IMAGE — NOT ISSUED OR VERIFIED BY THE NATIONAL ID PROGRAM")
+        c.drawCentredString(
+            page_w / 2, 7,
+            "PRINT COPY OF SOURCE IMAGE — NOT ISSUED OR VERIFIED BY THE NATIONAL ID PROGRAM"
+        )
     c.save()
     return out.getvalue()
-
 
 def pdf_to_a4_pdf(source: bytes) -> bytes:
     """Scale original PDF pages onto A4 without changing their content."""
