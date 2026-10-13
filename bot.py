@@ -87,7 +87,7 @@ ADMIN_IDS = []
 admin_ids_str = os.environ.get('ADMIN_IDS', '')
 if admin_ids_str:
     ADMIN_IDS = sorted({
-        int(x.strip()) for x in re.split(r'[,;\\s]+', admin_ids_str)
+        int(x.strip()) for x in re.split(r'[,;\s]+', admin_ids_str)
         if x.strip().isdigit()
     })
 
@@ -124,7 +124,7 @@ async def myid_command(update, context):
     user = update.effective_user
     if user:
         await update.effective_message.reply_text(
-            f"🆔 Your Telegram numeric ID: {user.id}\\n"
+            f"🆔 Your Telegram numeric ID: {user.id}\n"
             "Send this number to a configured bot owner if you need admin access."
         )
 
@@ -137,7 +137,7 @@ async def addadmin_command(update, context):
         return
     if len(context.args) != 1 or not context.args[0].isdigit():
         await update.effective_message.reply_text(
-            "Usage: /addadmin TELEGRAM_NUMERIC_ID\\n"
+            "Usage: /addadmin TELEGRAM_NUMERIC_ID\n"
             "The other admin can get their ID by sending /myid."
         )
         return
