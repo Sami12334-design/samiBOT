@@ -336,8 +336,8 @@ async def _process_uploaded(message, context, file_id, wm, kind, filename=""):
                 caption = f"✅ Removed {matches} matching text occurrence(s). White redaction blocks may be visible on colored backgrounds."
             else:
                 with pymupdf.open(stream=result, filetype="pdf") as out_doc:
-                page_count = out_doc.page_count
-            caption = f"✅ Watermark added to the PDF ({page_count} pages)."
+                    page_count = out_doc.page_count
+                caption = f"✅ Watermark added to the PDF ({page_count} pages)."
             output = BytesIO(result)
             output.name = "watermarked.pdf" if wm.get("action") == "add" else "watermark_removed.pdf"
             await message.reply_document(document=output, filename=output.name, caption=caption)
