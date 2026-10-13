@@ -81,12 +81,32 @@ STRING_SESSION = os.environ.get('STRING_SESSION', '')
 BOT_PASSWORD = os.environ.get("BOT_PASSWORD", "ptss25")
 RENDER_URL = os.environ.get('RENDER_URL', 'https://samibot-s1h6.onrender.com')
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
+# ADMIN_IDS in Render remains the trusted owner/admin seed list. Additional admins
+# can be registered with /addadmin and are stored in bot_data.db.
 ADMIN_IDS = []
 admin_ids_str = os.environ.get('ADMIN_IDS', '')
 if admin_ids_str:
-    ADMIN_IDS = [int(x.strip()) for x in admin_ids_str.split(',') if x.strip().isdigit()]
+    ADMIN_IDS = sorted({
+        int(x.strip()) for x in re.split(r'[,;\\s]+', admin_ids_str)
+        if x.strip().isdigit()
+    })
 
 telethon_client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
+
+def get_admin_ids():
+    """Return environment admins plus admins registered through the bot."""
+    ids = set(ADMIN_IDS)
+    try:
+        conn = sqlite3.connect('bot_data.db', timeout=10)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS admin_registry ("
+            "user_id INTEGER PRIMARY KEY, added_by INTEGER, added_at TEXT)"
+        )
+        ids.update(int(row[0]) for row in conn.execute("SELECT user_id FROM admin_registry"))
+        conn.close()
+    except Exception as exc:
+        print(f"Admin registry read warning: {exc}")
+    return sorted(ids)
 
 def self_ping():
     try:
@@ -95,7 +115,75 @@ def self_ping():
         pass
 
 def is_admin(user_id):
-    return user_id in ADMIN_IDS
+    try:
+        return int(user_id) in get_admin_ids()
+    except (TypeError, ValueError):
+        return False
+
+async def myid_command(update, context):
+    user = update.effective_user
+    if user:
+        await update.effective_message.reply_text(
+            f"🆔 Your Telegram numeric ID: {user.id}\\n"
+            "Send this number to a configured bot owner if you need admin access."
+        )
+
+async def addadmin_command(update, context):
+    requester = update.effective_user
+    if not requester or requester.id not in ADMIN_IDS:
+        await update.effective_message.reply_text(
+            "🔒 Only an admin listed in Render's ADMIN_IDS can add or remove admins."
+        )
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.effective_message.reply_text(
+            "Usage: /addadmin TELEGRAM_NUMERIC_ID\\n"
+            "The other admin can get their ID by sending /myid."
+        )
+        return
+    target_id = int(context.args[0])
+    if target_id <= 0:
+        await update.effective_message.reply_text("❌ Please provide a valid positive Telegram user ID.")
+        return
+    if target_id in get_admin_ids():
+        await update.effective_message.reply_text(f"ℹ️ {target_id} is already an admin.")
+        return
+    conn = sqlite3.connect('bot_data.db', timeout=10)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS admin_registry ("
+        "user_id INTEGER PRIMARY KEY, added_by INTEGER, added_at TEXT)"
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO admin_registry (user_id, added_by, added_at) VALUES (?, ?, ?)",
+        (target_id, requester.id, datetime.now(timezone.utc).isoformat())
+    )
+    conn.commit()
+    conn.close()
+    await update.effective_message.reply_text(
+        f"✅ Admin {target_id} added. They should send /start to SamiBOT, then open Message Control or Auto Responder."
+    )
+
+async def removeadmin_command(update, context):
+    requester = update.effective_user
+    if not requester or requester.id not in ADMIN_IDS:
+        await update.effective_message.reply_text(
+            "🔒 Only an admin listed in Render's ADMIN_IDS can remove admins."
+        )
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.effective_message.reply_text("Usage: /removeadmin TELEGRAM_NUMERIC_ID")
+        return
+    target_id = int(context.args[0])
+    if target_id in ADMIN_IDS:
+        await update.effective_message.reply_text(
+            "❌ This ID is configured in Render's ADMIN_IDS. Remove it from Render environment variables instead."
+        )
+        return
+    conn = sqlite3.connect('bot_data.db', timeout=10)
+    conn.execute("DELETE FROM admin_registry WHERE user_id=?", (target_id,))
+    conn.commit()
+    conn.close()
+    await update.effective_message.reply_text(f"✅ Admin {target_id} removed.")
 
 # --- FORCE JOIN CHANNELS ---
 # Configure in Render:
@@ -6663,7 +6751,7 @@ def mm_is_video(event):
 def mm_reason(event, user_id, text):
     r=mm_get_rules(); now=time.time()
     # Owner/admins are never blocked by manager rules.
-    if user_id in ADMIN_IDS: return None
+    if is_admin(user_id): return None
     # Never block the bot itself (prevents loop)
     try:
         me = telethon_client.loop.run_until_complete(telethon_client.get_me())
@@ -6710,14 +6798,14 @@ def mm_message_preview(event):
 
 # --- FIX 5: Exclude bot's own ID from forwarding and deduplicate admin list. ---
 async def mm_forward(event):
-    if not ADMIN_IDS: print('Message Manager: ADMIN_IDS is empty; forwarding skipped.'); return
+    if not get_admin_ids(): print('Message Manager: no admins configured; forwarding skipped.'); return
     try:
         bot_me = await telethon_client.get_me()
         bot_id = bot_me.id
     except Exception:
         bot_id = None
 
-    admin_list = list(set(ADMIN_IDS))
+    admin_list = get_admin_ids()
     if bot_id:
         admin_list = [aid for aid in admin_list if aid != bot_id]
     if not admin_list:
@@ -6846,7 +6934,7 @@ async def handle_mm_callback(update, context, data):
     if data=='mm_blocked': await q.answer(); await mm_show_blocked(update,context); return True
     if data=='mm_filters': await q.answer(); await mm_show_filters(update,context); return True
     if data=='mm_forwarding':
-        await q.answer(); admins=', '.join(map(str,ADMIN_IDS)) or 'NONE'
+        await q.answer(); admins=', '.join(map(str,get_admin_ids())) or 'NONE'
         await q.edit_message_text('📩 FORWARDING\n\nIncoming private messages are forwarded to these ADMIN_IDS:\n'+admins+'\n\nThe connected Telethon account must be able to message those IDs, and each admin should start this bot to receive Bot API controls.',reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Back',callback_data='message_manager')]])); return True
     if data in {'mm_block_everyone','mm_filter_links','mm_filter_videos'}:
         await q.answer(); prefix={'mm_block_everyone':'mm_dur|everyone','mm_filter_links':'mm_dur|links','mm_filter_videos':'mm_dur|videos'}[data]
@@ -8438,6 +8526,9 @@ async def main():
     PTB_BOT = bot_app.bot
     bot_app.add_handler(TypeHandler(Update, force_join_guard), group=-100)
     bot_app.add_handler(CommandHandler("start", start))
+    bot_app.add_handler(CommandHandler("myid", myid_command))
+    bot_app.add_handler(CommandHandler("addadmin", addadmin_command))
+    bot_app.add_handler(CommandHandler("removeadmin", removeadmin_command))
     # Easy user-facing shortcuts. Keep this order synced with the Telegram command menu.
     bot_app.add_handler(CommandHandler("video", make_feature_command("video_downloader", "🎬 Video Downloader")))
     bot_app.add_handler(CommandHandler("pdffetch", make_feature_command("pdf_fetch", "📄 PDF Fetch")))
