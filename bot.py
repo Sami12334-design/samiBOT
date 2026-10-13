@@ -665,7 +665,9 @@ async def start(update, context):
     conn.commit()
     conn.close()
     self_ping()
-    if not is_authenticated(user_id):
+    # Configured admins can access the admin dashboard without a separate user password.
+    # Non-admin users must still authenticate normally.
+    if not is_authenticated(user_id) and not is_admin(user_id):
         context.user_data['state'] = 'awaiting_password'
         await update.message.reply_text("🔐 TELEGRAM ASSISTANT\n\nPassword required.\nPlease enter the password to continue.")
         return
@@ -1310,7 +1312,9 @@ async def menu_callback(update, context):
         await handle_whisper_callback(update, context, query.data.split("|", 1)[1])
         return
     await query.answer()
-    if not is_authenticated(user_id):
+    # Admins are authorized by ADMIN_IDS; don't block their controls because
+    # they have not separately entered the general user password.
+    if not is_authenticated(user_id) and not is_admin(user_id):
         await query.edit_message_text("🔐 Password required.")
         return
 
@@ -6827,7 +6831,9 @@ async def mm_set_rule_duration(update, context, kind, value):
 
 async def handle_mm_callback(update, context, data):
     q=update.callback_query; uid=update.effective_user.id
-    if not is_authenticated(uid) or not is_admin(uid): await q.answer('Admin only',show_alert=True); return True
+    # Message Control is available to every configured admin, not just
+    # admins who have also completed normal-user password authentication.
+    if not is_admin(uid): await q.answer('Admin only',show_alert=True); return True
     if data=='message_manager':
         for _key in ('mm_input','mm_duration_kind','mm_reply_to'): context.user_data.pop(_key,None)
         await q.answer(); await mm_show(update,context); return True
