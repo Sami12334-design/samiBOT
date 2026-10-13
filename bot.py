@@ -47,6 +47,7 @@ import yt_dlp
 import imageio_ffmpeg
 import qrcode
 from ai_media_detector import analyze_image_bytes, analyze_audio_bytes, format_detection_result, DetectorError
+from watermark_feature import watermark_start, watermark_callback, watermark_text_input, watermark_photo_input, watermark_document_input
 
 try:
     from telethon.tl.functions.stories import GetPeerStoriesRequest, GetStoriesByIDRequest
@@ -670,6 +671,7 @@ async def start(update, context):
     if is_admin(user_id):
         keyboard = [
             [InlineKeyboardButton("📥 Inbox", callback_data="inbox"), InlineKeyboardButton("💬 Message Control", callback_data="message_manager")],
+            [InlineKeyboardButton("💧 Watermark Studio", callback_data="watermark")],
             [InlineKeyboardButton("👤 Profile", callback_data="profile")],
             [InlineKeyboardButton("👀 Profile Visitors", callback_data="profile_visitors"), InlineKeyboardButton("📖 Story Viewers", callback_data="story_viewers")],
             [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")],
@@ -681,6 +683,7 @@ async def start(update, context):
     else:
         keyboard = [
             [InlineKeyboardButton("👤 Profile", callback_data="profile")],
+            [InlineKeyboardButton("💧 Watermark Studio", callback_data="watermark")],
             [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")],
             [InlineKeyboardButton("➕ More Commands", callback_data="more")]
         ]
@@ -1310,6 +1313,8 @@ async def menu_callback(update, context):
         return
 
     data = query.data
+    if await watermark_callback(update, context, data):
+        return
     # Manager text-entry state must never leak into unrelated buttons.
     # Otherwise a later normal message is incorrectly interpreted as a user ID.
     if not (data.startswith("mm_") or data == "message_manager"):
@@ -8099,6 +8104,7 @@ async def handle_link(update, context):
     if await _auto_detect_uploaded_media(update, context): return
     self_ping()
     state = context.user_data.get("state")
+    if await watermark_text_input(update, context): return
     if state in ("awaiting_crop_width", "awaiting_crop_height"):
         raw = (text or "").strip()
         if not raw.isdigit():
@@ -8427,6 +8433,7 @@ async def main():
     bot_app.add_handler(CommandHandler("imagetotext", make_feature_command("image_to_text", "🖼️ Image to Text")))
     bot_app.add_handler(CommandHandler("audio", make_feature_command("audio_tools", "🎵 Audio Tool")))
     bot_app.add_handler(CommandHandler("editphoto", make_feature_command("image_edit", "🖼️ Edit Photo")))
+    bot_app.add_handler(CommandHandler("watermark", watermark_start))
     for shortcut in ("lastseen", "ls", "seen", "online", "status", "last"):
         bot_app.add_handler(CommandHandler(shortcut, last_seen_shortcut))
     bot_app.add_handler(CommandHandler("safety", safety_command))
@@ -8441,13 +8448,18 @@ async def main():
     bot_app.add_handler(CallbackQueryHandler(menu_callback))
     bot_app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, safety_group_monitor), group=-1)
     async def photo_router(update, context):
+        if await watermark_photo_input(update, context): return
         if context.user_data.get('state') == 'qr_scan':
             await handle_qr_photo(update, context); return
         if await _auto_detect_uploaded_media(update, context):
             return
         await handle_link(update, context)
+    async def document_router(update, context):
+        if await watermark_document_input(update, context): return
+        await handle_link(update, context)
     bot_app.add_handler(MessageHandler(filters.PHOTO, photo_router))
-    bot_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND & ~filters.PHOTO, handle_link))
+    bot_app.add_handler(MessageHandler(filters.Document.ALL, document_router))
+    bot_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND & ~filters.PHOTO & ~filters.Document.ALL, handle_link))
     print("Bot running with upgraded multi-source video downloader...")
     await bot_app.initialize()
     try:
@@ -8458,6 +8470,7 @@ async def main():
             BotCommand("imagetotext", "Extract text from an image"),
             BotCommand("audio", "Open audio tools"),
             BotCommand("editphoto", "Edit a photo"),
+            BotCommand("watermark", "Add or remove image/PDF watermarks"),
         ])
     except Exception as exc:
         print(f"Command menu setup warning: {exc}")
