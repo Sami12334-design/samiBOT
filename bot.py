@@ -8433,7 +8433,7 @@ async def main():
     bot_app.add_handler(CommandHandler("imagetotext", make_feature_command("image_to_text", "🖼️ Image to Text")))
     bot_app.add_handler(CommandHandler("audio", make_feature_command("audio_tools", "🎵 Audio Tool")))
     bot_app.add_handler(CommandHandler("editphoto", make_feature_command("image_edit", "🖼️ Edit Photo")))
-    bot_app.add_handler(CommandHandler("watermark", watermark_start))
+    bot_app.add_handler(CommandHandler("watermark", make_feature_command("watermark", "💧 Watermark Studio")))
     for shortcut in ("lastseen", "ls", "seen", "online", "status", "last"):
         bot_app.add_handler(CommandHandler(shortcut, last_seen_shortcut))
     bot_app.add_handler(CommandHandler("safety", safety_command))
