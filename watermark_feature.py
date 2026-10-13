@@ -141,11 +141,16 @@ async def watermark_callback(update: Update, context, data):
             await q.message.reply_text("❌ Invalid size. Choose again.")
             return True
         wm["size"] = _SIZES[size]
-        context.user_data["state"] = "wm_awaiting_file"
-        await q.message.reply_text(
-            f"✅ Settings saved. Now upload your {'image' if wm.get('kind') == 'image' else 'PDF'} file.",
-            reply_markup=_keyboard([[("❌ Cancel", "wm_cancel")]])
-        )
+        if wm.get("file_id"):
+            context.user_data["state"] = "wm_processing"
+            await q.message.reply_text("✅ Settings saved. Applying the watermark to your uploaded file…")
+            await _process_uploaded(q.message, context, wm["file_id"], wm, wm["kind"], wm.get("filename", ""))
+        else:
+            context.user_data["state"] = "wm_awaiting_file"
+            await q.message.reply_text(
+                f"✅ Settings saved. Now upload your {'image' if wm.get('kind') == 'image' else 'PDF'} file.",
+                reply_markup=_keyboard([[("❌ Cancel", "wm_cancel")]])
+            )
         return True
     return False
 
@@ -301,9 +306,14 @@ async def watermark_photo_input(update: Update, context):
     wm = context.user_data.setdefault("wm", {})
     file_id = update.effective_message.photo[-1].file_id
     if state == "wm_upload_first":
-        wm.update({"kind": "image", "file_id": file_id})
-        context.user_data["state"] = "wm_choose_remove_mode"
-        await update.effective_message.reply_text("Choose removal method:", reply_markup=_keyboard([[("1️⃣ Specific watermark", "wm_remove_mode|specific")], [("2️⃣ Automatic detection", "wm_remove_mode|auto")], [("❌ Cancel", "wm_cancel")]]))
+        wm.update({"kind": "image", "file_id": file_id, "filename": "image"})
+        context.user_data["state"] = "wm_choose_action"
+        await update.effective_message.reply_text(
+            "What would you like to do with this image?",
+            reply_markup=_keyboard([[( "➕ Add a new watermark", "wm_action|add")],
+                                    [( "🧽 Remove an existing watermark", "wm_action|remove")],
+                                    [( "❌ Cancel", "wm_cancel")]])
+        )
         return True
     await _process_uploaded(update.effective_message, context, file_id, wm, "image")
     return True
@@ -325,8 +335,13 @@ async def watermark_document_input(update: Update, context):
             await message.reply_text("❌ Upload an image or PDF.")
             return True
         wm.update({"kind": "pdf" if is_pdf else "image", "file_id": doc.file_id, "filename": doc.file_name or ""})
-        context.user_data["state"] = "wm_choose_remove_mode"
-        await message.reply_text("Choose removal method:", reply_markup=_keyboard([[("1️⃣ Specific watermark", "wm_remove_mode|specific")], [("2️⃣ Automatic detection", "wm_remove_mode|auto")], [("❌ Cancel", "wm_cancel")]]))
+        context.user_data["state"] = "wm_choose_action"
+        await message.reply_text(
+            "What would you like to do with this file?",
+            reply_markup=_keyboard([[( "➕ Add a new watermark", "wm_action|add")],
+                                    [( "🧽 Remove an existing watermark", "wm_action|remove")],
+                                    [( "❌ Cancel", "wm_cancel")]])
+        )
         return True
     if wm.get("kind") == "pdf" and not is_pdf:
         await message.reply_text("❌ Please upload a PDF document for this operation.")
