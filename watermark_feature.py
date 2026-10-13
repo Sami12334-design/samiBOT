@@ -79,7 +79,9 @@ async def watermark_callback(update: Update, context, data):
             context.user_data["state"] = "wm_text_remove"
             await q.message.reply_text("Send the exact watermark text to remove.", reply_markup=_keyboard([[("❌ Cancel", "wm_cancel")]]))
         else:
+            wm["text"] = "watermark"
             context.user_data["state"] = "wm_processing"
+            await q.message.reply_text("🤖 Automatic mode will look for the word watermark. For other visible text, choose Specific watermark.")
             await _process_uploaded(q.message, context, wm["file_id"], wm, wm["kind"], wm.get("filename", ""))
         return True
     if data.startswith("wm_type|"):
