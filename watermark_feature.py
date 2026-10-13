@@ -57,7 +57,7 @@ async def watermark_callback(update: Update, context, data):
     wm = context.user_data.setdefault("wm", {})
     if data == "watermark":
         context.user_data["wm"] = {}
-        context.user_data["state"] = "wm_choose_type"
+        context.user_data["state"] = "wm_upload_first"
         await q.message.reply_text(
             "💧 WATERMARK STUDIO\nFirst, upload the image or PDF you want to process.",
             reply_markup=_keyboard([[("❌ Cancel", "wm_cancel")]])
