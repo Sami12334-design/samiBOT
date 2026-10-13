@@ -1051,13 +1051,11 @@ async def ar_show_list(update, context):
 
 async def ar_delete(update, context, rule_id):
     q = update.callback_query
-    await q.answer("Deleted")
     ar_delete_rule(rule_id)
     await ar_show_list(update, context)
 
 async def ar_cancel(update, context):
     q = update.callback_query
-    await q.answer()
     context.user_data.pop('ar_trigger', None)
     context.user_data.pop('ar_response', None)
     context.user_data['state'] = None
@@ -1400,14 +1398,22 @@ async def menu_callback(update, context):
     if query.data and query.data.startswith("whisper|"):
         await handle_whisper_callback(update, context, query.data.split("|", 1)[1])
         return
-    await query.answer()
-    # Admins are authorized by ADMIN_IDS; don't block their controls because
-    # they have not separately entered the general user password.
+    data = query.data
+    # Message Manager and Auto Responder handlers answer their own callback
+    # queries. Avoid answering those queries twice here, which can abort their
+    # handler before the menu is rendered or the action is applied.
+    is_manager_or_responder = (
+        data == "message_manager" or data.startswith("mm_")
+        or data == "auto_responder" or data.startswith("ar_")
+    )
+    if not is_manager_or_responder:
+        await query.answer()
+    # Admins are authorized by ADMIN_IDS/registered admin registry; don't block
+    # their controls because they have not separately entered the user password.
     if not is_authenticated(user_id) and not is_admin(user_id):
         await query.edit_message_text("🔐 Password required.")
         return
 
-    data = query.data
     if await watermark_callback(update, context, data):
         return
     # Manager text-entry state must never leak into unrelated buttons.
