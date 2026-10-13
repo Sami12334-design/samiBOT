@@ -5,7 +5,7 @@ import re
 from io import BytesIO
 
 import pymupdf
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 import cv2
 import numpy as np
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -21,6 +21,8 @@ _POSITIONS = {
     "bottom_center": ("Bottom center", "bc"),
     "bottom_right": ("Bottom right", "br"),
     "diagonal": ("Diagonal", "diag"),
+    "center_left": ("Center left", "cl"),
+    "center_right": ("Center right", "cr"),
 }
 _COLORS = {
     "black": (0, 0, 0),
@@ -152,8 +154,6 @@ async def watermark_text_input(update: Update, context):
                 [("⬅️ Center left", "wm_pos|center_left"), ("🎯 Center", "wm_pos|center"), ("➡️ Center right", "wm_pos|center_right")],
                 [("↙️ Bottom left", "wm_pos|bottom_left"), ("⬇️ Bottom center", "wm_pos|bottom_center"), ("↘️ Bottom right", "wm_pos|bottom_right")],
                 [("📐 Diagonal", "wm_pos|diagonal")], [("❌ Cancel", "wm_cancel")]]
-        # Side positions are supported and mapped to their nearest edge anchor.
-        _POSITIONS.update({"center_left": ("Center left", "cl"), "center_right": ("Center right", "cr")})
         await update.effective_message.reply_text("Choose watermark position:", reply_markup=_keyboard(rows))
     else:
         context.user_data["state"] = "wm_awaiting_file"
@@ -335,7 +335,9 @@ async def _process_uploaded(message, context, file_id, wm, kind, filename=""):
                     raise RuntimeError("That text was not found as selectable PDF text. Scanned/image watermarks need OCR-based processing.")
                 caption = f"✅ Removed {matches} matching text occurrence(s). White redaction blocks may be visible on colored backgrounds."
             else:
-                caption = f"✅ Watermark added to the PDF ({pymupdf.open(stream=result, filetype='pdf').page_count} pages)."
+                with pymupdf.open(stream=result, filetype="pdf") as out_doc:
+                page_count = out_doc.page_count
+            caption = f"✅ Watermark added to the PDF ({page_count} pages)."
             output = BytesIO(result)
             output.name = "watermarked.pdf" if wm.get("action") == "add" else "watermark_removed.pdf"
             await message.reply_document(document=output, filename=output.name, caption=caption)
