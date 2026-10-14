@@ -102,8 +102,8 @@ def get_admin_ids():
     for variable in ("ADMIN_IDS", "BOT_ADMIN_IDS", "ADMIN_ID", "OWNER_ID", "BOT_OWNER_ID"):
         raw = os.environ.get(variable, "")
         if raw:
-            for item in re.split(r"[,;\\s]+", raw.strip()):
-                item = item.strip().strip("[](){}'\\"")
+            for item in re.split(r"[,;\s]+", raw.strip()):
+                item = item.strip().strip("[](){}'\"")
                 if item.isdigit():
                     ids.add(int(item))
 
@@ -118,7 +118,6 @@ def get_admin_ids():
     except Exception as exc:
         print(f"Admin registry read warning: {exc}")
     return sorted(user_id for user_id in ids if user_id > 0)
-
 def self_ping():
     try:
         urllib.request.urlopen(RENDER_URL, timeout=5)
