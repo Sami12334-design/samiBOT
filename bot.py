@@ -102,10 +102,9 @@ def get_admin_ids():
     for variable in ("ADMIN_IDS", "BOT_ADMIN_IDS", "ADMIN_ID", "OWNER_ID", "BOT_OWNER_ID"):
         raw = os.environ.get(variable, "")
         if raw:
-            for item in re.split(r"[,;\s]+", raw.strip()):
-                item = item.strip().strip("[](){}'\"")
-                if item.isdigit():
-                    ids.add(int(item))
+            # IDs are numeric; extracting digit-only tokens also accepts values
+            # pasted as JSON-like lists such as [123456, 789012].
+            ids.update(int(item) for item in re.findall(r"\d+", raw))
 
     try:
         conn = sqlite3.connect('bot_data.db', timeout=10)
