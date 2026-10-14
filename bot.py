@@ -94,8 +94,19 @@ if admin_ids_str:
 telethon_client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
 def get_admin_ids():
-    """Return environment admins plus admins registered through the bot."""
+    """Return every explicitly configured or bot-registered admin ID."""
     ids = set(ADMIN_IDS)
+
+    # Read the environment at call time as well as startup, accepting common
+    # deployment variable names and comma/semicolon/space/newline separators.
+    for variable in ("ADMIN_IDS", "BOT_ADMIN_IDS", "ADMIN_ID", "OWNER_ID", "BOT_OWNER_ID"):
+        raw = os.environ.get(variable, "")
+        if raw:
+            for item in re.split(r"[,;\\s]+", raw.strip()):
+                item = item.strip().strip("[](){}'\\"")
+                if item.isdigit():
+                    ids.add(int(item))
+
     try:
         conn = sqlite3.connect('bot_data.db', timeout=10)
         conn.execute(
@@ -106,7 +117,7 @@ def get_admin_ids():
         conn.close()
     except Exception as exc:
         print(f"Admin registry read warning: {exc}")
-    return sorted(ids)
+    return sorted(user_id for user_id in ids if user_id > 0)
 
 def self_ping():
     try:
@@ -1405,6 +1416,9 @@ async def menu_callback(update, context):
     is_manager_or_responder = (
         data == "message_manager" or data.startswith("mm_")
         or data == "auto_responder" or data.startswith("ar_")
+        # Inbox handlers also answer their own callbacks ("Loading inbox…").
+        # Exclude them here to avoid Telegram's "query already answered" error.
+        or data == "inbox" or data.startswith("inbox_open_")
     )
     if not is_manager_or_responder:
         await query.answer()
@@ -1594,9 +1608,15 @@ async def menu_callback(update, context):
         return
 
     if data == "inbox":
+        if not is_admin(user_id):
+            await query.answer("🔒 Admin only", show_alert=True)
+            return
         await show_inbox(update, context)
         return
     if data.startswith("inbox_open_"):
+        if not is_admin(user_id):
+            await query.answer("🔒 Admin only", show_alert=True)
+            return
         try:
             index = int(data.removeprefix("inbox_open_"))
         except ValueError:
@@ -6978,6 +6998,12 @@ async def handle_mm_callback(update, context, data):
 async def handle_mm_input(update, context):
     mode=context.user_data.get('mm_input'); text=(update.message.text or '').strip()
     if not mode: return False
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        context.user_data.pop('mm_input', None)
+        context.user_data.pop('mm_duration_kind', None)
+        context.user_data.pop('mm_reply_to', None)
+        await update.message.reply_text('🔒 Message Control is available to configured admins only.')
+        return True
     if mode=='block_user':
         if not text.isdigit(): await update.message.reply_text('❌ Send only the numeric Telegram user ID.'); return True
         context.user_data['mm_duration_kind']='user:'+text; context.user_data['mm_input']='duration'; await update.message.reply_text(f'⏱️ Block user {text}. Choose duration:',reply_markup=mm_duration_kb('mm_dur|user:'+text)); return True
