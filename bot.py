@@ -84,12 +84,14 @@ GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
 # ADMIN_IDS in Render remains the trusted owner/admin seed list. Additional admins
 # can be registered with /addadmin and are stored in bot_data.db.
 ADMIN_IDS = []
-admin_ids_str = os.environ.get('ADMIN_IDS', '')
-if admin_ids_str:
-    ADMIN_IDS = sorted({
-        int(x.strip()) for x in re.split(r'[,;\s]+', admin_ids_str)
-        if x.strip().isdigit()
-    })
+# Accept all supported admin environment-variable names at startup. Keeping the
+# startup list in sync with get_admin_ids() avoids owner-only behavior in features
+# that still read ADMIN_IDS directly.
+for _admin_env_name in ("ADMIN_IDS", "BOT_ADMIN_IDS", "ADMIN_ID", "OWNER_ID", "BOT_OWNER_ID"):
+    _admin_ids_raw = os.environ.get(_admin_env_name, "")
+    if _admin_ids_raw:
+        ADMIN_IDS.extend(int(item) for item in re.findall(r"\d+", _admin_ids_raw))
+ADMIN_IDS = sorted(set(uid for uid in ADMIN_IDS if uid > 0))
 
 telethon_client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
@@ -139,9 +141,9 @@ async def myid_command(update, context):
 
 async def addadmin_command(update, context):
     requester = update.effective_user
-    if not requester or requester.id not in ADMIN_IDS:
+    if not requester or not is_admin(requester.id):
         await update.effective_message.reply_text(
-            "🔒 Only an admin listed in Render's ADMIN_IDS can add or remove admins."
+            "🔒 Only an authorized admin can add or remove admins."
         )
         return
     if len(context.args) != 1 or not context.args[0].isdigit():
