@@ -236,15 +236,10 @@ def _add_image_watermark(data, wm):
 
 
 def _remove_image_text(data, target):
-    try:
-        from rapidocr_onnxruntime import RapidOCR
-        engine = RapidOCR()
-        result, _ = engine(np.array(Image.open(BytesIO(data)).convert("RGB")))
-    except Exception as exc:
-        raise RuntimeError("Text recognition is unavailable on this deployment. Install/enable rapidocr_onnxruntime and retry.") from exc
+    rgb, result = _ocr_image_scaled(data)
     if not result:
-        raise RuntimeError("No readable text was detected. Try a clearer, higher-resolution image.")
-    rgb = np.array(Image.open(BytesIO(data)).convert("RGB"))
+        raise RuntimeError("No readable text was detected. Try a clearer image or check the watermark spelling.")
+
     mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
     matches = 0
     for item in result:
@@ -268,16 +263,10 @@ def _remove_image_watermark_auto(data):
     Conservative heuristics prefer diagonal text and text near the image center.
     This is not a semantic watermark detector; users should review the output.
     """
-    try:
-        from rapidocr_onnxruntime import RapidOCR
-        engine = RapidOCR()
-        result, _ = engine(np.array(Image.open(BytesIO(data)).convert("RGB")))
-    except Exception as exc:
-        raise RuntimeError("Automatic OCR is unavailable. Ensure rapidocr_onnxruntime is installed.") from exc
+    rgb, result = _ocr_image_scaled(data)
     if not result:
         raise RuntimeError("No readable text was detected. Try Specific watermark or upload a clearer image.")
 
-    rgb = np.array(Image.open(BytesIO(data)).convert("RGB"))
     height, width = rgb.shape[:2]
     mask = np.zeros((height, width), dtype=np.uint8)
     selected = 0
