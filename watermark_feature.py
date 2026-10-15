@@ -79,9 +79,14 @@ async def watermark_callback(update: Update, context, data):
             context.user_data["state"] = "wm_text_remove"
             await q.message.reply_text("Send the exact watermark text to remove.", reply_markup=_keyboard([[("❌ Cancel", "wm_cancel")]]))
         else:
-            wm["text"] = "watermark"
+            # Auto mode uses OCR/layout heuristics; it must not silently search only
+            # for the literal English word "watermark".
+            wm["text"] = "__AUTO_WATERMARK__"
             context.user_data["state"] = "wm_processing"
-            await q.message.reply_text("🤖 Automatic mode will look for the word watermark. For other visible text, choose Specific watermark.")
+            await q.message.reply_text(
+                "🤖 Scanning for likely watermark text (for example, diagonal or faint text). "
+                "Automatic detection can miss watermarks or select ordinary text, so check the result."
+            )
             await _process_uploaded(q.message, context, wm["file_id"], wm, wm["kind"], wm.get("filename", ""))
         return True
     if data.startswith("wm_type|"):
@@ -257,6 +262,59 @@ def _remove_image_text(data, target):
     return out.getvalue(), matches
 
 
+def _remove_image_watermark_auto(data):
+    """Remove only OCR text regions that look plausibly watermark-like.
+
+    Conservative heuristics prefer diagonal text and text near the image center.
+    This is not a semantic watermark detector; users should review the output.
+    """
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+        engine = RapidOCR()
+        result, _ = engine(np.array(Image.open(BytesIO(data)).convert("RGB")))
+    except Exception as exc:
+        raise RuntimeError("Automatic OCR is unavailable. Ensure rapidocr_onnxruntime is installed.") from exc
+    if not result:
+        raise RuntimeError("No readable text was detected. Try Specific watermark or upload a clearer image.")
+
+    rgb = np.array(Image.open(BytesIO(data)).convert("RGB"))
+    height, width = rgb.shape[:2]
+    mask = np.zeros((height, width), dtype=np.uint8)
+    selected = 0
+    for item in result:
+        try:
+            box, text, score = item
+            pts = np.asarray(box, dtype=np.float32)
+            if pts.shape[0] < 4 or not str(text).strip():
+                continue
+            x1, y1 = pts[0]
+            x2, y2 = pts[1]
+            x3, y3 = pts[2]
+            angle = abs(np.degrees(np.arctan2(y2-y1, x2-x1)))
+            angle = min(angle, abs(180-angle))
+            cx = float(np.mean(pts[:, 0]))
+            cy = float(np.mean(pts[:, 1]))
+            # Watermarks are commonly diagonal or placed across the central area.
+            # Avoid selecting large central blocks that are likely real content.
+            box_w = float(np.max(pts[:, 0]) - np.min(pts[:, 0]))
+            box_h = float(np.max(pts[:, 1]) - np.min(pts[:, 1]))
+            central = 0.25*width < cx < 0.75*width and 0.25*height < cy < 0.75*height
+            diagonal = 8 <= angle <= 82
+            compact = box_w < 0.75*width and box_h < 0.18*height
+            if compact and (diagonal or central):
+                cv2.fillPoly(mask, [pts.astype(np.int32)], 255)
+                selected += 1
+        except Exception:
+            continue
+    if not selected:
+        raise RuntimeError("No likely watermark text was detected automatically. Use Specific watermark text for a safer targeted removal.")
+    mask = cv2.dilate(mask, np.ones((5, 5), np.uint8), iterations=2)
+    repaired = cv2.inpaint(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), mask, 5, cv2.INPAINT_TELEA)
+    out = BytesIO()
+    Image.fromarray(cv2.cvtColor(repaired, cv2.COLOR_BGR2RGB)).save(out, format="PNG")
+    return out.getvalue(), selected
+
+
 def _process_pdf(data, wm):
     doc = pymupdf.open(stream=data, filetype="pdf")
     if not doc.page_count:
@@ -379,13 +437,20 @@ async def _process_uploaded(message, context, file_id, wm, kind, filename=""):
                     check_image.verify()
                 caption = "✅ Watermark added to your image."
             else:
-                await status.edit_text("🔎 Scanning image for the requested watermark text… This can take a little time.")
-                result, count = await asyncio.wait_for(
-                    asyncio.to_thread(_remove_image_text, raw, wm["text"]), timeout=90
-                )
+                if wm.get("remove_mode") == "auto" or wm.get("text") == "__AUTO_WATERMARK__":
+                    await status.edit_text("🤖 Detecting likely watermark text and repairing its background…")
+                    result, count = await asyncio.wait_for(
+                        asyncio.to_thread(_remove_image_watermark_auto, raw), timeout=90
+                    )
+                    caption = f"✅ Automatically repaired {count} likely watermark text region(s). Please review the image; automatic detection can also select ordinary text."
+                else:
+                    await status.edit_text("🔎 Scanning image for the requested watermark text…")
+                    result, count = await asyncio.wait_for(
+                        asyncio.to_thread(_remove_image_text, raw, wm["text"]), timeout=90
+                    )
+                    caption = f"✅ Removed matching text from {count} detected region(s). Some background repair may be visible."
                 with Image.open(BytesIO(result)) as check_image:
                     check_image.verify()
-                caption = f"✅ Removed matching text from {count} detected region(s). Some background repair may be visible."
             output = BytesIO(result)
             output.name = "watermarked_image.png" if wm.get("action") == "add" else "watermark_removed.png"
             await message.reply_document(document=output, filename=output.name, caption=caption)
@@ -397,6 +462,8 @@ async def _process_uploaded(message, context, file_id, wm, kind, filename=""):
             if not result:
                 raise RuntimeError("The PDF processor returned an empty file. Please retry with a smaller PDF.")
             if wm.get("action") == "remove":
+                if wm.get("remove_mode") == "auto" or wm.get("text") == "__AUTO_WATERMARK__":
+                    raise RuntimeError("Automatic PDF watermark removal is not supported safely yet. Use Specific watermark text for selectable PDF text, or convert a scanned page to an image and use Automatic mode.")
                 # PDF text search can find no matches; avoid implying success in that case.
                 with pymupdf.open(stream=raw, filetype="pdf") as check_doc:
                     matches = sum(len(page.search_for(wm["text"])) for page in check_doc)
