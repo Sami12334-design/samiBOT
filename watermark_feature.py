@@ -235,6 +235,36 @@ def _add_image_watermark(data, wm):
     return out.getvalue()
 
 
+def _ocr_image_scaled(data, max_dimension=1600):
+    """Run OCR on a smaller copy to reduce Render CPU/RAM use; keep original for repair."""
+    try:
+        with Image.open(BytesIO(data)) as opened:
+            rgb = np.asarray(ImageOps.exif_transpose(opened).convert("RGB"))
+        height, width = rgb.shape[:2]
+        scale = min(1.0, float(max_dimension) / max(height, width))
+        if scale < 1.0:
+            small_w = max(1, int(width * scale))
+            small_h = max(1, int(height * scale))
+            small = cv2.resize(rgb, (small_w, small_h), interpolation=cv2.INTER_AREA)
+        else:
+            small = rgb
+        from rapidocr_onnxruntime import RapidOCR
+        engine = RapidOCR()
+        result, _ = engine(small)
+        if result and scale < 1.0:
+            scaled_result = []
+            for item in result:
+                scaled_result.append([
+                    (np.asarray(item[0], dtype=np.float32) / scale).tolist(),
+                    item[1],
+                    item[2] if len(item) > 2 else 1.0,
+                ])
+            result = scaled_result
+        return rgb, result
+    except Exception as exc:
+        raise RuntimeError("OCR failed. Check that rapidocr_onnxruntime is installed and try a smaller image.") from exc
+
+
 def _remove_image_text(data, target):
     rgb, result = _ocr_image_scaled(data)
     if not result:
