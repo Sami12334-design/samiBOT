@@ -445,13 +445,21 @@ async def member_add_callback(update, context, data, is_admin, bot, telethon_cli
 async def member_add_text(update, context, telethon_client, is_admin):
     user = update.effective_user
     message = update.effective_message
-    if not user or not message or not is_admin(user.id):
-        if message:
-            await message.reply_text("🔒 Member Add Manager is admin-only.")
-        return True
+    if not user or not message:
+        return False
+
+    # Only claim messages while this user is inside the Member Add conversation.
+    # Other messages (including normal-user password entry) must continue to
+    # the bot's regular handlers instead of being blocked by this admin-only tool.
     state = context.user_data.get("state")
     if state not in ("ma_source", "ma_destination", "ma_quantity", "ma_filter", "ma_confirm"):
         return False
+
+    if not is_admin(user.id):
+        context.user_data["state"] = None
+        context.user_data.pop("ma_draft", None)
+        await message.reply_text("🔒 Member Add Manager is admin-only.")
+        return True
     value = (message.text or "").strip()
     if value.lower() == "/cancel":
         context.user_data["state"] = None
