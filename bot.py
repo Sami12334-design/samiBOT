@@ -797,7 +797,9 @@ def make_feature_command(callback_data, button_text):
     async def feature_command(update, context):
         if not update.message or not update.effective_user:
             return
-        user_id = update.effective_user.id        if not is_authenticated(user_id):            context.user_data['state'] = 'awaiting_password'
+        user_id = update.effective_user.id
+        if not is_authenticated(user_id):
+            context.user_data['state'] = 'awaiting_password'
             await update.message.reply_text(
                 "🔐 TELEGRAM ASSISTANT\n\nPassword required.\nPlease enter the password to continue."
             )
