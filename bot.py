@@ -4804,7 +4804,8 @@ def _story_reaction_text(reaction):
 
 def _story_view_user_name(user):
     if user is None:
-        return "Unknown user"    first = getattr(user, "first_name", None) or ""
+        return "Unknown user"
+    first = getattr(user, "first_name", None) or ""
     last = getattr(user, "last_name", None) or ""
     name = f"{first} {last}".strip()
     username = getattr(user, "username", None)
