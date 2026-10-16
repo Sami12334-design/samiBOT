@@ -44,13 +44,16 @@ def _connect():
             report_message_id INTEGER,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            floodwait_until REAL NOT NULL DEFAULT 0
+            floodwait_until REAL NOT NULL DEFAULT 0,
+            filter_mode TEXT NOT NULL DEFAULT 'all'
         )
     """)
     # Safe schema migration for existing installations.
     columns = {row[1] for row in conn.execute("PRAGMA table_info(member_add_jobs)")}
     if "floodwait_until" not in columns:
         conn.execute("ALTER TABLE member_add_jobs ADD COLUMN floodwait_until REAL NOT NULL DEFAULT 0")
+    if "filter_mode" not in columns:
+        conn.execute("ALTER TABLE member_add_jobs ADD COLUMN filter_mode TEXT NOT NULL DEFAULT 'all'")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS member_add_processed (
             job_id INTEGER NOT NULL,
@@ -65,6 +68,12 @@ def _connect():
 
 def _esc(value):
     return html.escape(str(value or ""))
+
+
+def _is_active_user(user):
+    """Best-effort activity check using only status Telegram exposes to this session."""
+    status = getattr(user, "status", None)
+    return isinstance(status, (types.UserStatusOnline, types.UserStatusRecently))
 
 
 def _keyboard(job_id, status):
@@ -86,6 +95,7 @@ def _job_text(job):
         f"📤 Source: <code>{_esc(job['source_group'])}</code>\n"
         f"📥 Destination: <code>{_esc(job['destination_group'])}</code>\n"
         f"🎯 Target additions: <b>{job['target_count']}</b>\n"
+        f"🧹 Filter: <b>{'Active users' if job['filter_mode'] == 'active' else 'All users'}</b>\n"
         f"✅ Added: <b>{job['added_count']}</b>\n"
         f"⏭️ Skipped/failed: <b>{job['skipped_count']}</b>\n"
         f"🔎 Checked: <b>{job['attempted_count']}</b>\n"
@@ -226,6 +236,9 @@ async def _run_job(job_id, client, bot):
                 break
             if _is_processed(job_id, participant.id):
                 continue
+            if current["filter_mode"] == "active" and not _is_active_user(participant):
+                _mark_processed(job_id, participant.id, "skipped", "Activity status not visible or not active")
+                continue
 
             while True:
                 current = _get_job(job_id)
@@ -337,6 +350,31 @@ async def member_add_callback(update, context, data, is_admin, bot, telethon_cli
     if action == "ma_cancel_setup":
         await member_add_cancel_setup(update, context, is_admin)
         return True
+    if action in ("ma_filter_active", "ma_filter_done"):
+        draft = context.user_data.get("ma_draft") or {}
+        if context.user_data.get("state") != "ma_filter" or not all(
+            draft.get(key) for key in ("source_group", "destination_group", "target_count")
+        ):
+            await query.edit_message_text("❌ Setup expired. Open Member Add and try again.")
+            return True
+        draft["filter_mode"] = "active" if action == "ma_filter_active" else "all"
+        context.user_data["state"] = "ma_confirm"
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Confirm direct-add campaign", callback_data="ma_confirm")],
+            [InlineKeyboardButton("❎ Cancel", callback_data="ma_cancel_setup")],
+        ])
+        filter_label = "Active users only (best-effort Telegram status)" if draft["filter_mode"] == "active" else "No filter (ordinary mode)"
+        await query.edit_message_text(
+            "🧾 <b>Review direct-add campaign</b>\n\n"
+            f"📤 Source: <code>{_esc(draft['source_group'])}</code>\n"
+            f"📥 Destination: <code>{_esc(draft['destination_group'])}</code>\n"
+            f"🎯 Target: <b>{draft['target_count']}</b> successful additions\n"
+            f"🧹 Filter: <b>{_esc(filter_label)}</b>\n\n"
+            "Active status is only available when Telegram exposes it; hidden statuses may be skipped. "
+            "Telegram can still reject invites due to privacy settings or group limits.",
+            parse_mode="HTML", reply_markup=keyboard,
+        )
+        return True
     if action == "ma_confirm":
         draft = context.user_data.get("ma_draft") or {}
         if context.user_data.get("state") != "ma_confirm" or not all(
@@ -358,9 +396,9 @@ async def member_add_callback(update, context, data, is_admin, bot, telethon_cli
             return True
         conn = _connect()
         cur = conn.execute(
-            "INSERT INTO member_add_jobs (created_by, source_group, destination_group, target_count, status, report_chat_id, report_message_id, created_at, updated_at) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?)",
+            "INSERT INTO member_add_jobs (created_by, source_group, destination_group, target_count, status, report_chat_id, report_message_id, created_at, updated_at, filter_mode) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)",
             (user.id, draft["source_group"], draft["destination_group"], int(draft["target_count"]),
-             query.message.chat_id, query.message.message_id, _now(), _now()),
+             query.message.chat_id, query.message.message_id, _now(), _now(), draft.get("filter_mode", "all")),
         )
         job_id = cur.lastrowid
         conn.commit()
@@ -412,7 +450,7 @@ async def member_add_text(update, context, telethon_client, is_admin):
             await message.reply_text("🔒 Member Add Manager is admin-only.")
         return True
     state = context.user_data.get("state")
-    if state not in ("ma_source", "ma_destination", "ma_quantity", "ma_confirm"):
+    if state not in ("ma_source", "ma_destination", "ma_quantity", "ma_filter", "ma_confirm"):
         return False
     value = (message.text or "").strip()
     if value.lower() == "/cancel":
@@ -447,18 +485,20 @@ async def member_add_text(update, context, telethon_client, is_admin):
             await message.reply_text(f"❌ Enter a whole number from 1 to {MAX_TARGET}.")
             return True
         draft["target_count"] = int(value)
-        context.user_data["state"] = "ma_confirm"
+        context.user_data["state"] = "ma_filter"
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Confirm direct-add campaign", callback_data="ma_confirm")],
+            [InlineKeyboardButton("🟢 Active Users", callback_data="ma_filter_active")],
+            [InlineKeyboardButton("➡️ Done — use ordinary mode", callback_data="ma_filter_done")],
             [InlineKeyboardButton("❎ Cancel", callback_data="ma_cancel_setup")],
         ])
         await message.reply_text(
-            "🧾 <b>Review direct-add campaign</b>\n\n"
+            "🧹 <b>Choose member filter</b>\n\n"
             f"📤 Source: <code>{_esc(draft['source_group'])}</code>\n"
             f"📥 Destination: <code>{_esc(draft['destination_group'])}</code>\n"
             f"🎯 Target: <b>{draft['target_count']}</b> successful additions\n\n"
-            "SamiBOT uses the logged-in Telegram user session. Telegram will reject users whose privacy settings "
-            "or account/group limits prevent direct addition. The bot will not retry rejected users or bypass those restrictions.",
+            "🟢 <b>Active Users</b> — attempt users whose Telegram status is shown as online/recently active. "
+            "Telegram may hide some statuses, so this is best-effort.\n"
+            "➡️ <b>Done</b> — continue the original process without filtering.",
             parse_mode="HTML",
             reply_markup=keyboard,
         )
