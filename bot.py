@@ -26,7 +26,7 @@ from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageChops
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InlineQueryResultArticle, InputTextMessageContent, BotCommand
 from telegram.constants import ParseMode
 from telegram.error import Conflict
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes, InlineQueryHandler, TypeHandler, ApplicationHandlerStop
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes, InlineQueryHandler, TypeHandler, ApplicationHandlerStop, ChatJoinRequestHandler
 from telethon import TelegramClient, events, functions, types
 from telethon.sessions import StringSession
 from telethon.utils import get_peer_id
@@ -49,6 +49,7 @@ import qrcode
 from ai_media_detector import analyze_image_bytes, analyze_audio_bytes, format_detection_result, DetectorError
 from watermark_feature import watermark_start, watermark_callback, watermark_text_input, watermark_photo_input, watermark_document_input
 from fayda_printing import register_fayda_printing
+from member_add_feature import member_add_start, member_add_callback, member_add_text, member_add_join_request, member_add_cancel_setup
 
 try:
     from telethon.tl.functions.stories import GetPeerStoriesRequest, GetStoriesByIDRequest
@@ -775,6 +776,7 @@ async def start(update, context):
             [InlineKeyboardButton("📥 Inbox", callback_data="inbox"), InlineKeyboardButton("💬 Message Control", callback_data="message_manager")],
             [InlineKeyboardButton("🤖 Auto Responder", callback_data="auto_responder")],
             [InlineKeyboardButton("💧 Watermark Studio", callback_data="watermark")],
+            [InlineKeyboardButton("👥 Member Add Manager", callback_data="member_add")],
             [InlineKeyboardButton("🪪 Fayida / National ID Printer", callback_data="fayda_open")],
             [InlineKeyboardButton("👤 Profile", callback_data="profile")],
             [InlineKeyboardButton("👀 Profile Visitors", callback_data="profile_visitors"), InlineKeyboardButton("📖 Story Viewers", callback_data="story_viewers")],
@@ -1410,6 +1412,16 @@ async def menu_callback(update, context):
         await handle_whisper_callback(update, context, query.data.split("|", 1)[1])
         return
     data = query.data
+    if data == "member_add":
+        await member_add_start(update, context, is_admin)
+        return
+    if data == "ma_cancel_setup":
+        await member_add_cancel_setup(update, context, is_admin)
+        return
+    if data.startswith("ma_"):
+        handled = await member_add_callback(update, context, data, is_admin, context.bot)
+        if handled:
+            return
     # Message Manager and Auto Responder handlers answer their own callback
     # queries. Avoid answering those queries twice here, which can abort their
     # handler before the menu is rendered or the action is applied.
@@ -8235,6 +8247,7 @@ async def handle_link(update, context):
     if await _auto_detect_uploaded_media(update, context): return
     self_ping()
     state = context.user_data.get("state")
+    if await member_add_text(update, context, telethon_client, is_admin): return
     if await watermark_text_input(update, context): return
     if state in ("awaiting_crop_width", "awaiting_crop_height"):
         raw = (text or "").strip()
@@ -8581,6 +8594,7 @@ async def main():
     bot_app.add_handler(CommandHandler("setdesc", set_bot_description))
     bot_app.add_handler(CommandHandler("setphoto", set_bot_photo))
     bot_app.add_handler(CommandHandler("restart", restart_command))
+    bot_app.add_handler(ChatJoinRequestHandler(member_add_join_request))
     bot_app.add_handler(CallbackQueryHandler(menu_callback))
     bot_app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, safety_group_monitor), group=-1)
     async def photo_router(update, context):
