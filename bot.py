@@ -797,8 +797,7 @@ def make_feature_command(callback_data, button_text):
     async def feature_command(update, context):
         if not update.message or not update.effective_user:
             return
-        user_id = update.effective_user.id        if not is_authenticated(user_id):
-            context.user_data['state'] = 'awaiting_password'
+        user_id = update.effective_user.id        if not is_authenticated(user_id):            context.user_data['state'] = 'awaiting_password'
             await update.message.reply_text(
                 "🔐 TELEGRAM ASSISTANT\n\nPassword required.\nPlease enter the password to continue."
             )
@@ -1597,8 +1596,7 @@ async def menu_callback(update, context):
         await display_search_page(update, context, 1, filter_type)
         return
     if data.startswith("search_page_"):
-        try:
-            page = int(data.removeprefix("search_page_"))
+        try:            page = int(data.removeprefix("search_page_"))
         except ValueError:
             page = 1
         filter_type = context.user_data.get("search_filter", "all")
@@ -2397,8 +2395,7 @@ async def handle_image_convert(update, context, fmt):
         context.user_data['state'] = None
 # --- DOCUMENT CONVERSION ---
 async def handle_pdf_to_pptx(update, context):
-    if context.user_data.get('state') != 'awaiting_doc_pdf_pptx': return
-    if not update.message.document:
+    if context.user_data.get('state') != 'awaiting_doc_pdf_pptx': return    if not update.message.document:
         await update.message.reply_text("❌ Please upload a PDF file.")
         return
     if update.message.document.mime_type != "application/pdf":
@@ -3180,7 +3177,7 @@ def extract_ytdlp_info(url: str):
     # Only if that native strategy fails do we try a small set of known
     # no-PO-token / fallback clients. android_vr is intentionally NOT forced:
     # current yt-dlp marks its GVS formats as PO-token-sensitive.
-    clients = ["default", "tv", "web_safari", "web_embedded", "tv_simply"]
+    clients = ["default", "mweb", "web_safari", "web_embedded", "tv", "tv_simply"]
     errors = []
 
     for client in clients:
@@ -3197,8 +3194,7 @@ def extract_ytdlp_info(url: str):
                 info = ydl.extract_info(url, download=False)
             if info:
                 info["__sami_youtube_client"] = client
-                return info
-        except Exception as exc:
+                return info        except Exception as exc:
             errors.append(f"{client}: {exc}")
 
     raise RuntimeError("YouTube yt-dlp clients failed: " + " | ".join(errors[-4:]))
@@ -3221,7 +3217,7 @@ def ytdlp_download(url: str, output_dir: str, *, height=None, audio=False, title
     # Native/default strategy first. The old implementation started with
     # android_vr/web_embedded/web_safari, which is exactly the pattern that is
     # now failing on the user's Render deployment.
-    clients = ["default", "tv", "web_safari", "web_embedded", "tv_simply"] if platform == "youtube" else [None]
+    clients = ["default", "mweb", "web_safari", "web_embedded", "tv", "tv_simply"] if platform == "youtube" else [None]
     errors = []
     for client in clients:
         try:
@@ -3997,8 +3993,7 @@ async def send_pdf_filtered_pages(query_or_update, context, pages=None):
     Text pages become Telegram text and scanned/image pages become Telegram images.
     """
     pdf_bytes = context.user_data.get("pdf_bytes")
-    if not pdf_bytes:
-        await query_or_update.message.reply_text("❌ PDF session expired. Please upload it again.")
+    if not pdf_bytes:        await query_or_update.message.reply_text("❌ PDF session expired. Please upload it again.")
         context.user_data["state"] = None
         return
 
@@ -4799,7 +4794,6 @@ def _story_reaction_text(reaction):
         return f"custom emoji {document_id}"
     return "reaction"
 
-
 def _story_view_user_name(user):
     if user is None:
         return "Unknown user"    first = getattr(user, "first_name", None) or ""
@@ -5598,7 +5592,6 @@ def _search_cache_key(query):
 async def _search_discover_public_peers(query):
     """
     STEP 1 — AGGRESSIVE GLOBAL DIRECTORY DISCOVERY
-
     Telegram's contacts.SearchRequest is the discovery source. It returns
     public channels/supergroups even when the account has not joined them.
     No iter_dialogs(), local dialog cache, or admin chat list is used.
@@ -6397,8 +6390,7 @@ async def display_search_page(update, context, page, filter_type=None):
 
     markup = InlineKeyboardMarkup(
         _search_filter_buttons(
-            results,
-            active,
+            results,            active,
             search_query,
             page,            total_pages,
         )
@@ -7197,8 +7189,7 @@ async def _resolve_common_user(raw_query):
     previously learned the user's access hash. A username is preferred.
     """
     raw = re.sub(r"\s+", " ", (raw_query or "").strip())
-    if not raw:
-        raise ValueError("Please enter a Telegram username or numeric user ID.")
+    if not raw:        raise ValueError("Please enter a Telegram username or numeric user ID.")
     clean = raw
     if clean.startswith("https://t.me/") or clean.startswith("http://t.me/"):
         clean = clean.split("t.me/", 1)[1].split("/", 1)[0]
@@ -7997,8 +7988,7 @@ def _model_ai_score(image_path):
             candidate = 1.0 - score
             ai_score = candidate if ai_score is None else ai_score
             if not best_label:
-                best_label = label
-    if ai_score is None:        top = results[0]
+                best_label = label    if ai_score is None:        top = results[0]
         ai_score = float(top.get("score", 0.0))
         best_label = str(top.get("label", "unknown"))
     return max(0.0, min(1.0, ai_score)), best_label, results
