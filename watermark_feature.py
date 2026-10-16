@@ -2,6 +2,7 @@
 import asyncio
 import os
 import re
+import threading
 from io import BytesIO
 
 import pymupdf
@@ -12,6 +13,8 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 
 _MAX_MEDIA_BYTES = 18 * 1024 * 1024
+_OCR_ENGINE = None
+_OCR_ENGINE_LOCK = threading.Lock()
 _POSITIONS = {
     "top_left": ("Top left", "tl"),
     "top_center": ("Top center", "tc"),
@@ -235,34 +238,38 @@ def _add_image_watermark(data, wm):
     return out.getvalue()
 
 
-def _ocr_image_scaled(data, max_dimension=1600):
-    """Run OCR on a smaller copy to reduce Render CPU/RAM use; keep original for repair."""
+def _ocr_image_scaled(data, max_dimension=1200):
+    """Reuse the OCR model and scan a resized copy to reduce Render CPU/RAM use."""
+    global _OCR_ENGINE
     try:
         with Image.open(BytesIO(data)) as opened:
             rgb = np.asarray(ImageOps.exif_transpose(opened).convert("RGB"))
         height, width = rgb.shape[:2]
         scale = min(1.0, float(max_dimension) / max(height, width))
         if scale < 1.0:
-            small_w = max(1, int(width * scale))
-            small_h = max(1, int(height * scale))
-            small = cv2.resize(rgb, (small_w, small_h), interpolation=cv2.INTER_AREA)
+            small = cv2.resize(
+                rgb, (max(1, int(width * scale)), max(1, int(height * scale))),
+                interpolation=cv2.INTER_AREA
+            )
         else:
             small = rgb
-        from rapidocr_onnxruntime import RapidOCR
-        engine = RapidOCR()
-        result, _ = engine(small)
+        # Load the expensive OCR model only once per bot process.
+        with _OCR_ENGINE_LOCK:
+            if _OCR_ENGINE is None:
+                from rapidocr_onnxruntime import RapidOCR
+                _OCR_ENGINE = RapidOCR()
+            result, _ = _OCR_ENGINE(small)
         if result and scale < 1.0:
-            scaled_result = []
-            for item in result:
-                scaled_result.append([
-                    (np.asarray(item[0], dtype=np.float32) / scale).tolist(),
-                    item[1],
-                    item[2] if len(item) > 2 else 1.0,
-                ])
-            result = scaled_result
+            result = [[
+                (np.asarray(item[0], dtype=np.float32) / scale).tolist(),
+                item[1],
+                item[2] if len(item) > 2 else 1.0,
+            ] for item in result]
         return rgb, result
     except Exception as exc:
-        raise RuntimeError("OCR failed. Check that rapidocr_onnxruntime is installed and try a smaller image.") from exc
+        raise RuntimeError(
+            "OCR failed. Check that rapidocr_onnxruntime is installed and try a smaller image."
+        ) from exc
 
 
 def _remove_image_text(data, target):
@@ -465,7 +472,7 @@ async def _process_uploaded(message, context, file_id, wm, kind, filename=""):
                 else:
                     await status.edit_text("🔎 Scanning image for the requested watermark text…")
                     result, count = await asyncio.wait_for(
-                        asyncio.to_thread(_remove_image_text, raw, wm["text"]), timeout=90
+                        asyncio.to_thread(_remove_image_text, raw, wm["text"]), timeout=180
                     )
                     caption = f"✅ Removed matching text from {count} detected region(s). Some background repair may be visible."
                 with Image.open(BytesIO(result)) as check_image:
