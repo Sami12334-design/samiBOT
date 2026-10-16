@@ -1598,7 +1598,8 @@ async def menu_callback(update, context):
         await display_search_page(update, context, 1, filter_type)
         return
     if data.startswith("search_page_"):
-        try:            page = int(data.removeprefix("search_page_"))
+        try:
+            page = int(data.removeprefix("search_page_"))
         except ValueError:
             page = 1
         filter_type = context.user_data.get("search_filter", "all")
@@ -7997,7 +7998,9 @@ def _model_ai_score(image_path):
             candidate = 1.0 - score
             ai_score = candidate if ai_score is None else ai_score
             if not best_label:
-                best_label = label    if ai_score is None:        top = results[0]
+                best_label = label
+    if ai_score is None:
+        top = results[0]
         ai_score = float(top.get("score", 0.0))
         best_label = str(top.get("label", "unknown"))
     return max(0.0, min(1.0, ai_score)), best_label, results
