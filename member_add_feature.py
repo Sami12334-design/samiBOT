@@ -152,7 +152,7 @@ async def _run_job(job_id, client, bot):
             try:
                 await client(functions.channels.InviteToChannelRequest(
                     channel=destination,
-                    users=[await client.get_input_entity(participant)],
+                    users=[types.InputUser(user_id=participant.id, access_hash=participant.access_hash)],
                 ))
                 added += 1
                 _set_job(
