@@ -797,8 +797,7 @@ def make_feature_command(callback_data, button_text):
     async def feature_command(update, context):
         if not update.message or not update.effective_user:
             return
-        user_id = update.effective_user.id
-        if not is_authenticated(user_id):
+        user_id = update.effective_user.id        if not is_authenticated(user_id):
             context.user_data['state'] = 'awaiting_password'
             await update.message.reply_text(
                 "🔐 TELEGRAM ASSISTANT\n\nPassword required.\nPlease enter the password to continue."
@@ -1597,7 +1596,6 @@ async def menu_callback(update, context):
         context.user_data["search_page"] = 1
         await display_search_page(update, context, 1, filter_type)
         return
-
     if data.startswith("search_page_"):
         try:
             page = int(data.removeprefix("search_page_"))
@@ -2397,7 +2395,6 @@ async def handle_image_convert(update, context, fmt):
     except Exception as e:
         await status_msg.edit_text(f"❌ Conversion failed: {e}")
         context.user_data['state'] = None
-
 # --- DOCUMENT CONVERSION ---
 async def handle_pdf_to_pptx(update, context):
     if context.user_data.get('state') != 'awaiting_doc_pdf_pptx': return
@@ -3139,14 +3136,24 @@ def ytdlp_base_options():
                 options["js_runtimes"] = {runtime_name: {"path": runtime_path}}
                 break
 
-    # Optional remote BgUtils PO-token provider. Set YTDLP_POT_PROVIDER_URL
-    # to the private URL of the bgutil provider service (port 4416).
-    # The provider plugin is installed from requirements.txt.
+    # BgUtils PO-token provider: prefer an explicitly configured HTTP endpoint;
+    # otherwise use the local generation script installed by render-build.sh.
+    # This keeps the provider private and only affects yt-dlp (YouTube) options.
     pot_provider_url = os.getenv("YTDLP_POT_PROVIDER_URL", "").strip().rstrip("/")
     if pot_provider_url:
         options.setdefault("extractor_args", {}).setdefault(
             "youtubepot-bgutilhttp", {}
         )["base_url"] = [pot_provider_url]
+    else:
+        local_pot_server_home = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "bgutil-ytdlp-pot-provider",
+            "server",
+        )
+        if os.path.isdir(os.path.join(local_pot_server_home, "src")):
+            options.setdefault("extractor_args", {}).setdefault(
+                "youtubepot-bgutilscript", {}
+            )["server_home"] = [local_pot_server_home]
 
     # IMPORTANT: Do not force a hard-coded YouTube player client here.
     # Current yt-dlp has its own adaptive client strategy (currently starting
@@ -3197,8 +3204,7 @@ def extract_ytdlp_info(url: str):
     raise RuntimeError("YouTube yt-dlp clients failed: " + " | ".join(errors[-4:]))
 
 
-def build_ytdlp_format(height=None, audio=False, platform="unknown"):
-    if audio:
+def build_ytdlp_format(height=None, audio=False, platform="unknown"):    if audio:
         return "bestaudio/best"
     if height:
         if platform == "youtube":
@@ -3997,8 +4003,7 @@ async def send_pdf_filtered_pages(query_or_update, context, pages=None):
         return
 
     status = await query_or_update.message.reply_text("📄 Reading the PDF content…")
-    try:
-        pdf_bytes.seek(0)
+    try:        pdf_bytes.seek(0)
         doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
         total = len(doc)
 
@@ -4797,8 +4802,7 @@ def _story_reaction_text(reaction):
 
 def _story_view_user_name(user):
     if user is None:
-        return "Unknown user"
-    first = getattr(user, "first_name", None) or ""
+        return "Unknown user"    first = getattr(user, "first_name", None) or ""
     last = getattr(user, "last_name", None) or ""
     name = f"{first} {last}".strip()
     username = getattr(user, "username", None)
@@ -5597,7 +5601,6 @@ async def _search_discover_public_peers(query):
 
     Telegram's contacts.SearchRequest is the discovery source. It returns
     public channels/supergroups even when the account has not joined them.
-
     No iter_dialogs(), local dialog cache, or admin chat list is used.
     """
     found = {}
@@ -6397,8 +6400,7 @@ async def display_search_page(update, context, page, filter_type=None):
             results,
             active,
             search_query,
-            page,
-            total_pages,
+            page,            total_pages,
         )
     )
 
@@ -7197,7 +7199,6 @@ async def _resolve_common_user(raw_query):
     raw = re.sub(r"\s+", " ", (raw_query or "").strip())
     if not raw:
         raise ValueError("Please enter a Telegram username or numeric user ID.")
-
     clean = raw
     if clean.startswith("https://t.me/") or clean.startswith("http://t.me/"):
         clean = clean.split("t.me/", 1)[1].split("/", 1)[0]
@@ -7997,8 +7998,7 @@ def _model_ai_score(image_path):
             ai_score = candidate if ai_score is None else ai_score
             if not best_label:
                 best_label = label
-    if ai_score is None:
-        top = results[0]
+    if ai_score is None:        top = results[0]
         ai_score = float(top.get("score", 0.0))
         best_label = str(top.get("label", "unknown"))
     return max(0.0, min(1.0, ai_score)), best_label, results
