@@ -1419,7 +1419,7 @@ async def menu_callback(update, context):
         await member_add_cancel_setup(update, context, is_admin)
         return
     if data.startswith("ma_"):
-        handled = await member_add_callback(update, context, data, is_admin, context.bot)
+        handled = await member_add_callback(update, context, data, is_admin, context.bot, telethon_client)
         if handled:
             return
     # Message Manager and Auto Responder handlers answer their own callback

@@ -1,37 +1,57 @@
-"""Consent-based Member Add Manager for SamiBOT.
+"""Direct Member Add Manager for SamiBOT.
 
-This feature never scrapes a source group's member list or bulk-adds people.
-It uses destination join-request links so users actively request to join.
+Uses the authenticated Telethon user session to invite eligible source-group
+members one at a time. Telegram remains authoritative: users whose privacy
+settings do not permit the invite are skipped. Jobs are rate-limited and
+support pause, resume, cancel, and progress reporting.
 """
+import asyncio
+import html
 import sqlite3
+import time
 from datetime import datetime, timezone
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telethon import functions, types
+from telethon.errors import FloodWaitError, RPCError
 
 DB_PATH = "bot_data.db"
-MAX_TARGET = 5000
+MAX_TARGET = 500
+INVITE_DELAY_SECONDS = 3
+MAX_SOURCE_SCAN = 20000
+
+
+def _now():
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _connect():
     conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS member_invite_jobs (
+        CREATE TABLE IF NOT EXISTS member_add_jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_by INTEGER NOT NULL,
             source_group TEXT NOT NULL,
             destination_group TEXT NOT NULL,
             target_count INTEGER NOT NULL,
-            approved_count INTEGER NOT NULL DEFAULT 0,
+            attempted_count INTEGER NOT NULL DEFAULT 0,
+            added_count INTEGER NOT NULL DEFAULT 0,
+            skipped_count INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'active',
-            invite_link TEXT NOT NULL,
-            bot_created_link INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT NOT NULL DEFAULT '',
+            report_chat_id INTEGER,
+            report_message_id INTEGER,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
     """)
     conn.commit()
     return conn
+
+
+def _esc(value):
+    return html.escape(str(value or ""))
 
 
 def _keyboard(job_id, status):
@@ -41,28 +61,133 @@ def _keyboard(job_id, status):
     elif status == "paused":
         rows.append([InlineKeyboardButton("▶️ Resume", callback_data=f"ma_resume|{job_id}")])
     if status in ("active", "paused"):
-        rows.append([InlineKeyboardButton("🛑 Cancel campaign", callback_data=f"ma_cancel|{job_id}")])
+        rows.append([InlineKeyboardButton("🛑 Cancel", callback_data=f"ma_cancel|{job_id}")])
     rows.append([InlineKeyboardButton("🔄 Refresh", callback_data=f"ma_refresh|{job_id}")])
     return InlineKeyboardMarkup(rows)
 
 
 def _job_text(job):
+    target = max(1, int(job["target_count"]))
     return (
-        "👥 <b>MEMBER ADD MANAGER</b>\n\n"
-        f"📤 Source group: <code>{_esc(job['source_group'])}</code>\n"
+        "👥 <b>DIRECT MEMBER ADD</b>\n\n"
+        f"📤 Source: <code>{_esc(job['source_group'])}</code>\n"
         f"📥 Destination: <code>{_esc(job['destination_group'])}</code>\n"
-        f"🎯 Requested joins: <b>{job['target_count']}</b>\n"
-        f"✅ Approved join requests: <b>{job['approved_count']}</b>\n"
-        f"📊 Progress: <b>{min(100, int(job['approved_count'] * 100 / max(1, job['target_count'])))}%</b>\n"
-        f"🔔 Status: <b>{job['status'].upper()}</b>\n\n"
-        "People join only after they open the invite and submit a join request. "
-        "No one is added without their action."
+        f"🎯 Target additions: <b>{job['target_count']}</b>\n"
+        f"✅ Added: <b>{job['added_count']}</b>\n"
+        f"⏭️ Skipped/failed: <b>{job['skipped_count']}</b>\n"
+        f"🔎 Checked: <b>{job['attempted_count']}</b>\n"
+        f"📊 Target progress: <b>{min(100, int(job['added_count'] * 100 / target))}%</b>\n"
+        f"🔔 Status: <b>{_esc(job['status']).upper()}</b>\n"
+        + (f"⚠️ Last issue: <code>{_esc(job['last_error'])}</code>\n" if job["last_error"] else "")
+        + "\nTelegram may reject users due to privacy settings, membership limits, or group permissions. "
+          "Those users are skipped; SamiBOT does not bypass these restrictions."
     )
 
 
-def _esc(value):
-    import html
-    return html.escape(str(value or ""))
+def _get_job(job_id):
+    conn = _connect()
+    job = conn.execute("SELECT * FROM member_add_jobs WHERE id=?", (job_id,)).fetchone()
+    conn.close()
+    return job
+
+
+def _set_job(job_id, **values):
+    if not values:
+        return
+    conn = _connect()
+    fields = list(values)
+    assignments = ", ".join(f"{field}=?" for field in fields)
+    conn.execute(
+        f"UPDATE member_add_jobs SET {assignments}, updated_at=? WHERE id=?",
+        [values[field] for field in fields] + [_now(), job_id],
+    )
+    conn.commit()
+    conn.close()
+
+
+async def _report(job_id, bot, force=False):
+    job = _get_job(job_id)
+    if not job:
+        return
+    try:
+        await bot.edit_message_text(
+            chat_id=job["report_chat_id"],
+            message_id=job["report_message_id"],
+            text=_job_text(job),
+            parse_mode="HTML",
+            reply_markup=_keyboard(job_id, job["status"]),
+        )
+    except Exception:
+        # Message may have been deleted; progress remains persisted in SQLite.
+        pass
+
+
+async def _run_job(job_id, client, bot):
+    job = _get_job(job_id)
+    if not job:
+        return
+    try:
+        source = await client.get_entity(job["source_group"])
+        destination = await client.get_entity(job["destination_group"])
+        added = int(job["added_count"])
+        scanned = 0
+        async for participant in client.iter_participants(source):
+            current = _get_job(job_id)
+            if not current or current["status"] == "cancelled":
+                break
+            while current and current["status"] == "paused":
+                await asyncio.sleep(2)
+                current = _get_job(job_id)
+            if not current or current["status"] == "cancelled":
+                break
+            if current["status"] not in ("active",):
+                break
+            if added >= int(current["target_count"]):
+                _set_job(job_id, status="completed")
+                break
+            scanned += 1
+            if scanned > MAX_SOURCE_SCAN:
+                _set_job(job_id, status="completed", last_error="Source scan limit reached")
+                break
+            try:
+                await client(functions.channels.InviteToChannelRequest(
+                    channel=destination,
+                    users=[types.InputUser(user_id=participant.id, access_hash=participant.access_hash)],
+                ))
+                added += 1
+                _set_job(
+                    job_id,
+                    added_count=added,
+                    attempted_count=int(current["attempted_count"]) + 1,
+                    last_error="",
+                )
+            except FloodWaitError as exc:
+                wait_seconds = int(getattr(exc, "seconds", 30))
+                _set_job(job_id, last_error=f"Telegram FloodWait: waiting {wait_seconds}s before continuing")
+                await _report(job_id, bot, True)
+                await asyncio.sleep(wait_seconds)
+                latest = _get_job(job_id)
+                if latest and latest["status"] == "active":
+                    _set_job(job_id, last_error="")
+            except Exception as exc:
+                name = type(exc).__name__
+                _set_job(
+                    job_id,
+                    skipped_count=int(current["skipped_count"]) + 1,
+                    attempted_count=int(current["attempted_count"]) + 1,
+                    last_error=name,
+                )
+            latest = _get_job(job_id)
+            if latest and (int(latest["attempted_count"]) % 5 == 0 or added >= int(latest["target_count"])):
+                await _report(job_id, bot)
+            await asyncio.sleep(INVITE_DELAY_SECONDS)
+        latest = _get_job(job_id)
+        if latest and latest["status"] == "active":
+            final_status = "completed" if int(latest["added_count"]) >= int(latest["target_count"]) else "completed"
+            _set_job(job_id, status=final_status)
+    except Exception as exc:
+        _set_job(job_id, status="failed", last_error=f"{type(exc).__name__}: {str(exc)[:120]}")
+    await _report(job_id, bot, True)
 
 
 async def member_add_start(update, context, is_admin):
@@ -77,15 +202,15 @@ async def member_add_start(update, context, is_admin):
     context.user_data["state"] = "ma_source"
     context.user_data["ma_draft"] = {}
     await query.edit_message_text(
-        "👥 <b>MEMBER ADD MANAGER</b>\n\n"
+        "👥 <b>DIRECT MEMBER ADD</b>\n\n"
         "Step 1/3 — Send the source group's public @username or t.me link. "
-        "SamiBOT will validate the group but will not scrape its member list.\n\n"
+        "SamiBOT will check source members and let Telegram enforce each user's invite privacy.\n\n"
         "Send /cancel to stop.",
         parse_mode="HTML",
     )
 
 
-async def member_add_callback(update, context, data, is_admin, bot):
+async def member_add_callback(update, context, data, is_admin, bot, telethon_client=None):
     query = update.callback_query
     user = update.effective_user
     if not user or not is_admin(user.id):
@@ -96,69 +221,57 @@ async def member_add_callback(update, context, data, is_admin, bot):
     if action == "member_add":
         await member_add_start(update, context, is_admin)
         return True
+    if action == "ma_cancel_setup":
+        await member_add_cancel_setup(update, context, is_admin)
+        return True
     if action == "ma_confirm":
         draft = context.user_data.get("ma_draft") or {}
         if context.user_data.get("state") != "ma_confirm" or not all(
-            draft.get(k) for k in ("source_group", "destination_group", "target_count")
+            draft.get(key) for key in ("source_group", "destination_group", "target_count")
         ):
-            await query.edit_message_text("❌ Setup expired. Open Member Add Manager and try again.")
+            await query.edit_message_text("❌ Setup expired. Open Member Add and try again.")
             return True
-        dest = draft["destination_group"]
+        if telethon_client is None or not telethon_client.is_connected():
+            await query.edit_message_text("❌ SamiBOT's Telegram user session is not connected. Check Render logs and STRING_SESSION.")
+            return True
         try:
-            invite = await bot.create_chat_invite_link(
-                chat_id=dest,
-                creates_join_request=True,
-                name=f"SamiBOT consent job {user.id}",
-            )
-            link = invite.invite_link
-            bot_created = 1
+            source = await telethon_client.get_entity(draft["source_group"])
+            destination = await telethon_client.get_entity(draft["destination_group"])
+            if not isinstance(destination, types.Channel) or not getattr(destination, "megagroup", False):
+                await query.edit_message_text("❌ Destination must be a supergroup, not a broadcast channel.")
+                return True
         except Exception as exc:
-            context.user_data["state"] = "ma_invite_link"
-            context.user_data["ma_last_error"] = type(exc).__name__
-            await query.edit_message_text(
-                "⚠️ SamiBOT cannot create a join-request link for that destination.\n\n"
-                "Please make sure the destination group is a supergroup and either grant the bot "
-                "<code>Invite Users</code> permission, or send an existing destination invite link "
-                "that you control. I will not try to bypass Telegram permissions.\n\n"
-                "Send /cancel to stop.",
-                parse_mode="HTML",
-            )
+            await query.edit_message_text(f"❌ Could not validate groups: {_esc(type(exc).__name__)}")
             return True
-        now = datetime.now(timezone.utc).isoformat()
         conn = _connect()
         cur = conn.execute(
-            "INSERT INTO member_invite_jobs "
-            "(created_by, source_group, destination_group, target_count, approved_count, status, invite_link, bot_created_link, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, 0, 'active', ?, ?, ?, ?)",
-            (user.id, draft["source_group"], dest, int(draft["target_count"]), link, bot_created, now, now),
+            "INSERT INTO member_add_jobs (created_by, source_group, destination_group, target_count, status, report_chat_id, report_message_id, created_at, updated_at) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?)",
+            (user.id, draft["source_group"], draft["destination_group"], int(draft["target_count"]),
+             query.message.chat_id, query.message.message_id, _now(), _now()),
         )
         job_id = cur.lastrowid
         conn.commit()
-        job = conn.execute("SELECT * FROM member_invite_jobs WHERE id=?", (job_id,)).fetchone()
         conn.close()
         context.user_data["state"] = None
         context.user_data.pop("ma_draft", None)
         await query.edit_message_text(
-            _job_text(job) + f"\n\n🔗 <b>Join-request link</b>\n{_esc(link)}",
+            _job_text(_get_job(job_id)),
             parse_mode="HTML",
             reply_markup=_keyboard(job_id, "active"),
-            disable_web_page_preview=True,
         )
+        context.application.create_task(_run_job(job_id, telethon_client, bot), name=f"member-add-{job_id}")
         return True
-    if action == "ma_pause" or action == "ma_resume" or action == "ma_cancel" or action == "ma_refresh":
+    if action in ("ma_pause", "ma_resume", "ma_cancel", "ma_refresh"):
         try:
             job_id = int(parts[1])
         except (IndexError, ValueError):
             await query.answer("Invalid job.", show_alert=True)
             return True
-        conn = _connect()
-        job = conn.execute("SELECT * FROM member_invite_jobs WHERE id=?", (job_id,)).fetchone()
+        job = _get_job(job_id)
         if not job:
-            conn.close()
             await query.answer("Job not found.", show_alert=True)
             return True
         if int(job["created_by"]) != user.id and not is_admin(user.id):
-            conn.close()
             await query.answer("Not authorized.", show_alert=True)
             return True
         status = job["status"]
@@ -168,21 +281,11 @@ async def member_add_callback(update, context, data, is_admin, bot):
             status = "active"
         elif action == "ma_cancel" and status in ("active", "paused"):
             status = "cancelled"
-        now = datetime.now(timezone.utc).isoformat()
-        conn.execute("UPDATE member_invite_jobs SET status=?, updated_at=? WHERE id=?", (status, now, job_id))
-        conn.commit()
-        job = conn.execute("SELECT * FROM member_invite_jobs WHERE id=?", (job_id,)).fetchone()
-        conn.close()
-        if action == "ma_cancel" and job["bot_created_link"]:
-            try:
-                await bot.revoke_chat_invite_link(job["destination_group"], job["invite_link"])
-            except Exception:
-                pass
+        _set_job(job_id, status=status)
         await query.edit_message_text(
-            _job_text(job) + f"\n\n🔗 <b>Invite link</b>\n{_esc(job['invite_link'])}",
+            _job_text(_get_job(job_id)),
             parse_mode="HTML",
             reply_markup=_keyboard(job_id, status),
-            disable_web_page_preview=True,
         )
         return True
     return False
@@ -196,7 +299,7 @@ async def member_add_text(update, context, telethon_client, is_admin):
             await message.reply_text("🔒 Member Add Manager is admin-only.")
         return True
     state = context.user_data.get("state")
-    if state not in ("ma_source", "ma_destination", "ma_quantity", "ma_confirm", "ma_invite_link"):
+    if state not in ("ma_source", "ma_destination", "ma_quantity", "ma_confirm"):
         return False
     value = (message.text or "").strip()
     if value.lower() == "/cancel":
@@ -207,27 +310,24 @@ async def member_add_text(update, context, telethon_client, is_admin):
     draft = context.user_data.setdefault("ma_draft", {})
     if state == "ma_source":
         try:
-            entity = await telethon_client.get_entity(value)
-            if not (getattr(entity, "megagroup", False) or getattr(entity, "broadcast", False) or hasattr(entity, "participants_count")):
-                await message.reply_text("❌ That does not look like a Telegram group/channel. Send its @username or link.")
-                return True
+            await telethon_client.get_entity(value)
             draft["source_group"] = value
             context.user_data["state"] = "ma_destination"
-            await message.reply_text(
-                "Step 2/3 — Send the destination group's public @username or numeric chat ID.\n\n"
-                "The destination should be a supergroup to support join requests. The bot may need Invite Users permission."
-            )
+            await message.reply_text("Step 2/3 — Send the destination supergroup's public @username or numeric ID.")
         except Exception as exc:
-            await message.reply_text(f"❌ I could not access that source group ({type(exc).__name__}). Check the link and try again.")
+            await message.reply_text(f"❌ Cannot access source group ({type(exc).__name__}). Check the link and try again.")
         return True
     if state == "ma_destination":
         try:
-            await telethon_client.get_entity(value)
+            entity = await telethon_client.get_entity(value)
+            if not isinstance(entity, types.Channel) or not getattr(entity, "megagroup", False):
+                await message.reply_text("❌ Destination must be a supergroup.")
+                return True
             draft["destination_group"] = value
             context.user_data["state"] = "ma_quantity"
-            await message.reply_text(f"Step 3/3 — How many consenting members should join {value}? Send a number from 1 to {MAX_TARGET}.")
+            await message.reply_text(f"Step 3/3 — How many members should SamiBOT attempt to add? Enter 1–{MAX_TARGET}.")
         except Exception:
-            await message.reply_text("❌ I could not access that destination. Send a valid @username, group link, or numeric ID.")
+            await message.reply_text("❌ Cannot access destination group. Send a valid @username, t.me link, or numeric ID.")
         return True
     if state == "ma_quantity":
         if not value.isdigit() or not 1 <= int(value) <= MAX_TARGET:
@@ -236,107 +336,26 @@ async def member_add_text(update, context, telethon_client, is_admin):
         draft["target_count"] = int(value)
         context.user_data["state"] = "ma_confirm"
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Confirm consent-based campaign", callback_data="ma_confirm")],
+            [InlineKeyboardButton("✅ Confirm direct-add campaign", callback_data="ma_confirm")],
             [InlineKeyboardButton("❎ Cancel", callback_data="ma_cancel_setup")],
         ])
         await message.reply_text(
-            "🧾 <b>Review campaign</b>\n\n"
+            "🧾 <b>Review direct-add campaign</b>\n\n"
             f"📤 Source: <code>{_esc(draft['source_group'])}</code>\n"
             f"📥 Destination: <code>{_esc(draft['destination_group'])}</code>\n"
-            f"🎯 Target: <b>{draft['target_count']}</b> approved join requests\n\n"
-            "Confirm only if members choose to join themselves. This tool will not read/scrape the source member list "
-            "or directly add users. The target is a cap on approved join requests.",
+            f"🎯 Target: <b>{draft['target_count']}</b> successful additions\n\n"
+            "SamiBOT uses the logged-in Telegram user session. Telegram will reject users whose privacy settings "
+            "or account/group limits prevent direct addition. The bot will not retry rejected users or bypass those restrictions.",
             parse_mode="HTML",
             reply_markup=keyboard,
-        )
-        return True
-    if state == "ma_invite_link":
-        if not value.startswith(("https://t.me/", "http://t.me/")):
-            await message.reply_text("❌ Send a valid Telegram invite link beginning with https://t.me/ or /cancel.")
-            return True
-        now = datetime.now(timezone.utc).isoformat()
-        conn = _connect()
-        cur = conn.execute(
-            "INSERT INTO member_invite_jobs "
-            "(created_by, source_group, destination_group, target_count, approved_count, status, invite_link, bot_created_link, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, 0, 'active', ?, 0, ?, ?)",
-            (user.id, draft["source_group"], draft["destination_group"], int(draft["target_count"]), value, now, now),
-        )
-        job_id = cur.lastrowid
-        conn.commit()
-        job = conn.execute("SELECT * FROM member_invite_jobs WHERE id=?", (job_id,)).fetchone()
-        conn.close()
-        context.user_data["state"] = None
-        context.user_data.pop("ma_draft", None)
-        await message.reply_text(
-            _job_text(job) + "\n\n⚠️ This is an admin-supplied link; SamiBOT cannot verify join requests or automatically count members unless it has destination admin permissions.",
-            parse_mode="HTML",
-            reply_markup=_keyboard(job_id, "active"),
         )
         return True
     return True
 
 
 async def member_add_join_request(update, context):
-    request = update.chat_join_request
-    if not request:
-        return
-    link = getattr(getattr(request, "invite_link", None), "invite_link", None)
-    if not link:
-        return
-    conn = _connect()
-    job = conn.execute(
-        "SELECT * FROM member_invite_jobs WHERE invite_link=? ORDER BY id DESC LIMIT 1",
-        (link,),
-    ).fetchone()
-    if not job:
-        conn.close()
-        return
-    if job["status"] == "paused":
-        # Do not approve while paused. Decline so the person can submit again after resume.
-        conn.close()
-        try:
-            await context.bot.decline_chat_join_request(request.chat.id, request.from_user.id)
-        except Exception as exc:
-            print(f"[MemberAdd] Could not decline paused join request: {type(exc).__name__}")
-        return
-    if job["status"] != "active" or int(job["approved_count"]) >= int(job["target_count"]):
-        conn.close()
-        try:
-            await context.bot.decline_chat_join_request(request.chat.id, request.from_user.id)
-        except Exception as exc:
-            print(f"[MemberAdd] Could not decline cancelled/completed join request: {type(exc).__name__}")
-        return
-    try:
-        await context.bot.approve_chat_join_request(request.chat.id, request.from_user.id)
-    except Exception as exc:
-        conn.close()
-        print(f"[MemberAdd] Join request approval failed: {type(exc).__name__}: {exc}")
-        return
-    approved = int(job["approved_count"]) + 1
-    status = "completed" if approved >= int(job["target_count"]) else "active"
-    now = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        "UPDATE member_invite_jobs SET approved_count=?, status=?, updated_at=? WHERE id=?",
-        (approved, status, now, int(job["id"])),
-    )
-    conn.commit()
-    updated = conn.execute("SELECT * FROM member_invite_jobs WHERE id=?", (int(job["id"]),)).fetchone()
-    conn.close()
-    if status == "completed" and job["bot_created_link"]:
-        try:
-            await context.bot.revoke_chat_invite_link(request.chat.id, link)
-        except Exception:
-            pass
-    try:
-        await context.bot.send_message(
-            chat_id=int(job["created_by"]),
-            text=_job_text(updated),
-            parse_mode="HTML",
-            reply_markup=_keyboard(int(job["id"]), status),
-        )
-    except Exception as exc:
-        print(f"[MemberAdd] Progress notification failed: {type(exc).__name__}")
+    # Direct-add campaigns do not use join requests.
+    return
 
 
 async def member_add_cancel_setup(update, context, is_admin):
