@@ -163,12 +163,12 @@ async def _run_job(job_id, client, bot):
                 )
             except FloodWaitError as exc:
                 wait_seconds = int(getattr(exc, "seconds", 30))
-                _set_job(job_id, status="paused", last_error=f"Telegram FloodWait: {wait_seconds}s; paused safely")
+                _set_job(job_id, last_error=f"Telegram FloodWait: waiting {wait_seconds}s before continuing")
                 await _report(job_id, bot, True)
                 await asyncio.sleep(wait_seconds)
                 latest = _get_job(job_id)
-                if latest and latest["status"] == "paused":
-                    _set_job(job_id, status="active", last_error="")
+                if latest and latest["status"] == "active":
+                    _set_job(job_id, last_error="")
             except Exception as exc:
                 name = type(exc).__name__
                 _set_job(
