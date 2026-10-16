@@ -2397,7 +2397,9 @@ async def handle_image_convert(update, context, fmt):
         context.user_data['state'] = None
 # --- DOCUMENT CONVERSION ---
 async def handle_pdf_to_pptx(update, context):
-    if context.user_data.get('state') != 'awaiting_doc_pdf_pptx': return    if not update.message.document:
+    if context.user_data.get('state') != 'awaiting_doc_pdf_pptx':
+        return
+    if not update.message.document:
         await update.message.reply_text("❌ Please upload a PDF file.")
         return
     if update.message.document.mime_type != "application/pdf":
@@ -3196,13 +3198,15 @@ def extract_ytdlp_info(url: str):
                 info = ydl.extract_info(url, download=False)
             if info:
                 info["__sami_youtube_client"] = client
-                return info        except Exception as exc:
+                return info
+        except Exception as exc:
             errors.append(f"{client}: {exc}")
 
     raise RuntimeError("YouTube yt-dlp clients failed: " + " | ".join(errors[-4:]))
 
 
-def build_ytdlp_format(height=None, audio=False, platform="unknown"):    if audio:
+def build_ytdlp_format(height=None, audio=False, platform="unknown"):
+    if audio:
         return "bestaudio/best"
     if height:
         if platform == "youtube":
@@ -3995,12 +3999,14 @@ async def send_pdf_filtered_pages(query_or_update, context, pages=None):
     Text pages become Telegram text and scanned/image pages become Telegram images.
     """
     pdf_bytes = context.user_data.get("pdf_bytes")
-    if not pdf_bytes:        await query_or_update.message.reply_text("❌ PDF session expired. Please upload it again.")
+    if not pdf_bytes:
+        await query_or_update.message.reply_text("❌ PDF session expired. Please upload it again.")
         context.user_data["state"] = None
         return
 
     status = await query_or_update.message.reply_text("📄 Reading the PDF content…")
-    try:        pdf_bytes.seek(0)
+    try:
+        pdf_bytes.seek(0)
         doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
         total = len(doc)
 
