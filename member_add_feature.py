@@ -292,12 +292,16 @@ async def member_add_join_request(update, context):
     if not job:
         conn.close()
         return
+    if job["status"] == "paused":
+        # Keep requests pending while paused; resume can process them later.
+        conn.close()
+        return
     if job["status"] != "active" or int(job["approved_count"]) >= int(job["target_count"]):
         conn.close()
         try:
             await context.bot.decline_chat_join_request(request.chat.id, request.from_user.id)
         except Exception as exc:
-            print(f"[MemberAdd] Could not decline excess/paused join request: {type(exc).__name__}")
+            print(f"[MemberAdd] Could not decline cancelled/completed join request: {type(exc).__name__}")
         return
     try:
         await context.bot.approve_chat_join_request(request.chat.id, request.from_user.id)
