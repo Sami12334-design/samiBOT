@@ -9,6 +9,16 @@ if [ ! -x .deno/bin/deno ]; then
   curl -fsSL https://deno.land/install.sh | DENO_INSTALL="$PWD/.deno" sh
 fi
 
+# Install the matching local BgUtils POT generation script for YouTube.
+# Script mode avoids exposing an unauthenticated provider HTTP server.
+if [ ! -d bgutil-ytdlp-pot-provider/server ]; then
+  git clone --depth 1 --branch 1.3.1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git bgutil-ytdlp-pot-provider
+fi
+(
+  cd bgutil-ytdlp-pot-provider/server
+  "$OLDPWD/.deno/bin/deno" install --allow-scripts=npm:canvas --frozen
+)
+
 # Install the pinned 15 MB INT8 local image detector during build.
 # This avoids relying on an optional Render environment variable at runtime.
 AI_MODEL_DIR="$PWD/models/ai-detector"
