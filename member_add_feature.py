@@ -173,7 +173,7 @@ def _mark_processed(job_id, user_id, outcome, error=""):
 
 async def _wait_for_floodwait(job_id, bot):
     """Wait until Telegram's deadline, updating the countdown and honoring Cancel."""
-    last_reported = None
+    next_report_at = 0
     while True:
         job = _get_job(job_id)
         if not job or job["status"] == "cancelled":
@@ -184,11 +184,10 @@ async def _wait_for_floodwait(job_id, bot):
             _set_job(job_id, floodwait_until=0, last_error="")
             await _report(job_id, bot, True)
             return True
-        message = f"Telegram FloodWait: waiting {remaining}s before continuing"
-        if message != last_reported:
-            _set_job(job_id, last_error=message)
+        if time.time() >= next_report_at:
+            _set_job(job_id, last_error=f"Telegram FloodWait: waiting {remaining}s before continuing")
             await _report(job_id, bot, True)
-            last_reported = message
+            next_report_at = time.time() + 15
         await asyncio.sleep(min(5, max(1, remaining)))
 
 
