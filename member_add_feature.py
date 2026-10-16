@@ -255,11 +255,32 @@ async def _run_job(job_id, client, bot):
                     _set_job(job_id, status="completed", last_error="")
                     break
                 try:
-                    await client(functions.channels.InviteToChannelRequest(
+                    invite_result = await client(functions.channels.InviteToChannelRequest(
                         channel=destination,
                         users=[types.InputUser(user_id=participant.id, access_hash=participant.access_hash)],
                     ))
-                    _mark_processed(job_id, participant.id, "added")
+                    # Telegram returns InvitedUsers with missing_invitees for users
+                    # it could not add. Do not increment "Added" unless this response
+                    # confirms that this specific participant was not rejected.
+                    missing_invitees = getattr(invite_result, "missing_invitees", None)
+                    if missing_invitees is None:
+                        _mark_processed(
+                            job_id, participant.id, "skipped",
+                            "Telegram did not confirm invitation result",
+                        )
+                    else:
+                        rejected_ids = {
+                            int(getattr(item, "user_id", 0))
+                            for item in missing_invitees
+                            if getattr(item, "user_id", None) is not None
+                        }
+                        if participant.id in rejected_ids:
+                            _mark_processed(
+                                job_id, participant.id, "skipped",
+                                "Telegram reported this user as a missing invitee",
+                            )
+                        else:
+                            _mark_processed(job_id, participant.id, "added")
                     break
                 except FloodWaitError as exc:
                     wait_seconds = max(1, int(getattr(exc, "seconds", 30)))
