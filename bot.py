@@ -49,7 +49,7 @@ import qrcode
 from ai_media_detector import analyze_image_bytes, analyze_audio_bytes, format_detection_result, DetectorError
 from watermark_feature import watermark_start, watermark_callback, watermark_text_input, watermark_photo_input, watermark_document_input
 from fayda_printing import register_fayda_printing
-from member_add_feature import member_add_start, member_add_callback, member_add_text, member_add_join_request, member_add_cancel_setup
+from member_add_feature import member_add_start, member_add_callback, member_add_text, member_add_join_request, member_add_cancel_setup, resume_member_add_jobs
 
 try:
     from telethon.tl.functions.stories import GetPeerStoriesRequest, GetStoriesByIDRequest
@@ -8636,6 +8636,8 @@ async def main():
         print(f"Webhook cleanup warning: {exc}")
 
     await bot_app.start()
+    # Recover persisted member-add jobs after both Telegram clients are initialized.
+    resume_member_add_jobs(bot_app, telethon_client, bot_app.bot)
     try:
         # Fail fast on a second polling instance instead of retrying forever.
         await bot_app.updater.start_polling(bootstrap_retries=0)
