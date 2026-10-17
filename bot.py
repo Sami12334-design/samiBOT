@@ -94,7 +94,127 @@ for _admin_env_name in ("ADMIN_IDS", "BOT_ADMIN_IDS", "ADMIN_ID", "OWNER_ID", "B
         ADMIN_IDS.extend(int(item) for item in re.findall(r"\d+", _admin_ids_raw))
 ADMIN_IDS = sorted(set(uid for uid in ADMIN_IDS if uid > 0))
 
-telethon_client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
+
+# --- CENTRAL TELETHON REQUEST QUEUE / FLOODWAIT PROTECTION ---
+# All Telethon raw requests pass through this shared queue, concurrency limit,
+# adaptive pacing, and FloodWait handler. This applies across features using
+# the shared telethon_client, including member_add_feature.
+class QueuedTelegramClient(TelegramClient):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._request_queue = None
+        self._request_workers = []
+        self._request_pacing_lock = None
+        self._request_next_at = 0.0
+        self._request_blocked_until = 0.0
+        self._request_successes = 0
+        self._request_floodwaits = 0
+        self._request_current_delay = max(
+            0.05, float(os.environ.get("TELETHON_MIN_REQUEST_INTERVAL", "0.35"))
+        )
+        self._request_min_delay = self._request_current_delay
+        self._request_max_delay = max(
+            self._request_min_delay,
+            float(os.environ.get("TELETHON_MAX_REQUEST_INTERVAL", "3.0"))
+        )
+        self._request_worker_count = max(
+            1, min(4, int(os.environ.get("TELETHON_QUEUE_WORKERS", "2")))
+        )
+        self._request_max_retries = max(
+            1, min(10, int(os.environ.get("TELETHON_FLOODWAIT_MAX_RETRIES", "5")))
+        )
+
+    def _ensure_request_workers(self):
+        if self._request_queue is None:
+            self._request_queue = asyncio.Queue(maxsize=500)
+            self._request_pacing_lock = asyncio.Lock()
+        if not self._request_workers:
+            loop = asyncio.get_running_loop()
+            self._request_workers = [
+                loop.create_task(self._request_worker(), name=f"sami-telethon-queue-{i + 1}")
+                for i in range(self._request_worker_count)
+            ]
+
+    async def __call__(self, request, ordered=False):
+        self._ensure_request_workers()
+        loop = asyncio.get_running_loop()
+        result_future = loop.create_future()
+        await self._request_queue.put((request, ordered, result_future))
+        return await result_future
+
+    async def _wait_for_request_slot(self):
+        # One shared pacing gate coordinates every feature using this client.
+        async with self._request_pacing_lock:
+            loop = asyncio.get_running_loop()
+            now = loop.time()
+            wait_for = max(
+                0.0,
+                self._request_next_at - now,
+                self._request_blocked_until - now,
+            )
+            if wait_for:
+                await asyncio.sleep(wait_for)
+            self._request_next_at = loop.time() + self._request_current_delay
+
+    async def _request_worker(self):
+        while True:
+            request, ordered, result_future = await self._request_queue.get()
+            try:
+                if result_future.cancelled():
+                    continue
+                attempts = 0
+                while True:
+                    await self._wait_for_request_slot()
+                    try:
+                        result = await super().__call__(request, ordered=ordered)
+                    except FloodWaitError as exc:
+                        attempts += 1
+                        wait_seconds = max(1, int(getattr(exc, "seconds", 1))) + 1
+                        loop = asyncio.get_running_loop()
+                        self._request_blocked_until = max(
+                            self._request_blocked_until, loop.time() + wait_seconds
+                        )
+                        self._request_floodwaits += 1
+                        self._request_current_delay = min(
+                            self._request_max_delay,
+                            max(self._request_min_delay, self._request_current_delay * 1.5),
+                        )
+                        print(
+                            "Telethon FloodWait: "
+                            f"waiting {wait_seconds}s; retry {attempts}/"
+                            f"{self._request_max_retries}; queue={self._request_queue.qsize()}; "
+                            f"next_delay={self._request_current_delay:.2f}s"
+                        )
+                        if attempts > self._request_max_retries:
+                            raise
+                        # Loop back only after the server-requested wait has elapsed.
+                        continue
+                    self._request_successes += 1
+                    # Recover pacing gradually after sustained successful requests.
+                    if self._request_successes % 25 == 0:
+                        self._request_current_delay = max(
+                            self._request_min_delay,
+                            self._request_current_delay * 0.9,
+                        )
+                    if self._request_successes % 100 == 0:
+                        print(
+                            "Telethon queue status: "
+                            f"completed={self._request_successes}; "
+                            f"floodwaits={self._request_floodwaits}; "
+                            f"queued={self._request_queue.qsize()}; "
+                            f"delay={self._request_current_delay:.2f}s"
+                        )
+                    if not result_future.done():
+                        result_future.set_result(result)
+                    break
+            except Exception as exc:
+                if not result_future.done():
+                    result_future.set_exception(exc)
+            finally:
+                self._request_queue.task_done()
+
+
+telethon_client = QueuedTelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
 def get_admin_ids():
     """Return every explicitly configured or bot-registered admin ID."""
