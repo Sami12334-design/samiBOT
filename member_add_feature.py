@@ -259,14 +259,15 @@ async def _run_job(job_id, client, bot):
                         channel=destination,
                         users=[types.InputUser(user_id=participant.id, access_hash=participant.access_hash)],
                     ))
-                    # Telegram returns InvitedUsers with missing_invitees for users
-                    # it could not add. Do not increment "Added" unless this response
-                    # confirms that this specific participant was not rejected.
+                    # Telegram's response has updates plus missing_invitees. A user
+                    # absent from missing_invitees is not, by itself, sufficient proof
+                    # that this exact user is now present in the destination. Verify
+                    # membership with Telegram before incrementing the success counter.
                     missing_invitees = getattr(invite_result, "missing_invitees", None)
                     if missing_invitees is None:
                         _mark_processed(
                             job_id, participant.id, "skipped",
-                            "Telegram did not confirm invitation result",
+                            "Telegram did not return a verifiable invitation result",
                         )
                     else:
                         rejected_ids = {
@@ -280,7 +281,17 @@ async def _run_job(job_id, client, bot):
                                 "Telegram reported this user as a missing invitee",
                             )
                         else:
-                            _mark_processed(job_id, participant.id, "added")
+                            try:
+                                # Read-after-write confirmation avoids reporting a
+                                # successful addition based only on an absent rejection.
+                                await client.get_permissions(destination, participant)
+                            except Exception as verify_exc:
+                                _mark_processed(
+                                    job_id, participant.id, "skipped",
+                                    f"Invitation not verified: {type(verify_exc).__name__}",
+                                )
+                            else:
+                                _mark_processed(job_id, participant.id, "added")
                     break
                 except FloodWaitError as exc:
                     wait_seconds = max(1, int(getattr(exc, "seconds", 30)))
