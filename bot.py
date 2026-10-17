@@ -101,6 +101,9 @@ ADMIN_IDS = sorted(set(uid for uid in ADMIN_IDS if uid > 0))
 # the shared telethon_client, including member_add_feature.
 class QueuedTelegramClient(TelegramClient):
     def __init__(self, *args, **kwargs):
+        # Route even short FloodWaits through this shared coordinator, rather than
+        # letting Telethon sleep privately while other workers keep issuing calls.
+        kwargs.setdefault("flood_sleep_threshold", 0)
         super().__init__(*args, **kwargs)
         self._request_queue = None
         self._request_workers = []
