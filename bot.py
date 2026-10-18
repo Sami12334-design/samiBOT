@@ -1777,7 +1777,7 @@ async def menu_callback(update, context):
         return
     if data == "main_menu":
         if is_admin(user_id):       
-            keyboard = [[InlineKeyboardButton("📥 Inbox", callback_data="inbox"), InlineKeyboardButton("👤 Profile", callback_data="profile")], [InlineKeyboardButton("👀 Profile Visitors", callback_data="profile_visitors"), InlineKeyboardButton("📖 Story Viewers", callback_data="story_viewers")], [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")], [InlineKeyboardButton("🌍 Public Search", callback_data="search")], [InlineKeyboardButton("➕ More Commands", callback_data="more")]]
+            keyboard = [[InlineKeyboardButton("📥 Inbox", callback_data="inbox"), InlineKeyboardButton("👤 Profile", callback_data="profile")], [InlineKeyboardButton("👀 Profile Visitors", callback_data="profile_visitors"), InlineKeyboardButton("📖 Story Viewers", callback_data="story_viewers")], [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")], [InlineKeyboardButton("📥 Golden Downloader", callback_data="golden_downloader")], [InlineKeyboardButton("🌍 Public Search", callback_data="search")], [InlineKeyboardButton("➕ More Commands", callback_data="more")]]
         else:
             keyboard = [[InlineKeyboardButton("👤 Profile", callback_data="profile")], [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")], [InlineKeyboardButton("🌍 Public Search", callback_data="search")], [InlineKeyboardButton("➕ More Commands", callback_data="more")]]
         await query.message.reply_text("🤖 TELEGRAM ASSISTANT", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -1936,6 +1936,15 @@ async def menu_callback(update, context):
     elif data == "fetch":
         await query.message.reply_text("🔗 Fetch Telegram\n\nSend me a link (e.g., t.me/channel/123 or t.me/channel/123-130):")
         context.user_data['state'] = 'fetch_link'
+    elif data == "golden_downloader":
+        context.user_data["state"] = "golden_downloader_link"
+        await query.message.reply_text(
+            "📥 <b>GOLDEN DOWNLOADER</b>\n\n"
+            "Send a document link from Studocu, Scribd, or another supported source.\n"
+            "I’ll try to retrieve the available document and send it here as a file.\n\n"
+            "🔗 Please send one link at a time.",
+            parse_mode=ParseMode.HTML
+        )
     elif data == "search":
         await query.message.reply_text("🔎 PUBLIC SEARCH\n\nEnter a keyword, hashtag, @username, or public channel name.\n\n🌐 Public groups/channels only — no private dialogs, no admin-only history.\n⚡ Parallel discovery + direct public-history search + relevance ranking.\nExample: Logic mid")
         context.user_data['state'] = 'search_query'
@@ -8452,7 +8461,7 @@ async def handle_link(update, context):
         if text == BOT_PASSWORD:
             add_authenticated_user(user_id); context.user_data['state'] = None
             await update.message.reply_text("✅ Access granted!")
-            keyboard = [[InlineKeyboardButton("📥 Inbox", callback_data="inbox"), InlineKeyboardButton("👤 Profile", callback_data="profile")], [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")], [InlineKeyboardButton("➕ More Commands", callback_data="more")]]
+            keyboard = [[InlineKeyboardButton("📥 Inbox", callback_data="inbox"), InlineKeyboardButton("👤 Profile", callback_data="profile")], [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")], [InlineKeyboardButton("📥 Golden Downloader", callback_data="golden_downloader")], [InlineKeyboardButton("➕ More Commands", callback_data="more")]]
             await update.message.reply_text("🤖 TELEGRAM ASSISTANT", reply_markup=InlineKeyboardMarkup(keyboard))
         else:
             await update.message.reply_text("❌ Incorrect password. Please try again.")
@@ -8533,6 +8542,28 @@ async def handle_link(update, context):
         # The Fetch Telegram menu asks for a link; let it reach the link parser below.
         context.user_data["state"] = None
         state = None
+    if state == "golden_downloader_link":
+        context.user_data["state"] = None
+        candidate = (text or "").strip()
+        if not re.match(r"^https?://", candidate, re.I):
+            await update.message.reply_text("❌ Please send a complete document URL beginning with https:// or http://.")
+            return
+        host = (urllib.parse.urlparse(candidate).hostname or "").lower()
+        supported_hosts = ("studocu.com", "www.studocu.com", "scribd.com", "www.scribd.com", "pdfcoffee.com", "www.pdfcoffee.com")
+        if not any(host == domain or host.endswith("." + domain) for domain in supported_hosts):
+            await update.message.reply_text(
+                "🔎 Link received. This source isn’t configured yet. Golden Downloader currently accepts links from Studocu, Scribd, and PDFCoffee; more sources can be added."
+            )
+            return
+        await update.message.reply_text(
+            "🔗 <b>Link received by Golden Downloader</b>\n\n"
+            "I couldn’t retrieve the document automatically from this source in the current version. "
+            "The source-specific retrieval connector still needs to be added. Your link was not changed, "
+            "and the existing Telegram and media downloaders are untouched.",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
+        )
+        return
     if state:
         context.user_data['state'] = None
         if state == 'profile_query': await fetch_profile(update, context, text)
