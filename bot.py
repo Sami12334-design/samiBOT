@@ -1780,7 +1780,7 @@ async def menu_callback(update, context):
         if is_admin(user_id):       
             keyboard = [[InlineKeyboardButton("📥 Inbox", callback_data="inbox"), InlineKeyboardButton("👤 Profile", callback_data="profile")], [InlineKeyboardButton("👀 Profile Visitors", callback_data="profile_visitors"), InlineKeyboardButton("📖 Story Viewers", callback_data="story_viewers")], [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")], [InlineKeyboardButton("📥 Golden Downloader", callback_data="golden_downloader")], [InlineKeyboardButton("🌍 Public Search", callback_data="search")], [InlineKeyboardButton("➕ More Commands", callback_data="more")]]
         else:
-            keyboard = [[InlineKeyboardButton("👤 Profile", callback_data="profile")], [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")], [InlineKeyboardButton("🌍 Public Search", callback_data="search")], [InlineKeyboardButton("➕ More Commands", callback_data="more")]]
+            keyboard = [[InlineKeyboardButton("👤 Profile", callback_data="profile")], [InlineKeyboardButton("🔗 Fetch Telegram", callback_data="fetch")], [InlineKeyboardButton("📥 Golden Downloader", callback_data="golden_downloader")], [InlineKeyboardButton("🌍 Public Search", callback_data="search")], [InlineKeyboardButton("➕ More Commands", callback_data="more")]]
         await query.message.reply_text("🤖 TELEGRAM ASSISTANT", reply_markup=InlineKeyboardMarkup(keyboard))
     elif data == "more":
         kb = [
