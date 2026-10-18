@@ -3,6 +3,7 @@
 This intentionally uses only files/pages exposed without logging in or bypassing access controls.
 """
 import html
+import json
 import os
 import re
 import tempfile
@@ -67,7 +68,7 @@ def _safe_name(value, default="document"):
     value = re.sub(r"[^\w. -]+", "_", value or "", flags=re.UNICODE).strip(" ._")
     return (value[:90] or default)
 
-def download_public_document(url):
+def _download_public_document(url):
     """Return a local file path for a public direct file or publicly exposed preview, else raise."""
     parsed = urllib.parse.urlparse((url or "").strip())
     if parsed.scheme != "https" or _host(url) not in ALLOWED_PAGE_HOSTS:
@@ -134,3 +135,72 @@ def download_public_document(url):
         import shutil
         shutil.rmtree(tempdir, ignore_errors=True)
         raise
+
+
+def _download_via_configured_api(source_url):
+    """Try an explicitly configured third-party API endpoint.
+
+    Configure GOLDEN_DOWNLOADER_API_URLS as a comma-separated list of HTTPS
+    endpoint templates, each containing {url}, for example:
+    https://provider.example/api/download?url={url}
+    An endpoint may return a PDF directly or JSON containing download_url/url.
+    Provider endpoints must be documented/authorized by their operator.
+    """
+    endpoints = [
+        item.strip()
+        for item in os.environ.get("GOLDEN_DOWNLOADER_API_URLS", "").split(",")
+        if item.strip()
+    ]
+    errors = []
+    for template in endpoints:
+        try:
+            if not template.startswith("https://") or "{url}" not in template:
+                errors.append("invalid provider endpoint configuration")
+                continue
+            endpoint = template.replace("{url}", urllib.parse.quote(source_url, safe=""))
+            final_url, content_type, body = _request(endpoint, limit=MAX_FILE_BYTES)
+            if "application/pdf" in content_type.lower() or body.startswith(b"%PDF-"):
+                tempdir = tempfile.mkdtemp(prefix="golden_api_")
+                out = os.path.join(tempdir, "document.pdf")
+                with open(out, "wb") as handle:
+                    handle.write(body)
+                return out
+            try:
+                payload = json.loads(body.decode("utf-8", errors="replace"))
+            except Exception:
+                errors.append("provider returned neither PDF nor JSON")
+                continue
+            download_url = payload.get("download_url") or payload.get("url")
+            if not isinstance(download_url, str) or not download_url.startswith("https://"):
+                errors.append("provider returned no HTTPS download_url")
+                continue
+            _, file_type, file_body = _request(download_url, referer=final_url, limit=MAX_FILE_BYTES)
+            if "application/pdf" not in file_type.lower() and not file_body.startswith(b"%PDF-"):
+                errors.append("provider link did not return a PDF")
+                continue
+            tempdir = tempfile.mkdtemp(prefix="golden_api_")
+            out = os.path.join(tempdir, _safe_name(payload.get("filename"), "document") + ".pdf")
+            with open(out, "wb") as handle:
+                handle.write(file_body)
+            return out
+        except Exception as exc:
+            errors.append(str(exc)[:160])
+            continue
+    raise ValueError("All configured external downloader providers failed. " + "; ".join(errors[-3:]))
+
+
+def download_public_document(url):
+    """Try public-source retrieval first, then configured external API providers."""
+    errors = []
+    try:
+        return _download_public_document(url)
+    except Exception as exc:
+        errors.append("public source: " + str(exc)[:200])
+    try:
+        return _download_via_configured_api(url)
+    except Exception as exc:
+        errors.append("external API fallback: " + str(exc)[:220])
+    raise ValueError(
+        "Golden Downloader tried its available methods but could not retrieve this file. "
+        + " | ".join(errors)
+    )
