@@ -73,7 +73,7 @@ def download_public_document(url):
     if parsed.scheme != "https" or _host(url) not in ALLOWED_PAGE_HOSTS:
         raise ValueError("Please send an HTTPS link from Studocu, Scribd, or PDFCoffee.")
     final_url, content_type, body = _request(url)
-    if not any(_host(final_url) == d or _host(final_url).endswith("." + d) for d in ALLOWED_PAGE_HOSTS + ()):
+    if not any(_host(final_url) == d or _host(final_url).endswith("." + d) for d in ALLOWED_PAGE_HOSTS):
         # Source pages can redirect within the source domain only.
         if not _allowed_asset(final_url):
             raise ValueError("The source redirected to an unsupported host.")
