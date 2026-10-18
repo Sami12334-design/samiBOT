@@ -366,7 +366,7 @@ async def _force_join_missing(bot, user_id):
     return missing
 
 async def force_join_guard(update, context):
-    if update and update.effective_message and (update.effective_message.text or "").split(maxsplit=1)[0].lower() == "/start":
+    if update and update.effective_message and (update.effective_message.text or "").lower().split(maxsplit=1)[:1] == ["/start"]:
         print("DIAGNOSTIC: /start reached force_join_guard; force_join_channels=" + str(len(FORCE_JOIN_CHANNELS)))
     if not FORCE_JOIN_CHANNELS:
         return
@@ -932,7 +932,7 @@ async def telegram_error_handler(update, context):
 async def trace_incoming_update(update, context):
     # Temporary low-noise diagnostics: confirm whether Telegram delivers /start here.
     message = update.effective_message
-    if message and (message.text or "").split(maxsplit=1)[0].lower() == "/start":
+    if message and (message.text or "").lower().split(maxsplit=1)[:1] == ["/start"]:
         print("DIAGNOSTIC: Telegram delivered /start update_id=" + str(update.update_id))
 
 def make_feature_command(callback_data, button_text):
