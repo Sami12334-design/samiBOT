@@ -3342,10 +3342,10 @@ def extract_ytdlp_info(url: str):
         opts = ytdlp_base_options()
         if client != "default":
             opts.setdefault("extractor_args", {}).setdefault("youtube", {})["player_client"] = [client]
-        # YouTube's TV clients do not support account cookies reliably; passing
-        # logged-in cookies can trigger DRM or playability failures. Keep cookies
-        # for normal web clients, but omit them for TV fallback clients.
-        if client in {"tv", "tv_simply"}:
+        # Keep cookies for the native/default attempt only. If those cookies are
+        # stale, retry alternate clients without them while retaining PO-token
+        # provider settings from ytdlp_base_options().
+        if client != "default":
             opts.pop("cookiefile", None)
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -3383,9 +3383,11 @@ def ytdlp_download(url: str, output_dir: str, *, height=None, audio=False, title
         try:
             opts = ytdlp_base_options()
             if client and client != "default":
-                opts["extractor_args"] = {"youtube": {"player_client": [client]}}
-            # TV clients are not compatible with account cookies in many cases.
-            if client in {"tv", "tv_simply"}:
+                # Merge the client setting instead of replacing extractor_args:
+                # replacing it discards the configured bgutil PO-token provider.
+                opts.setdefault("extractor_args", {}).setdefault("youtube", {})["player_client"] = [client]
+            # Keep potentially stale account cookies out of fallback-client retries.
+            if client != "default":
                 opts.pop("cookiefile", None)
             opts.update({
                 "format": build_ytdlp_format(height, audio, platform),
@@ -3714,16 +3716,9 @@ def cobalt_prepare(url: str, *, audio=False):
 def extract_download_options(url: str):
     platform = video_platform(url)
     normalized = normalize_public_url(url) if platform == "tiktok" else url
-    # YouTube: try an independent hosted download API first, not yt-dlp clients.
-    if platform == "youtube":
-        try:
-            cobalt = cobalt_prepare(normalized)
-            return {"source": "cobalt", "platform": platform, "url": normalized,
-                    "title": cobalt.get("filename") or "YouTube video",
-                    "qualities": [720], "audio": False, "cobalt": cobalt}
-        except Exception:
-            pass
-    # Keep existing extractor path for other platforms and as a YouTube fallback.
+    # YouTube: try yt-dlp first so the configured PO-token provider can help.
+    # Public Cobalt endpoints may require JWT auth and no longer reliably support YouTube.
+    # If yt-dlp fails, the existing Piped/Invidious fallback below remains available.
     try:
         info = extract_ytdlp_info(normalized)
         title = info.get("title") or "Video"
@@ -3830,36 +3825,27 @@ async def handle_admin_youtube_audio(update, context):
     output_dir = tempfile.mkdtemp(prefix="tg_yt_audio_")
     try:
         def download_audio():
-            # Use Cobalt first so this admin tool does not depend on YouTube
-            # authentication/cookies on the Render server.
+            # Use yt-dlp first so YouTube's configured PO-token provider is available.
             try:
-                cobalt_data = cobalt_prepare(raw_url, audio=True)
-                mp3_path = os.path.join(output_dir, "youtube_audio.mp3")
-                download_url_to_file(
-                    cobalt_data["url"],
-                    mp3_path,
-                    headers={"User-Agent": "Mozilla/5.0", "Accept": "*/*"},
-                )
-                if os.path.isfile(mp3_path) and os.path.getsize(mp3_path) > 0:
-                    return mp3_path, cobalt_data.get("filename") or "YouTube Audio"
-            except Exception as cobalt_error:
-                cobalt_error_text = str(cobalt_error)
-            else:
-                cobalt_error_text = "Cobalt returned an empty audio file."
+                result = ytdlp_download(raw_url, output_dir, audio=True, title_hint="YouTube Audio")
+                if os.path.isfile(result["path"]) and os.path.getsize(result["path"]) > 0:
+                    return result["path"], result.get("title") or "YouTube Audio"
+                yt_error = "yt-dlp returned an empty audio file."
+            except Exception as yt_exc:
+                yt_error = str(yt_exc)
 
-            # If Cobalt is unavailable, use the bot's existing public Piped
-            # fallback and convert its best audio stream to 192 kbps MP3.
+            # Secondary fallback: existing public Piped API, converted to 192 kbps MP3.
             video_id = youtube_video_id(raw_url)
             if not video_id:
-                raise RuntimeError("Could not read the YouTube video ID.")
+                raise RuntimeError(f"YouTube audio download failed. yt-dlp: {yt_error[:400]}")
             try:
                 meta = piped_metadata(video_id)
                 result = download_from_piped(meta, output_dir, audio=True)
                 return result["path"], result.get("title") or "YouTube Audio"
             except Exception as piped_error:
                 raise RuntimeError(
-                    "Alternative download services failed. "
-                    f"Cobalt: {cobalt_error_text[:400]} | "
+                    "YouTube audio download failed. "
+                    f"yt-dlp: {yt_error[:400]} | "
                     f"Piped: {str(piped_error)[:400]}"
                 )
 

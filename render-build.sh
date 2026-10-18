@@ -11,8 +11,12 @@ fi
 
 # Install the matching local BgUtils POT generation script for YouTube.
 # Script mode avoids exposing an unauthenticated provider HTTP server.
-if [ ! -d bgutil-ytdlp-pot-provider/server ]; then
-  git clone --depth 1 --branch 1.3.1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git bgutil-ytdlp-pot-provider
+# Re-clone when the cached source is missing or is not the requested tag.
+POT_PROVIDER_TAG="2.0.2"
+POT_PROVIDER_DIR="bgutil-ytdlp-pot-provider"
+if [ ! -d "$POT_PROVIDER_DIR/server/src" ] || [ "$(git -C "$POT_PROVIDER_DIR" describe --tags --exact-match 2>/dev/null || true)" != "$POT_PROVIDER_TAG" ]; then
+  rm -rf "$POT_PROVIDER_DIR"
+  git clone --depth 1 --branch "$POT_PROVIDER_TAG" https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git "$POT_PROVIDER_DIR"
 fi
 (
   cd bgutil-ytdlp-pot-provider/server
