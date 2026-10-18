@@ -50,6 +50,7 @@ from ai_media_detector import analyze_image_bytes, analyze_audio_bytes, format_d
 from watermark_feature import watermark_start, watermark_callback, watermark_text_input, watermark_photo_input, watermark_document_input
 from fayda_printing import register_fayda_printing
 from member_add_feature import member_add_start, member_add_callback, member_add_text, member_add_join_request, member_add_cancel_setup, resume_member_add_jobs
+from golden_downloader import download_public_document
 
 try:
     from telethon.tl.functions.stories import GetPeerStoriesRequest, GetStoriesByIDRequest
@@ -8555,14 +8556,33 @@ async def handle_link(update, context):
                 "🔎 Link received. This source isn’t configured yet. Golden Downloader currently accepts links from Studocu, Scribd, and PDFCoffee; more sources can be added."
             )
             return
-        await update.message.reply_text(
-            "🔗 <b>Link received by Golden Downloader</b>\n\n"
-            "I couldn’t retrieve the document automatically from this source in the current version. "
-            "The source-specific retrieval connector still needs to be added. Your link was not changed, "
-            "and the existing Telegram and media downloaders are untouched.",
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True
-        )
+        status_msg = await update.message.reply_text("⏳ <b>Golden Downloader is checking the public document preview…</b>", parse_mode=ParseMode.HTML)
+        downloaded_path = None
+        try:
+            downloaded_path = await asyncio.to_thread(download_public_document, candidate)
+            with open(downloaded_path, "rb") as document_file:
+                await update.message.reply_document(
+                    document=document_file,
+                    filename=os.path.basename(downloaded_path),
+                    caption="📥 <b>Golden Downloader</b> — document retrieved from the publicly available source.",
+                    parse_mode=ParseMode.HTML
+                )
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            message = str(exc).strip() or "The source did not provide a downloadable file."
+            await status_msg.edit_text(
+                "❌ <b>Could not retrieve this document.</b>\n\n"
+                + html.escape(message[:700])
+                + "\n\nIf the document is downloadable on the source site, download it there and send the file to SamiBOT.",
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
+            )
+        finally:
+            if downloaded_path:
+                shutil.rmtree(os.path.dirname(downloaded_path), ignore_errors=True)
         return
     if state:
         context.user_data['state'] = None
