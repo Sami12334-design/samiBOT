@@ -366,6 +366,8 @@ async def _force_join_missing(bot, user_id):
     return missing
 
 async def force_join_guard(update, context):
+    if update and update.effective_message and (update.effective_message.text or "").split(maxsplit=1)[0].lower() == "/start":
+        print("DIAGNOSTIC: /start reached force_join_guard; force_join_channels=" + str(len(FORCE_JOIN_CHANNELS)))
     if not FORCE_JOIN_CHANNELS:
         return
     user = update.effective_user
@@ -379,6 +381,7 @@ async def force_join_guard(update, context):
     if query and query.data == "force_join_verify":
         missing = await _force_join_missing(context.bot, user.id)
         if missing:
+            print("DIAGNOSTIC: force-join verification blocked; missing_count=" + str(len(missing)))
             try:
                 await query.answer("You still need to join every required channel.", show_alert=True)
             except Exception:
@@ -396,6 +399,7 @@ async def force_join_guard(update, context):
         raise ApplicationHandlerStop
     missing = await _force_join_missing(context.bot, user.id)
     if missing:
+        print("DIAGNOSTIC: force-join guard blocked update; missing_count=" + str(len(missing)))
         msg = update.effective_message
         if msg:
             await msg.reply_text(
@@ -880,6 +884,7 @@ async def handle_telethon_error(update, error):
         await update.message.reply_text(f"❌ Error: {error}")
 
 async def start(update, context):
+    print("DIAGNOSTIC: /start handler entered")
     user_id = update.effective_user.id
     conn = sqlite3.connect('bot_data.db')
     conn.execute("CREATE TABLE IF NOT EXISTS started_users (user_id INTEGER PRIMARY KEY, first_started TEXT NOT NULL)")
@@ -917,6 +922,19 @@ async def start(update, context):
             [InlineKeyboardButton("➕ More Commands", callback_data="more")]
         ]
     await update.message.reply_text("🤖 TELEGRAM ASSISTANT\n\nChoose an option:", reply_markup=InlineKeyboardMarkup(keyboard))
+async def telegram_error_handler(update, context):
+    error = context.error
+    print("TELEGRAM HANDLER ERROR: " + repr(error))
+    import traceback
+    if error:
+        traceback.print_exception(type(error), error, error.__traceback__)
+
+async def trace_incoming_update(update, context):
+    # Temporary low-noise diagnostics: confirm whether Telegram delivers /start here.
+    message = update.effective_message
+    if message and (message.text or "").split(maxsplit=1)[0].lower() == "/start":
+        print("DIAGNOSTIC: Telegram delivered /start update_id=" + str(update.update_id))
+
 def make_feature_command(callback_data, button_text):
     """Create a simple slash-command shortcut that opens an existing feature."""
     async def feature_command(update, context):
@@ -8694,6 +8712,9 @@ async def main():
     register_fayda_printing(bot_app, ADMIN_IDS)
     global PTB_BOT
     PTB_BOT = bot_app.bot
+    bot_app.add_error_handler(telegram_error_handler)
+    # Diagnostic handler runs before force-join checks and /start.
+    bot_app.add_handler(TypeHandler(Update, trace_incoming_update), group=-200)
     bot_app.add_handler(TypeHandler(Update, force_join_guard), group=-100)
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("myid", myid_command))
