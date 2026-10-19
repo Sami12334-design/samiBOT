@@ -5586,7 +5586,7 @@ SEARCH_MAX_QUERY = 80
 SEARCH_MAX_RESULTS = 160
 SEARCH_PUBLIC_PEER_LIMIT = 20
 SEARCH_MESSAGES_PER_PEER = 3
-SEARCH_GLOBAL_MESSAGE_LIMIT = 120
+SEARCH_GLOBAL_MESSAGE_LIMIT = 100
 SEARCH_CONCURRENCY = 10
 SEARCH_TIMEOUT = 7.5
 SEARCH_CACHE_TTL = 45.0
@@ -5758,7 +5758,7 @@ async def _search_discover_public_peers(query):
     found = {}
 
     q = re.sub(
-        r"\\s+",
+        r"\s+",
         " ",
         (query or "").strip(),
     )
