@@ -3284,6 +3284,16 @@ def ytdlp_base_options():
     # available before falling back to system runtimes.
     runtime_path = shutil.which("deno")
     if not runtime_path:
+        # render-build.sh installs Deno to $PWD/.deno/bin/deno, which is not
+        # on PATH at runtime. Look for it next to this script so yt-dlp can
+        # solve YouTube's JavaScript challenges (without it every web/TV
+        # client fails with "Failed to extract any player response").
+        _local_deno = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), ".deno", "bin", "deno"
+        )
+        if os.path.isfile(_local_deno) and os.access(_local_deno, os.X_OK):
+            runtime_path = _local_deno
+    if not runtime_path:
         try:
             import deno as deno_pkg
             runtime_path = deno_pkg.find_deno_bin()
