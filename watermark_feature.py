@@ -8,7 +8,6 @@ clear, user-facing message instead of a raw traceback.
 """
 import asyncio
 import os
-import threading
 from io import BytesIO
 
 import pymupdf
@@ -19,16 +18,12 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 
 _MAX_MEDIA_BYTES = 18 * 1024 * 1024
-# Remove operations are CPU/memory heavy on a small VPS. Keep the working image
-# small so OCR + inpainting stay fast and never OOM the process.
-_REMOVE_MAX_DIMENSION = 1000
-_REMOVE_INPAINT_RADIUS = 4
-_OCR_MAX_DIMENSION = 1000
-_REMOVE_TIMEOUT_IMAGE = 60
-_REMOVE_TIMEOUT_PDF = 90
-_OCR_ENGINE = None
-_OCR_ENGINE_LOCK = threading.Lock()
-_OCR_AVAILABLE = True  # flipped to False permanently after first import failure
+# Keep the working image small so inpainting stays fast (under ~15s) and never
+# OOM the process. No OCR is used — removal is pure OpenCV.
+_REMOVE_MAX_DIMENSION = 800
+_REMOVE_INPAINT_RADIUS = 3
+_REMOVE_TIMEOUT_IMAGE = 20
+_REMOVE_TIMEOUT_PDF = 30
 
 _POSITIONS = {
     "top_left": ("Top left", "tl"),
@@ -255,7 +250,7 @@ def _add_image_watermark(data, wm):
     return out.getvalue()
 
 
-# --- REMOVE: shared helpers ---
+# --- REMOVE: fast OpenCV-only helpers (no OCR, completes in seconds) ---
 
 def _load_image_for_remove(data):
     """Open, EXIF-orient, and downscale so removal stays fast and memory-safe."""
@@ -271,11 +266,11 @@ def _load_image_for_remove(data):
             (max(1, int(width * scale)), max(1, int(height * scale))),
             Image.Resampling.LANCZOS,
         )
-    return np.asarray(rgb_pil), scale
+    return np.asarray(rgb_pil)
 
 
 def _inpaint(mask, bgr):
-    """Faster NS inpainting with a small radius to avoid long CPU stalls."""
+    """Fast NS inpainting with a small radius to avoid long CPU stalls."""
     if mask.max() == 0:
         return bgr
     mask = cv2.dilate(mask, np.ones((5, 5), np.uint8), iterations=1)
@@ -288,80 +283,60 @@ def _encode_png(bgr):
     return out.getvalue()
 
 
-def _ensure_ocr():
-    """Lazily load the OCR engine once. Returns the engine or None."""
-    global _OCR_ENGINE, _OCR_AVAILABLE
-    if not _OCR_AVAILABLE:
-        return None
-    if _OCR_ENGINE is not None:
-        return _OCR_ENGINE
-    with _OCR_ENGINE_LOCK:
-        if _OCR_ENGINE is not None:
-            return _OCR_ENGINE
-        try:
-            from rapidocr_onnxruntime import RapidOCR
-            _OCR_ENGINE = RapidOCR()
-            return _OCR_ENGINE
-        except Exception:
-            _OCR_AVAILABLE = False
-            return None
-
-
-def _run_ocr(image_rgb):
-    """Run OCR on a downscaled RGB array. Returns (result, scale) or raises WatermarkError."""
-    engine = _ensure_ocr()
-    if engine is None:
-        raise WatermarkError(
-            "Text recognition (OCR) is not available on this server. "
-            "For images, try Automatic region removal, or remove the watermark with an external app."
-        )
-    height, width = image_rgb.shape[:2]
-    scale = min(1.0, float(_OCR_MAX_DIMENSION) / max(height, width))
-    if scale < 1.0:
-        small = cv2.resize(
-            image_rgb,
-            (max(1, int(width * scale)), max(1, int(height * scale))),
-            interpolation=cv2.INTER_AREA,
-        )
-    else:
-        small = image_rgb
-    try:
-        result, _ = engine(small)
-    except Exception as exc:
-        raise WatermarkError("Text recognition failed on this image. Try a clearer or smaller image.") from exc
-    if result and scale < 1.0:
-        result = [[
-            (np.asarray(item[0], dtype=np.float32) / scale).tolist(),
-            item[1],
-            item[2] if len(item) > 2 else 1.0,
-        ] for item in result]
-    return result, scale
+def _render_text_templates(text, width, height):
+    """Render the target text at several sizes/colors as grayscale templates for matching."""
+    templates = []
+    base_size = max(12, min(width, height) // 12)
+    for size in (base_size, base_size * 2, base_size // 2):
+        if size < 10:
+            continue
+        font = _font(size)
+        for color in ((255, 255, 255), (0, 0, 0), (200, 200, 200), (128, 128, 128)):
+            tmp_img = Image.new("L", (width, height), 128)
+            draw = ImageDraw.Draw(tmp_img)
+            bbox = draw.textbbox((0, 0), text, font=font, stroke_width=1)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            if tw <= 0 or th <= 0 or tw >= width or th >= height:
+                continue
+            draw.text((2, 2), text, fill=color, font=font, stroke_width=1)
+            cropped = tmp_img.crop((0, 0, min(tw + 6, width), min(th + 6, height)))
+            templates.append(np.asarray(cropped))
+    return templates
 
 
 def _remove_image_text(data, target):
-    """Remove a specific text watermark from an image using OCR + inpainting."""
-    rgb, _ = _load_image_for_remove(data)
-    result, _ = _run_ocr(rgb)
-    if not result:
-        raise WatermarkError("No readable text was detected. Try a clearer image or check the watermark spelling.")
+    """Remove a specific text watermark using fast template matching + inpainting.
 
-    target_cf = target.casefold()
-    mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
+    No OCR is used. The target text is rendered at several sizes and matched
+    against the image with cv2.matchTemplate. This completes in seconds.
+    """
+    rgb = _load_image_for_remove(data)
+    height, width = rgb.shape[:2]
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    mask = np.zeros((height, width), dtype=np.uint8)
     matches = 0
-    for item in result:
-        try:
-            box, text, score = item[0], item[1], item[2] if len(item) > 2 else 1.0
-        except Exception:
+
+    for template in _render_text_templates(target, width, height):
+        th, tw = template.shape[:2]
+        if th >= height or tw >= width:
             continue
-        text_cf = str(text).casefold()
-        if target_cf in text_cf or text_cf in target_cf:
-            pts = np.array(box, dtype=np.int32)
-            cv2.fillPoly(mask, [pts], 255)
-            matches += 1
+        for method in (cv2.TM_SQDIFF_NORMED, cv2.TM_CCOEFF_NORMED):
+            try:
+                result = cv2.matchTemplate(gray, template, method)
+            except Exception:
+                continue
+            if method == cv2.TM_SQDIFF_NORMED:
+                locs = np.where(result <= 0.3)
+            else:
+                locs = np.where(result >= 0.7)
+            for pt in zip(*locs[::-1]):
+                cv2.rectangle(mask, pt, (pt[0] + tw, pt[1] + th), 255, -1)
+                matches += 1
+
     if not matches:
         raise WatermarkError(
-            f"The text “{target}” was not detected. Check the spelling, capitalization, and language, "
-            "or upload a clearer image. You can also try Automatic mode."
+            f"The text \"{target}\" was not found. Check the spelling, or try Automatic mode. "
+            "For non-English text, Automatic mode may work better."
         )
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     repaired = _inpaint(mask, bgr)
@@ -369,84 +344,40 @@ def _remove_image_text(data, target):
 
 
 def _remove_image_watermark_auto(data):
-    """Remove likely watermark text from an image.
+    """Remove likely watermark regions from an image using fast color/contrast detection.
 
-    Uses OCR heuristics first; if OCR is unavailable, falls back to a fast
-    color-contrast regional remover so the bot still returns a result.
+    No OCR is used. Detects light (near-white) and dark overlay regions that are
+    typical of watermarks, then inpaints them. Completes in a few seconds.
     """
-    rgb, _ = _load_image_for_remove(data)
+    rgb = _load_image_for_remove(data)
     height, width = rgb.shape[:2]
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     mask = np.zeros((height, width), dtype=np.uint8)
-
-    # Try OCR-based detection first.
-    ocr_used = False
     selected = 0
-    if _OCR_AVAILABLE:
-        try:
-            result, _ = _run_ocr(rgb)
-        except WatermarkError:
-            result = None
-        if result:
-            ocr_used = True
-            for item in result:
-                try:
-                    box, text, score = item[0], item[1], item[2] if len(item) > 2 else 1.0
-                    pts = np.asarray(box, dtype=np.float32)
-                    if pts.shape[0] < 4 or not str(text).strip():
-                        continue
-                    x1, y1 = pts[0]
-                    x2, y2 = pts[1]
-                    angle = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
-                    angle = min(angle, abs(180 - angle))
-                    cx = float(np.mean(pts[:, 0]))
-                    cy = float(np.mean(pts[:, 1]))
-                    box_w = float(np.max(pts[:, 0]) - np.min(pts[:, 0]))
-                    box_h = float(np.max(pts[:, 1]) - np.min(pts[:, 1]))
-                    central = 0.25 * width < cx < 0.75 * width and 0.25 * height < cy < 0.75 * height
-                    diagonal = 8 <= angle <= 82
-                    compact = box_w < 0.75 * width and box_h < 0.18 * height
-                    # Select diagonal text (classic watermark shape) or small central text,
-                    # but never a large central block that is likely real content.
-                    if compact and (diagonal or (central and box_w < 0.5 * width)):
-                        cv2.fillPoly(mask, [pts.astype(np.int32)], 255)
-                        selected += 1
-                except Exception:
-                    continue
 
-    # Fast non-OCR fallback: detect low-saturation / high-contrast regions
-    # repeated across the image (a common watermark signature). This keeps the
-    # bot functional when OCR is unavailable or finds nothing.
-    if not selected:
-        try:
-            hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-            # Watermarks are often light (near-white) overlays over the image.
-            light = cv2.inRange(hsv, (0, 0, 200), (180, 40, 255))
-            # Or dark/faint overlays.
-            dark = cv2.inRange(hsv, (0, 0, 0), (180, 40, 55))
-            candidate = cv2.bitwise_or(light, dark)
-            candidate = cv2.morphologyEx(
-                candidate, cv2.MORPH_OPEN, np.ones((7, 7), np.uint8)
-            )
-            # Keep only medium-sized connected regions (text-sized), not huge
-            # background areas or tiny specks.
-            num, labels, stats, _ = cv2.connectedComponentsWithStats(candidate, connectivity=8)
-            for i in range(1, num):
-                area = int(stats[i, cv2.CC_STAT_AREA])
-                if 60 <= area <= 0.15 * width * height:
-                    region = (labels == i).astype(np.uint8) * 255
-                    mask = cv2.bitwise_or(mask, region)
-                    selected += 1
-        except Exception:
-            pass
+    try:
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        # Watermarks are often light (near-white) or dark overlays over the image.
+        light = cv2.inRange(hsv, (0, 0, 200), (180, 40, 255))
+        dark = cv2.inRange(hsv, (0, 0, 0), (180, 40, 55))
+        candidate = cv2.bitwise_or(light, dark)
+        candidate = cv2.morphologyEx(
+            candidate, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8)
+        )
+        # Keep only medium-sized connected regions (text-sized), not huge
+        # background areas or tiny specks.
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(candidate, connectivity=8)
+        max_area = 0.12 * width * height
+        for i in range(1, num):
+            area = int(stats[i, cv2.CC_STAT_AREA])
+            if 40 <= area <= max_area:
+                region = (labels == i).astype(np.uint8) * 255
+                mask = cv2.bitwise_or(mask, region)
+                selected += 1
+    except Exception:
+        pass
 
     if not selected:
-        if ocr_used:
-            raise WatermarkError(
-                "No likely watermark text was detected automatically. "
-                "Use Specific watermark text for a targeted removal, or upload a clearer image."
-            )
         raise WatermarkError(
             "Automatic removal could not find a clear watermark on this image. "
             "Try Specific watermark text, or upload a clearer image with a more visible watermark."
@@ -573,7 +504,7 @@ def _friendly_error(exc):
     msg = str(exc).strip() or type(exc).__name__ or "Unknown processing error."
     # Avoid leaking internal paths or library internals.
     if "MemoryError" in msg or isinstance(exc, MemoryError):
-        return "The image is too large for watermark removal on this server. Try a smaller image (under 1000px)."
+        return "The image is too large for watermark removal on this server. Try a smaller image (under 800px)."
     if "cv2" in msg or "OpenCV" in msg:
         return "Image processing failed on this server. Try a smaller or simpler image."
     return msg[:900]
@@ -642,7 +573,7 @@ async def _process_uploaded(message, context, file_id, wm, kind, filename=""):
     except asyncio.TimeoutError:
         await status.edit_text(
             "⏱️ Watermark removal timed out on this server. "
-            "Try a smaller image (under 1000px) or a shorter PDF. "
+            "Try a smaller image (under 800px) or a shorter PDF. "
             "If it keeps happening, the server may be low on memory."
         )
     except WatermarkError as exc:
