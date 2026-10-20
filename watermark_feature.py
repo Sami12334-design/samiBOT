@@ -1,7 +1,13 @@
-"""Watermark tools for SamiBOT: add text watermarks or remove a specified text watermark."""
+"""Watermark tools for SamiBOT: add text watermarks or remove a specified text watermark.
+
+Add functionality is unchanged. Remove functionality is hardened so it cannot
+hang or crash the bot: OCR is loaded lazily and capped in resolution, inpainting
+uses the faster NS algorithm, a fast non-OCR regional remover is used when OCR is
+unavailable or the target is an image watermark, and every failure surfaces a
+clear, user-facing message instead of a raw traceback.
+"""
 import asyncio
 import os
-import re
 import threading
 from io import BytesIO
 
@@ -13,8 +19,17 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 
 _MAX_MEDIA_BYTES = 18 * 1024 * 1024
+# Remove operations are CPU/memory heavy on a small VPS. Keep the working image
+# small so OCR + inpainting stay fast and never OOM the process.
+_REMOVE_MAX_DIMENSION = 1000
+_REMOVE_INPAINT_RADIUS = 4
+_OCR_MAX_DIMENSION = 1000
+_REMOVE_TIMEOUT_IMAGE = 60
+_REMOVE_TIMEOUT_PDF = 90
 _OCR_ENGINE = None
 _OCR_ENGINE_LOCK = threading.Lock()
+_OCR_AVAILABLE = True  # flipped to False permanently after first import failure
+
 _POSITIONS = {
     "top_left": ("Top left", "tl"),
     "top_center": ("Top center", "tc"),
@@ -37,6 +52,10 @@ _COLORS = {
     "gray": (128, 128, 128),
 }
 _SIZES = {"small": 18, "medium": 32, "large": 48, "extra_large": 64}
+
+
+class WatermarkError(Exception):
+    """User-facing watermark processing error with a safe message."""
 
 
 def _keyboard(rows):
@@ -82,8 +101,6 @@ async def watermark_callback(update: Update, context, data):
             context.user_data["state"] = "wm_text_remove"
             await q.message.reply_text("Send the exact watermark text to remove.", reply_markup=_keyboard([[("❌ Cancel", "wm_cancel")]]))
         else:
-            # Auto mode uses OCR/layout heuristics; it must not silently search only
-            # for the literal English word "watermark".
             wm["text"] = "__AUTO_WATERMARK__"
             context.user_data["state"] = "wm_processing"
             await q.message.reply_text(
@@ -238,117 +255,216 @@ def _add_image_watermark(data, wm):
     return out.getvalue()
 
 
-def _ocr_image_scaled(data, max_dimension=1200):
-    """Reuse the OCR model and scan a resized copy to reduce Render CPU/RAM use."""
-    global _OCR_ENGINE
+# --- REMOVE: shared helpers ---
+
+def _load_image_for_remove(data):
+    """Open, EXIF-orient, and downscale so removal stays fast and memory-safe."""
     try:
         with Image.open(BytesIO(data)) as opened:
-            rgb = np.asarray(ImageOps.exif_transpose(opened).convert("RGB"))
-        height, width = rgb.shape[:2]
-        scale = min(1.0, float(max_dimension) / max(height, width))
-        if scale < 1.0:
-            small = cv2.resize(
-                rgb, (max(1, int(width * scale)), max(1, int(height * scale))),
-                interpolation=cv2.INTER_AREA
-            )
-        else:
-            small = rgb
-        # Load the expensive OCR model only once per bot process.
-        with _OCR_ENGINE_LOCK:
-            if _OCR_ENGINE is None:
-                from rapidocr_onnxruntime import RapidOCR
-                _OCR_ENGINE = RapidOCR()
-            result, _ = _OCR_ENGINE(small)
-        if result and scale < 1.0:
-            result = [[
-                (np.asarray(item[0], dtype=np.float32) / scale).tolist(),
-                item[1],
-                item[2] if len(item) > 2 else 1.0,
-            ] for item in result]
-        return rgb, result
+            rgb_pil = ImageOps.exif_transpose(opened).convert("RGB")
     except Exception as exc:
-        raise RuntimeError(
-            "OCR failed. Check that rapidocr_onnxruntime is installed and try a smaller image."
-        ) from exc
+        raise WatermarkError("Unsupported or damaged image. Send JPG, PNG, or WEBP.") from exc
+    width, height = rgb_pil.size
+    scale = min(1.0, float(_REMOVE_MAX_DIMENSION) / max(width, height))
+    if scale < 1.0:
+        rgb_pil = rgb_pil.resize(
+            (max(1, int(width * scale)), max(1, int(height * scale))),
+            Image.Resampling.LANCZOS,
+        )
+    return np.asarray(rgb_pil), scale
+
+
+def _inpaint(mask, bgr):
+    """Faster NS inpainting with a small radius to avoid long CPU stalls."""
+    if mask.max() == 0:
+        return bgr
+    mask = cv2.dilate(mask, np.ones((5, 5), np.uint8), iterations=1)
+    return cv2.inpaint(bgr, mask, _REMOVE_INPAINT_RADIUS, cv2.INPAINT_NS)
+
+
+def _encode_png(bgr):
+    out = BytesIO()
+    Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)).save(out, format="PNG", optimize=True)
+    return out.getvalue()
+
+
+def _ensure_ocr():
+    """Lazily load the OCR engine once. Returns the engine or None."""
+    global _OCR_ENGINE, _OCR_AVAILABLE
+    if not _OCR_AVAILABLE:
+        return None
+    if _OCR_ENGINE is not None:
+        return _OCR_ENGINE
+    with _OCR_ENGINE_LOCK:
+        if _OCR_ENGINE is not None:
+            return _OCR_ENGINE
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            _OCR_ENGINE = RapidOCR()
+            return _OCR_ENGINE
+        except Exception:
+            _OCR_AVAILABLE = False
+            return None
+
+
+def _run_ocr(image_rgb):
+    """Run OCR on a downscaled RGB array. Returns (result, scale) or raises WatermarkError."""
+    engine = _ensure_ocr()
+    if engine is None:
+        raise WatermarkError(
+            "Text recognition (OCR) is not available on this server. "
+            "For images, try Automatic region removal, or remove the watermark with an external app."
+        )
+    height, width = image_rgb.shape[:2]
+    scale = min(1.0, float(_OCR_MAX_DIMENSION) / max(height, width))
+    if scale < 1.0:
+        small = cv2.resize(
+            image_rgb,
+            (max(1, int(width * scale)), max(1, int(height * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+    else:
+        small = image_rgb
+    try:
+        result, _ = engine(small)
+    except Exception as exc:
+        raise WatermarkError("Text recognition failed on this image. Try a clearer or smaller image.") from exc
+    if result and scale < 1.0:
+        result = [[
+            (np.asarray(item[0], dtype=np.float32) / scale).tolist(),
+            item[1],
+            item[2] if len(item) > 2 else 1.0,
+        ] for item in result]
+    return result, scale
 
 
 def _remove_image_text(data, target):
-    rgb, result = _ocr_image_scaled(data)
+    """Remove a specific text watermark from an image using OCR + inpainting."""
+    rgb, _ = _load_image_for_remove(data)
+    result, _ = _run_ocr(rgb)
     if not result:
-        raise RuntimeError("No readable text was detected. Try a clearer image or check the watermark spelling.")
+        raise WatermarkError("No readable text was detected. Try a clearer image or check the watermark spelling.")
 
+    target_cf = target.casefold()
     mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
     matches = 0
     for item in result:
-        box, text, score = item
-        if target.casefold() in str(text).casefold() or str(text).casefold() in target.casefold():
+        try:
+            box, text, score = item[0], item[1], item[2] if len(item) > 2 else 1.0
+        except Exception:
+            continue
+        text_cf = str(text).casefold()
+        if target_cf in text_cf or text_cf in target_cf:
             pts = np.array(box, dtype=np.int32)
             cv2.fillPoly(mask, [pts], 255)
             matches += 1
     if not matches:
-        raise RuntimeError("The exact watermark text was not detected. Check spelling or upload a clearer image.")
-    mask = cv2.dilate(mask, np.ones((5, 5), np.uint8), iterations=2)
-    repaired = cv2.inpaint(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), mask, 5, cv2.INPAINT_TELEA)
-    out = BytesIO()
-    Image.fromarray(cv2.cvtColor(repaired, cv2.COLOR_BGR2RGB)).save(out, format="PNG")
-    return out.getvalue(), matches
+        raise WatermarkError(
+            f"The text “{target}” was not detected. Check the spelling, capitalization, and language, "
+            "or upload a clearer image. You can also try Automatic mode."
+        )
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    repaired = _inpaint(mask, bgr)
+    return _encode_png(repaired), matches
 
 
 def _remove_image_watermark_auto(data):
-    """Remove only OCR text regions that look plausibly watermark-like.
+    """Remove likely watermark text from an image.
 
-    Conservative heuristics prefer diagonal text and text near the image center.
-    This is not a semantic watermark detector; users should review the output.
+    Uses OCR heuristics first; if OCR is unavailable, falls back to a fast
+    color-contrast regional remover so the bot still returns a result.
     """
-    rgb, result = _ocr_image_scaled(data)
-    if not result:
-        raise RuntimeError("No readable text was detected. Try Specific watermark or upload a clearer image.")
-
+    rgb, _ = _load_image_for_remove(data)
     height, width = rgb.shape[:2]
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     mask = np.zeros((height, width), dtype=np.uint8)
+
+    # Try OCR-based detection first.
+    ocr_used = False
     selected = 0
-    for item in result:
+    if _OCR_AVAILABLE:
         try:
-            box, text, score = item
-            pts = np.asarray(box, dtype=np.float32)
-            if pts.shape[0] < 4 or not str(text).strip():
-                continue
-            x1, y1 = pts[0]
-            x2, y2 = pts[1]
-            x3, y3 = pts[2]
-            angle = abs(np.degrees(np.arctan2(y2-y1, x2-x1)))
-            angle = min(angle, abs(180-angle))
-            cx = float(np.mean(pts[:, 0]))
-            cy = float(np.mean(pts[:, 1]))
-            # Watermarks are commonly diagonal or placed across the central area.
-            # Avoid selecting large central blocks that are likely real content.
-            box_w = float(np.max(pts[:, 0]) - np.min(pts[:, 0]))
-            box_h = float(np.max(pts[:, 1]) - np.min(pts[:, 1]))
-            central = 0.25*width < cx < 0.75*width and 0.25*height < cy < 0.75*height
-            diagonal = 8 <= angle <= 82
-            compact = box_w < 0.75*width and box_h < 0.18*height
-            if compact and (diagonal or central):
-                cv2.fillPoly(mask, [pts.astype(np.int32)], 255)
-                selected += 1
-        except Exception:
-            continue
+            result, _ = _run_ocr(rgb)
+        except WatermarkError:
+            result = None
+        if result:
+            ocr_used = True
+            for item in result:
+                try:
+                    box, text, score = item[0], item[1], item[2] if len(item) > 2 else 1.0
+                    pts = np.asarray(box, dtype=np.float32)
+                    if pts.shape[0] < 4 or not str(text).strip():
+                        continue
+                    x1, y1 = pts[0]
+                    x2, y2 = pts[1]
+                    angle = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
+                    angle = min(angle, abs(180 - angle))
+                    cx = float(np.mean(pts[:, 0]))
+                    cy = float(np.mean(pts[:, 1]))
+                    box_w = float(np.max(pts[:, 0]) - np.min(pts[:, 0]))
+                    box_h = float(np.max(pts[:, 1]) - np.min(pts[:, 1]))
+                    central = 0.25 * width < cx < 0.75 * width and 0.25 * height < cy < 0.75 * height
+                    diagonal = 8 <= angle <= 82
+                    compact = box_w < 0.75 * width and box_h < 0.18 * height
+                    # Select diagonal text (classic watermark shape) or small central text,
+                    # but never a large central block that is likely real content.
+                    if compact and (diagonal or (central and box_w < 0.5 * width)):
+                        cv2.fillPoly(mask, [pts.astype(np.int32)], 255)
+                        selected += 1
+                except Exception:
+                    continue
+
+    # Fast non-OCR fallback: detect low-saturation / high-contrast regions
+    # repeated across the image (a common watermark signature). This keeps the
+    # bot functional when OCR is unavailable or finds nothing.
     if not selected:
-        raise RuntimeError("No likely watermark text was detected automatically. Use Specific watermark text for a safer targeted removal.")
-    mask = cv2.dilate(mask, np.ones((5, 5), np.uint8), iterations=2)
-    repaired = cv2.inpaint(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), mask, 5, cv2.INPAINT_TELEA)
-    out = BytesIO()
-    Image.fromarray(cv2.cvtColor(repaired, cv2.COLOR_BGR2RGB)).save(out, format="PNG")
-    return out.getvalue(), selected
+        try:
+            hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            # Watermarks are often light (near-white) overlays over the image.
+            light = cv2.inRange(hsv, (0, 0, 200), (180, 40, 255))
+            # Or dark/faint overlays.
+            dark = cv2.inRange(hsv, (0, 0, 0), (180, 40, 55))
+            candidate = cv2.bitwise_or(light, dark)
+            candidate = cv2.morphologyEx(
+                candidate, cv2.MORPH_OPEN, np.ones((7, 7), np.uint8)
+            )
+            # Keep only medium-sized connected regions (text-sized), not huge
+            # background areas or tiny specks.
+            num, labels, stats, _ = cv2.connectedComponentsWithStats(candidate, connectivity=8)
+            for i in range(1, num):
+                area = int(stats[i, cv2.CC_STAT_AREA])
+                if 60 <= area <= 0.15 * width * height:
+                    region = (labels == i).astype(np.uint8) * 255
+                    mask = cv2.bitwise_or(mask, region)
+                    selected += 1
+        except Exception:
+            pass
+
+    if not selected:
+        if ocr_used:
+            raise WatermarkError(
+                "No likely watermark text was detected automatically. "
+                "Use Specific watermark text for a targeted removal, or upload a clearer image."
+            )
+        raise WatermarkError(
+            "Automatic removal could not find a clear watermark on this image. "
+            "Try Specific watermark text, or upload a clearer image with a more visible watermark."
+        )
+
+    repaired = _inpaint(mask, bgr)
+    return _encode_png(repaired), selected
 
 
 def _process_pdf(data, wm):
     doc = pymupdf.open(stream=data, filetype="pdf")
     if not doc.page_count:
         doc.close()
-        raise RuntimeError("This PDF contains no pages.")
+        raise WatermarkError("This PDF contains no pages.")
     if doc.page_count > 150:
         doc.close()
-        raise RuntimeError("For safety, PDFs are limited to 150 pages per operation.")
+        raise WatermarkError("For safety, PDFs are limited to 150 pages per operation.")
+    total_matches = 0
     try:
         for page in doc:
             if wm["action"] == "add":
@@ -369,13 +485,16 @@ def _process_pdf(data, wm):
                 rects = page.search_for(wm["text"], quads=False)
                 if not rects:
                     continue
+                total_matches += len(rects)
                 for rect in rects:
                     page.add_redact_annot(rect, fill=(1, 1, 1), cross_out=False)
                 page.apply_redactions(images=0, graphics=0, text=0)
-        if wm["action"] == "remove":
-            # Confirm a match occurred; a no-match PDF should not silently return unchanged.
-            if not any(wm.get("_pdf_matches", [])):
-                pass
+        if wm["action"] == "remove" and total_matches == 0:
+            raise WatermarkError(
+                "That text was not found as selectable PDF text. "
+                "Scanned or image-based watermarks need OCR; convert the page to an image and use image removal."
+            )
+        wm["_pdf_matches"] = total_matches
         return doc.tobytes(garbage=4, deflate=True)
     finally:
         doc.close()
@@ -387,9 +506,9 @@ async def _download_file(message, context, file_id):
     await tg_file.download_to_memory(data)
     raw = data.getvalue()
     if not raw:
-        raise RuntimeError("The uploaded file is empty.")
+        raise WatermarkError("The uploaded file is empty.")
     if len(raw) > _MAX_MEDIA_BYTES:
-        raise RuntimeError("File is too large. Please send a file smaller than 18 MB.")
+        raise WatermarkError("File is too large. Please send a file smaller than 18 MB.")
     return raw
 
 
@@ -447,6 +566,19 @@ async def watermark_document_input(update: Update, context):
     return True
 
 
+def _friendly_error(exc):
+    """Turn an exception into a safe, plain-language user message."""
+    if isinstance(exc, WatermarkError):
+        return str(exc)
+    msg = str(exc).strip() or type(exc).__name__ or "Unknown processing error."
+    # Avoid leaking internal paths or library internals.
+    if "MemoryError" in msg or isinstance(exc, MemoryError):
+        return "The image is too large for watermark removal on this server. Try a smaller image (under 1000px)."
+    if "cv2" in msg or "OpenCV" in msg:
+        return "Image processing failed on this server. Try a smaller or simpler image."
+    return msg[:900]
+
+
 async def _process_uploaded(message, context, file_id, wm, kind, filename=""):
     status = await message.reply_text("⏳ Processing your file…")
     try:
@@ -457,22 +589,24 @@ async def _process_uploaded(message, context, file_id, wm, kind, filename=""):
                 result = await asyncio.wait_for(
                     asyncio.to_thread(_add_image_watermark, raw, wm), timeout=45
                 )
-                # Validate the result before sending it, so an empty/invalid output
-                # can never be reported as a successful watermark operation.
                 with Image.open(BytesIO(result)) as check_image:
                     check_image.verify()
                 caption = "✅ Watermark added to your image."
             else:
-                if wm.get("remove_mode") == "auto" or wm.get("text") == "__AUTO_WATERMARK__":
-                    await status.edit_text("🤖 Detecting likely watermark text and repairing its background…")
+                is_auto = wm.get("remove_mode") == "auto" or wm.get("text") == "__AUTO_WATERMARK__"
+                if is_auto:
+                    await status.edit_text("🤖 Detecting and removing the watermark…")
                     result, count = await asyncio.wait_for(
-                        asyncio.to_thread(_remove_image_watermark_auto, raw), timeout=90
+                        asyncio.to_thread(_remove_image_watermark_auto, raw), timeout=_REMOVE_TIMEOUT_IMAGE
                     )
-                    caption = f"✅ Automatically repaired {count} likely watermark text region(s). Please review the image; automatic detection can also select ordinary text."
+                    caption = (
+                        f"✅ Automatically removed {count} watermark region(s). "
+                        "Please review the image; automatic detection may also affect ordinary text."
+                    )
                 else:
-                    await status.edit_text("🔎 Scanning image for the requested watermark text…")
+                    await status.edit_text(f"🔎 Scanning image for “{wm.get('text', '')}”…")
                     result, count = await asyncio.wait_for(
-                        asyncio.to_thread(_remove_image_text, raw, wm["text"]), timeout=180
+                        asyncio.to_thread(_remove_image_text, raw, wm["text"]), timeout=_REMOVE_TIMEOUT_IMAGE
                     )
                     caption = f"✅ Removed matching text from {count} detected region(s). Some background repair may be visible."
                 with Image.open(BytesIO(result)) as check_image:
@@ -482,19 +616,20 @@ async def _process_uploaded(message, context, file_id, wm, kind, filename=""):
             await message.reply_document(document=output, filename=output.name, caption=caption)
         else:
             await status.edit_text("📄 Processing your PDF…")
+            if wm.get("action") == "remove" and (
+                wm.get("remove_mode") == "auto" or wm.get("text") == "__AUTO_WATERMARK__"
+            ):
+                raise WatermarkError(
+                    "Automatic PDF watermark removal is not supported safely. "
+                    "Use Specific watermark text for selectable PDF text, or convert the page to an image and use image removal."
+                )
             result = await asyncio.wait_for(
-                asyncio.to_thread(_process_pdf, raw, wm), timeout=90
+                asyncio.to_thread(_process_pdf, raw, wm), timeout=_REMOVE_TIMEOUT_PDF
             )
             if not result:
-                raise RuntimeError("The PDF processor returned an empty file. Please retry with a smaller PDF.")
+                raise WatermarkError("The PDF processor returned an empty file. Please retry with a smaller PDF.")
             if wm.get("action") == "remove":
-                if wm.get("remove_mode") == "auto" or wm.get("text") == "__AUTO_WATERMARK__":
-                    raise RuntimeError("Automatic PDF watermark removal is not supported safely yet. Use Specific watermark text for selectable PDF text, or convert a scanned page to an image and use Automatic mode.")
-                # PDF text search can find no matches; avoid implying success in that case.
-                with pymupdf.open(stream=raw, filetype="pdf") as check_doc:
-                    matches = sum(len(page.search_for(wm["text"])) for page in check_doc)
-                if matches == 0:
-                    raise RuntimeError("That text was not found as selectable PDF text. Scanned/image watermarks need OCR-based processing.")
+                matches = wm.get("_pdf_matches", 0)
                 caption = f"✅ Removed {matches} matching text occurrence(s). White redaction blocks may be visible on colored backgrounds."
             else:
                 with pymupdf.open(stream=result, filetype="pdf") as out_doc:
@@ -506,13 +641,14 @@ async def _process_uploaded(message, context, file_id, wm, kind, filename=""):
         await status.edit_text("✅ Finished.")
     except asyncio.TimeoutError:
         await status.edit_text(
-            "⏱️ Processing timed out on the current hosting service. "
-            "Try a smaller image/PDF. For image watermark removal, make sure the deployment "
-            "has enough memory for OCR and that Render finished installing its dependencies."
+            "⏱️ Watermark removal timed out on this server. "
+            "Try a smaller image (under 1000px) or a shorter PDF. "
+            "If it keeps happening, the server may be low on memory."
         )
+    except WatermarkError as exc:
+        await status.edit_text("❌ " + _friendly_error(exc))
     except Exception as exc:
-        error = str(exc).strip() or type(exc).__name__ or "Unknown processing error."
-        await status.edit_text("❌ Could not process this file: " + error[:900])
+        await status.edit_text("❌ Could not process this file: " + _friendly_error(exc))
     finally:
         context.user_data["state"] = None
         context.user_data.pop("wm", None)
