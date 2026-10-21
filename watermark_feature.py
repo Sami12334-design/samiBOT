@@ -1,10 +1,9 @@
-"""Watermark tools for SamiBOT: add text watermarks or remove a specified text watermark.
+"""Watermark tools for SamiBOT: add text watermarks or remove existing watermarks.
 
-Add functionality is unchanged. Remove functionality is hardened so it cannot
-hang or crash the bot: OCR is loaded lazily and capped in resolution, inpainting
-uses the faster NS algorithm, a fast non-OCR regional remover is used when OCR is
-unavailable or the target is an image watermark, and every failure surfaces a
-clear, user-facing message instead of a raw traceback.
+Add functionality is unchanged. Remove functionality delegates to the
+classical-CV core in ``watermark_removal.py`` which supports auto (HSV color
+detection), region (user-supplied rectangle or preset), color (target color
++ tolerance), and text (PDF selectable text) modes.
 """
 import asyncio
 import os
@@ -16,14 +15,16 @@ import cv2
 import numpy as np
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from watermark_removal import (
+    remove_watermark as _core_remove_watermark,
+    remove_pdf_watermark as _core_remove_pdf_watermark,
+    RemovalResult,
+    WatermarkRemovalError,
+)
 
 _MAX_MEDIA_BYTES = 18 * 1024 * 1024
-# Keep the working image small so inpainting stays fast (under ~15s) and never
-# OOM the process. No OCR is used — removal is pure OpenCV.
-_REMOVE_MAX_DIMENSION = 800
-_REMOVE_INPAINT_RADIUS = 3
-_REMOVE_TIMEOUT_IMAGE = 20
-_REMOVE_TIMEOUT_PDF = 30
+_REMOVE_TIMEOUT_IMAGE = 30
+_REMOVE_TIMEOUT_PDF = 60
 
 _POSITIONS = {
     "top_left": ("Top left", "tl"),
@@ -135,10 +136,13 @@ async def watermark_callback(update: Update, context, data):
             context.user_data["state"] = "wm_choose_remove_mode"
             await q.message.reply_text(
                 "Choose how to remove the watermark:",
-                reply_markup=_keyboard([[( "1️⃣ Specific watermark text", "wm_remove_mode|specific")],
-                                        [( "2️⃣ Automatic (look for the word watermark)", "wm_remove_mode|auto")],
-                                        [( "❌ Cancel", "wm_cancel")]])
-            )
+                reply_markup=_keyboard([
+                    [("🤖 Automatic (detect colored banners)", "wm_remove_mode|auto")],
+                    [("📍 Region (pick a position)", "wm_remove_mode|region")],
+                    [("🎨 Color (pick a color)", "wm_remove_mode|color")],
+                    [("📝 Specific text (PDF selectable text)", "wm_remove_mode|specific")],
+                    [("❌ Cancel", "wm_cancel")],
+                ]))
         return True
     if data.startswith("wm_pos|"):
         pos = data.split("|", 1)[1]
@@ -250,141 +254,44 @@ def _add_image_watermark(data, wm):
     return out.getvalue()
 
 
-# --- REMOVE: fast OpenCV-only helpers (no OCR, completes in seconds) ---
+# --- REMOVE: delegates to watermark_removal.py core processor ---
 
-def _load_image_for_remove(data):
-    """Open, EXIF-orient, and downscale so removal stays fast and memory-safe."""
-    try:
-        with Image.open(BytesIO(data)) as opened:
-            rgb_pil = ImageOps.exif_transpose(opened).convert("RGB")
-    except Exception as exc:
-        raise WatermarkError("Unsupported or damaged image. Send JPG, PNG, or WEBP.") from exc
-    width, height = rgb_pil.size
-    scale = min(1.0, float(_REMOVE_MAX_DIMENSION) / max(width, height))
-    if scale < 1.0:
-        rgb_pil = rgb_pil.resize(
-            (max(1, int(width * scale)), max(1, int(height * scale))),
-            Image.Resampling.LANCZOS,
-        )
-    return np.asarray(rgb_pil)
-
-
-def _inpaint(mask, bgr):
-    """Fast NS inpainting with a small radius to avoid long CPU stalls."""
-    if mask.max() == 0:
-        return bgr
-    mask = cv2.dilate(mask, np.ones((5, 5), np.uint8), iterations=1)
-    return cv2.inpaint(bgr, mask, _REMOVE_INPAINT_RADIUS, cv2.INPAINT_NS)
-
-
-def _encode_png(bgr):
-    out = BytesIO()
-    Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)).save(out, format="PNG", optimize=True)
-    return out.getvalue()
-
-
-def _render_text_templates(text, width, height):
-    """Render the target text at several sizes/colors as grayscale templates for matching."""
-    templates = []
-    base_size = max(12, min(width, height) // 12)
-    for size in (base_size, base_size * 2, base_size // 2):
-        if size < 10:
-            continue
-        font = _font(size)
-        for color in ((255, 255, 255), (0, 0, 0), (200, 200, 200), (128, 128, 128)):
-            tmp_img = Image.new("L", (width, height), 128)
-            draw = ImageDraw.Draw(tmp_img)
-            bbox = draw.textbbox((0, 0), text, font=font, stroke_width=1)
-            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            if tw <= 0 or th <= 0 or tw >= width or th >= height:
-                continue
-            draw.text((2, 2), text, fill=color, font=font, stroke_width=1)
-            cropped = tmp_img.crop((0, 0, min(tw + 6, width), min(th + 6, height)))
-            templates.append(np.asarray(cropped))
-    return templates
-
-
-def _remove_image_text(data, target):
-    """Remove a specific text watermark using fast template matching + inpainting.
-
-    No OCR is used. The target text is rendered at several sizes and matched
-    against the image with cv2.matchTemplate. This completes in seconds.
-    """
-    rgb = _load_image_for_remove(data)
-    height, width = rgb.shape[:2]
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    mask = np.zeros((height, width), dtype=np.uint8)
-    matches = 0
-
-    for template in _render_text_templates(target, width, height):
-        th, tw = template.shape[:2]
-        if th >= height or tw >= width:
-            continue
-        for method in (cv2.TM_SQDIFF_NORMED, cv2.TM_CCOEFF_NORMED):
-            try:
-                result = cv2.matchTemplate(gray, template, method)
-            except Exception:
-                continue
-            if method == cv2.TM_SQDIFF_NORMED:
-                locs = np.where(result <= 0.3)
-            else:
-                locs = np.where(result >= 0.7)
-            for pt in zip(*locs[::-1]):
-                cv2.rectangle(mask, pt, (pt[0] + tw, pt[1] + th), 255, -1)
-                matches += 1
-
-    if not matches:
+def _remove_image_auto(data, config=None):
+    """Auto-detect and remove a colored watermark banner (e.g. orange + white text)."""
+    result = _core_remove_watermark(data, mode="auto", config=config)
+    if not result.success:
         raise WatermarkError(
-            f"The text \"{target}\" was not found. Check the spelling, or try Automatic mode. "
-            "For non-English text, Automatic mode may work better."
+            "; ".join(result.warnings)
+            or "Automatic removal could not find a clear watermark on this image."
         )
-    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    repaired = _inpaint(mask, bgr)
-    return _encode_png(repaired), matches
+    count = len(result.regions)
+    return result.image_bytes, count, result.warnings
 
 
-def _remove_image_watermark_auto(data):
-    """Remove likely watermark regions from an image using fast color/contrast detection.
-
-    No OCR is used. Detects light (near-white) and dark overlay regions that are
-    typical of watermarks, then inpaints them. Completes in a few seconds.
-    """
-    rgb = _load_image_for_remove(data)
-    height, width = rgb.shape[:2]
-    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    mask = np.zeros((height, width), dtype=np.uint8)
-    selected = 0
-
-    try:
-        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-        # Watermarks are often light (near-white) or dark overlays over the image.
-        light = cv2.inRange(hsv, (0, 0, 200), (180, 40, 255))
-        dark = cv2.inRange(hsv, (0, 0, 0), (180, 40, 55))
-        candidate = cv2.bitwise_or(light, dark)
-        candidate = cv2.morphologyEx(
-            candidate, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8)
-        )
-        # Keep only medium-sized connected regions (text-sized), not huge
-        # background areas or tiny specks.
-        num, labels, stats, _ = cv2.connectedComponentsWithStats(candidate, connectivity=8)
-        max_area = 0.12 * width * height
-        for i in range(1, num):
-            area = int(stats[i, cv2.CC_STAT_AREA])
-            if 40 <= area <= max_area:
-                region = (labels == i).astype(np.uint8) * 255
-                mask = cv2.bitwise_or(mask, region)
-                selected += 1
-    except Exception:
-        pass
-
-    if not selected:
+def _remove_image_region(data, region, config=None):
+    """Remove a watermark from a user-selected region or position preset."""
+    cfg = dict(config or {})
+    cfg["region"] = region
+    result = _core_remove_watermark(data, mode="region", config=cfg)
+    if not result.success:
         raise WatermarkError(
-            "Automatic removal could not find a clear watermark on this image. "
-            "Try Specific watermark text, or upload a clearer image with a more visible watermark."
+            "; ".join(result.warnings)
+            or "No watermark was found in the selected region."
         )
+    return result.image_bytes, len(result.regions), result.warnings
 
-    repaired = _inpaint(mask, bgr)
-    return _encode_png(repaired), selected
+
+def _remove_image_color(data, target_color, config=None):
+    """Remove a watermark matching a user-specified color with tolerance."""
+    cfg = dict(config or {})
+    cfg["target_color"] = target_color
+    result = _core_remove_watermark(data, mode="color", config=cfg)
+    if not result.success:
+        raise WatermarkError(
+            "; ".join(result.warnings)
+            or "No watermark matching that color was found."
+        )
+    return result.image_bytes, len(result.regions), result.warnings
 
 
 def _process_pdf(data, wm):
@@ -395,10 +302,9 @@ def _process_pdf(data, wm):
     if doc.page_count > 150:
         doc.close()
         raise WatermarkError("For safety, PDFs are limited to 150 pages per operation.")
-    total_matches = 0
-    try:
-        for page in doc:
-            if wm["action"] == "add":
+    if wm["action"] == "add":
+        try:
+            for page in doc:
                 rect = page.rect
                 size = min(float(wm["size"]), max(12.0, rect.width / 5))
                 font = "helv"
@@ -412,23 +318,24 @@ def _process_pdf(data, wm):
                     page.insert_text((rect.width*0.18, rect.height*0.55), wm["text"], fontsize=size, fontname=font, color=color, fill_opacity=0.55, rotate=45, overlay=True)
                 else:
                     page.insert_text((max(4,x), max(size+2,min(rect.height-4,y))), wm["text"], fontsize=size, fontname=font, color=color, fill_opacity=0.55, overlay=True)
-            else:
-                rects = page.search_for(wm["text"], quads=False)
-                if not rects:
-                    continue
-                total_matches += len(rects)
-                for rect in rects:
-                    page.add_redact_annot(rect, fill=(1, 1, 1), cross_out=False)
-                page.apply_redactions(images=0, graphics=0, text=0)
-        if wm["action"] == "remove" and total_matches == 0:
-            raise WatermarkError(
-                "That text was not found as selectable PDF text. "
-                "Scanned or image-based watermarks need OCR; convert the page to an image and use image removal."
-            )
-        wm["_pdf_matches"] = total_matches
-        return doc.tobytes(garbage=4, deflate=True)
-    finally:
-        doc.close()
+            return doc.tobytes(garbage=4, deflate=True)
+        finally:
+            doc.close()
+    # Remove action: delegate to core PDF processor.
+    doc.close()
+    remove_mode = wm.get("remove_mode", "auto")
+    pdf_text = wm.get("text") if remove_mode == "specific" else None
+    core_mode = "text" if pdf_text else "auto"
+    try:
+        result = _core_remove_pdf_watermark(
+            data, mode=core_mode, text=pdf_text,
+        )
+    except WatermarkRemovalError as exc:
+        raise WatermarkError(str(exc)) from exc
+    if not result["success"]:
+        raise WatermarkError("; ".join(result["warnings"]) or "No watermark was detected in the PDF.")
+    wm["_pdf_matches"] = result["pages_processed"]
+    return result["pdf_bytes"]
 
 
 async def _download_file(message, context, file_id):
