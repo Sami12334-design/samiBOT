@@ -1,6 +1,5 @@
 """Tests for the Telegram watermark workflow (watermark_feature.py).
 
-Run from the repo root:  python -m unittest tests/test_watermark_feature.py
 Telegram objects are replaced with small fakes; image/PDF processing is real.
 """
 import ast
