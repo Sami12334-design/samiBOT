@@ -1938,11 +1938,20 @@ async def menu_callback(update, context):
         await query.message.reply_text("🔗 Fetch Telegram\n\nSend me a link (e.g., t.me/channel/123 or t.me/channel/123-130):")
         context.user_data['state'] = 'fetch_link'
     elif data == "golden_downloader":
+        if not is_authenticated(user_id):
+            context.user_data["state"] = None
+            await query.answer("🔒 Sign in first to use Golden Downloader.", show_alert=True)
+            await query.message.reply_text(
+                "🔒 <b>Golden Downloader is for signed-in users only.</b>\n\n"
+                "Please send /start and complete sign-in before requesting a document.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
         context.user_data["state"] = "golden_downloader_link"
         await query.message.reply_text(
             "📥 <b>GOLDEN DOWNLOADER</b>\n\n"
             "Send a document link from Studocu, Scribd, or another supported source.\n"
-            "I’ll try to retrieve the available document and send it here as a file.\n\n"
+            "I’ll retrieve only files or previews the source makes publicly available.\n\n"
             "🔗 Please send one link at a time.",
             parse_mode=ParseMode.HTML
         )
@@ -8555,9 +8564,15 @@ async def handle_link(update, context):
         state = None
     if state == "golden_downloader_link":
         context.user_data["state"] = None
+        if not is_authenticated(user_id):
+            await update.message.reply_text(
+                "🔒 Your sign-in is required before Golden Downloader can process a link.\n\n"
+                "Please send /start and complete sign-in first."
+            )
+            return
         candidate = (text or "").strip()
-        if not re.match(r"^https?://", candidate, re.I):
-            await update.message.reply_text("❌ Please send a complete document URL beginning with https:// or http://.")
+        if not re.match(r"^https://", candidate, re.I):
+            await update.message.reply_text("❌ Please send a complete HTTPS document URL beginning with https://.")
             return
         host = (urllib.parse.urlparse(candidate).hostname or "").lower()
         supported_hosts = ("studocu.com", "www.studocu.com", "scribd.com", "www.scribd.com", "pdfcoffee.com", "www.pdfcoffee.com")
