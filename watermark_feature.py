@@ -25,6 +25,15 @@ from watermark_removal import (
 _MAX_MEDIA_BYTES = 18 * 1024 * 1024
 _REMOVE_TIMEOUT_IMAGE = 30
 _REMOVE_TIMEOUT_PDF = 60
+_MAX_ATTEMPTS = 3  # failed processing attempts allowed before the session is cleared
+_AUTO_SENTINEL = "__AUTO_WATERMARK__"
+# Presets understood by watermark_removal._region_detect (hyphenated names).
+_REGION_PRESETS = {
+    "top-left": "↖️ Top left",
+    "top-right": "↗️ Top right",
+    "bottom-left": "↙️ Bottom left",
+    "bottom-right": "↘️ Bottom right",
+}
 
 _POSITIONS = {
     "top_left": ("Top left", "tl"),
@@ -61,6 +70,23 @@ def _keyboard(rows):
     ])
 
 
+def _remove_mode_keyboard():
+    return _keyboard([
+        [("🤖 Automatic (detect colored banners)", "wm_remove_mode|auto")],
+        [("📍 Region (pick a position)", "wm_remove_mode|region")],
+        [("🎨 Color (pick a color)", "wm_remove_mode|color")],
+        [("📝 Specific text (PDF selectable text)", "wm_remove_mode|specific")],
+        [("❌ Cancel", "wm_cancel")],
+    ])
+
+
+def _retry_keyboard(wm):
+    first = [("🔁 Retry", "wm_retry")]
+    if wm.get("action") == "remove":
+        first.append(("🔀 Change method", "wm_change_method"))
+    return _keyboard([first, [("🔄 Start over", "watermark"), ("❌ Cancel", "wm_cancel")]])
+
+
 async def watermark_start(update: Update, context):
     context.user_data["wm"] = {}
     context.user_data["state"] = "wm_upload_first"
@@ -88,22 +114,84 @@ async def watermark_callback(update: Update, context, data):
         return True
     if data.startswith("wm_remove_mode|"):
         mode = data.split("|", 1)[1]
-        if mode not in ("specific", "auto") or not wm.get("file_id"):
+        if mode not in ("auto", "region", "color", "specific"):
+            await q.message.reply_text("❌ Invalid option. Please choose again.", reply_markup=_remove_mode_keyboard())
+            return True
+        if not wm.get("file_id"):
             await q.message.reply_text("❌ Session expired. Start again with /watermark.")
+            return True
+        if mode == "specific" and wm.get("kind") == "image":
+            await q.message.reply_text(
+                "ℹ️ Specific text removal only works on PDFs with selectable text. "
+                "For images, choose Automatic, Region, or Color.",
+                reply_markup=_remove_mode_keyboard())
+            return True
+        if mode in ("region", "color") and wm.get("kind") == "pdf":
+            await q.message.reply_text(
+                "ℹ️ Region and color removal work on images only. "
+                "For a PDF, use Specific text (selectable PDF text).",
+                reply_markup=_remove_mode_keyboard())
             return True
         wm["action"] = "remove"
         wm["remove_mode"] = mode
-        if mode == "specific":
+        if mode == "region":
+            context.user_data["state"] = "wm_choose_region"
+            rows = [[(_REGION_PRESETS["top-left"], "wm_region|top-left"), (_REGION_PRESETS["top-right"], "wm_region|top-right")],
+                    [(_REGION_PRESETS["bottom-left"], "wm_region|bottom-left"), (_REGION_PRESETS["bottom-right"], "wm_region|bottom-right")],
+                    [("❌ Cancel", "wm_cancel")]]
+            await q.message.reply_text("Where is the watermark?", reply_markup=_keyboard(rows))
+        elif mode == "color":
+            context.user_data["state"] = "wm_choose_remove_color"
+            await q.message.reply_text("Choose the watermark color to remove:",
+                reply_markup=_keyboard([[("⚫ Black", "wm_rmcolor|black"), ("⚪ White", "wm_rmcolor|white")],
+                                        [("🔴 Red", "wm_rmcolor|red"), ("🔵 Blue", "wm_rmcolor|blue")],
+                                        [("🟢 Green", "wm_rmcolor|green"), ("🟡 Yellow", "wm_rmcolor|yellow")],
+                                        [("◻️ Gray", "wm_rmcolor|gray"), ("❌ Cancel", "wm_cancel")]]))
+        elif mode == "specific":
             context.user_data["state"] = "wm_text_remove"
             await q.message.reply_text("Send the exact watermark text to remove.", reply_markup=_keyboard([[("❌ Cancel", "wm_cancel")]]))
         else:
-            wm["text"] = "__AUTO_WATERMARK__"
+            wm["text"] = _AUTO_SENTINEL
             context.user_data["state"] = "wm_processing"
             await q.message.reply_text(
                 "🤖 Scanning for likely watermark text (for example, diagonal or faint text). "
                 "Automatic detection can miss watermarks or select ordinary text, so check the result."
             )
             await _process_uploaded(q.message, context, wm["file_id"], wm, wm["kind"], wm.get("filename", ""))
+        return True
+    if data.startswith("wm_region|") or data.startswith("wm_rmcolor|"):
+        which, value = data.split("|", 1)
+        if wm.get("action") != "remove" or wm.get("kind") != "image" or not wm.get("file_id"):
+            await q.message.reply_text("❌ Session expired. Start again with /watermark.")
+            return True
+        if which == "wm_region" and value in _REGION_PRESETS:
+            wm["remove_mode"], wm["region_preset"] = "region", value
+        elif which == "wm_rmcolor" and value in _COLORS:
+            wm["remove_mode"], wm["target_color"] = "color", value
+        else:
+            await q.message.reply_text("❌ Invalid choice. Please choose again.")
+            return True
+        context.user_data["state"] = "wm_processing"
+        await q.message.reply_text("✅ Settings saved. Removing the watermark…")
+        await _process_uploaded(q.message, context, wm["file_id"], wm, wm["kind"], wm.get("filename", ""))
+        return True
+    if data == "wm_retry":
+        if not wm.get("file_id") or wm.get("kind") not in ("image", "pdf") or wm.get("action") not in ("add", "remove"):
+            await q.message.reply_text("❌ Session expired. Start again with /watermark.")
+            return True
+        if context.user_data.get("state") == "wm_processing":
+            await q.message.reply_text("⏳ Still processing your file. Please wait.")
+            return True
+        context.user_data["state"] = "wm_processing"
+        await q.message.reply_text("🔁 Retrying with the same file and settings…")
+        await _process_uploaded(q.message, context, wm["file_id"], wm, wm["kind"], wm.get("filename", ""))
+        return True
+    if data == "wm_change_method":
+        if wm.get("action") != "remove" or not wm.get("file_id"):
+            await q.message.reply_text("❌ Session expired. Start again with /watermark.")
+            return True
+        context.user_data["state"] = "wm_choose_remove_mode"
+        await q.message.reply_text("Choose how to remove the watermark:", reply_markup=_remove_mode_keyboard())
         return True
     if data.startswith("wm_type|"):
         kind = data.split("|", 1)[1]
@@ -134,15 +222,7 @@ async def watermark_callback(update: Update, context, data):
             )
         else:
             context.user_data["state"] = "wm_choose_remove_mode"
-            await q.message.reply_text(
-                "Choose how to remove the watermark:",
-                reply_markup=_keyboard([
-                    [("🤖 Automatic (detect colored banners)", "wm_remove_mode|auto")],
-                    [("📍 Region (pick a position)", "wm_remove_mode|region")],
-                    [("🎨 Color (pick a color)", "wm_remove_mode|color")],
-                    [("📝 Specific text (PDF selectable text)", "wm_remove_mode|specific")],
-                    [("❌ Cancel", "wm_cancel")],
-                ]))
+            await q.message.reply_text("Choose how to remove the watermark:", reply_markup=_remove_mode_keyboard())
         return True
     if data.startswith("wm_pos|"):
         pos = data.split("|", 1)[1]
@@ -294,6 +374,31 @@ def _remove_image_color(data, target_color, config=None):
     return result.image_bytes, len(result.regions), result.warnings
 
 
+def _remove_image(data, wm):
+    """Run the image-removal mode chosen in the menu.
+
+    Returns ``(image_bytes, region_count, warnings)`` like the wrappers above.
+    """
+    mode = wm.get("remove_mode") or ("auto" if wm.get("text") == _AUTO_SENTINEL else "specific")
+    if mode == "auto":
+        return _remove_image_auto(data)
+    if mode == "region":
+        preset = wm.get("region_preset")
+        if preset not in _REGION_PRESETS:
+            raise WatermarkError("No region was selected. Please choose where the watermark is.")
+        return _remove_image_region(data, {"preset": preset})
+    if mode == "color":
+        name = wm.get("target_color")
+        if name not in _COLORS:
+            raise WatermarkError("No color was selected. Please choose the watermark color.")
+        r, g, b = _COLORS[name]
+        return _remove_image_color(data, (b, g, r))  # core expects BGR
+    raise WatermarkError(
+        "Specific text removal only works on PDFs with selectable text. "
+        "For images, use Automatic, Region, or Color."
+    )
+
+
 def _process_pdf(data, wm):
     doc = pymupdf.open(stream=data, filetype="pdf")
     if not doc.page_count:
@@ -406,7 +511,7 @@ async def watermark_document_input(update: Update, context):
 
 def _friendly_error(exc):
     """Turn an exception into a safe, plain-language user message."""
-    if isinstance(exc, WatermarkError):
+    if isinstance(exc, (WatermarkError, WatermarkRemovalError)):
         return str(exc)
     msg = str(exc).strip() or type(exc).__name__ or "Unknown processing error."
     # Avoid leaking internal paths or library internals.
@@ -417,10 +522,51 @@ def _friendly_error(exc):
     return msg[:900]
 
 
-async def _process_uploaded(message, context, file_id, wm, kind, filename=""):
-    status = await message.reply_text("⏳ Processing your file…")
+async def _report_failure(status, context, wm, text):
+    """Tell the user what failed and keep the session so they can retry.
+
+    A failed attempt keeps the settings and the uploaded file reference. The
+    session is only cleared after _MAX_ATTEMPTS failures. If the upload itself
+    was rejected, the settings are kept and a new file is requested.
+    """
+    same_session = context.user_data.get("wm") is wm  # don't touch a session the user restarted
+    if not wm.get("file_id"):
+        if same_session:
+            context.user_data["state"] = "wm_awaiting_file"
+        text += "\nSend a different file to try again."
+        markup = _keyboard([[("❌ Cancel", "wm_cancel")]])
+    elif wm.get("_attempts", 0) >= _MAX_ATTEMPTS:
+        if same_session:
+            context.user_data["state"] = None
+            context.user_data.pop("wm", None)
+        text += "\nToo many failed attempts. Please start again."
+        markup = _keyboard([[("🔄 Start over", "watermark")]])
+    else:
+        if same_session:
+            context.user_data["state"] = "wm_retry"
+        markup = _retry_keyboard(wm)
     try:
-        raw = await _download_file(message, context, file_id)
+        await status.edit_text(text, reply_markup=markup)
+    except Exception:
+        pass  # session state is already set; a failed message edit must not crash the bot
+
+
+async def _process_uploaded(message, context, file_id, wm, kind, filename=""):
+    # Remember the input so a failed attempt can be retried without re-uploading.
+    if wm.get("file_id") != file_id:
+        wm["_attempts"] = 0
+    wm["file_id"], wm["kind"] = file_id, kind
+    if filename:
+        wm["filename"] = filename
+    wm["_attempts"] = wm.get("_attempts", 0) + 1
+    status = await message.reply_text("⏳ Processing your file…")
+    succeeded = False
+    try:
+        try:
+            raw = await _download_file(message, context, file_id)
+        except WatermarkError:
+            wm.pop("file_id", None)  # empty / too large: this upload cannot be retried
+            raise
         if kind == "image":
             if wm.get("action") == "add":
                 await status.edit_text("💧 Adding watermark to your image…")
@@ -431,22 +577,19 @@ async def _process_uploaded(message, context, file_id, wm, kind, filename=""):
                     check_image.verify()
                 caption = "✅ Watermark added to your image."
             else:
-                is_auto = wm.get("remove_mode") == "auto" or wm.get("text") == "__AUTO_WATERMARK__"
-                if is_auto:
-                    await status.edit_text("🤖 Detecting and removing the watermark…")
-                    result, count = await asyncio.wait_for(
-                        asyncio.to_thread(_remove_image_watermark_auto, raw), timeout=_REMOVE_TIMEOUT_IMAGE
-                    )
+                await status.edit_text("🤖 Detecting and removing the watermark…")
+                result, count, warns = await asyncio.wait_for(
+                    asyncio.to_thread(_remove_image, raw, wm), timeout=_REMOVE_TIMEOUT_IMAGE
+                )
+                if wm.get("remove_mode") == "auto":
                     caption = (
                         f"✅ Automatically removed {count} watermark region(s). "
                         "Please review the image; automatic detection may also affect ordinary text."
                     )
                 else:
-                    await status.edit_text(f"🔎 Scanning image for “{wm.get('text', '')}”…")
-                    result, count = await asyncio.wait_for(
-                        asyncio.to_thread(_remove_image_text, raw, wm["text"]), timeout=_REMOVE_TIMEOUT_IMAGE
-                    )
-                    caption = f"✅ Removed matching text from {count} detected region(s). Some background repair may be visible."
+                    caption = f"✅ Removed {count} watermark region(s). Please review the image."
+                if warns:
+                    caption = (caption + " " + "; ".join(warns))[:1000]
                 with Image.open(BytesIO(result)) as check_image:
                     check_image.verify()
             output = BytesIO(result)
@@ -454,13 +597,17 @@ async def _process_uploaded(message, context, file_id, wm, kind, filename=""):
             await message.reply_document(document=output, filename=output.name, caption=caption)
         else:
             await status.edit_text("📄 Processing your PDF…")
-            if wm.get("action") == "remove" and (
-                wm.get("remove_mode") == "auto" or wm.get("text") == "__AUTO_WATERMARK__"
-            ):
-                raise WatermarkError(
-                    "Automatic PDF watermark removal is not supported safely. "
-                    "Use Specific watermark text for selectable PDF text, or convert the page to an image and use image removal."
-                )
+            if wm.get("action") == "remove":
+                if wm.get("remove_mode") == "auto" or wm.get("text") == _AUTO_SENTINEL:
+                    raise WatermarkError(
+                        "Automatic PDF watermark removal is not supported safely. "
+                        "Use Specific watermark text for selectable PDF text, or convert the page to an image and use image removal."
+                    )
+                if wm.get("remove_mode") in ("region", "color"):
+                    raise WatermarkError(
+                        "Region and color removal work on images only. "
+                        "For a PDF, use Specific watermark text for selectable PDF text, or convert the page to an image."
+                    )
             result = await asyncio.wait_for(
                 asyncio.to_thread(_process_pdf, raw, wm), timeout=_REMOVE_TIMEOUT_PDF
             )
@@ -476,17 +623,27 @@ async def _process_uploaded(message, context, file_id, wm, kind, filename=""):
             output = BytesIO(result)
             output.name = "watermarked.pdf" if wm.get("action") == "add" else "watermark_removed.pdf"
             await message.reply_document(document=output, filename=output.name, caption=caption)
-        await status.edit_text("✅ Finished.")
+        succeeded = True
+        try:
+            await status.edit_text("✅ Finished.")
+        except Exception:
+            pass  # the file was already delivered; a cosmetic edit failing is not a processing failure
     except asyncio.TimeoutError:
-        await status.edit_text(
+        await _report_failure(
+            status, context, wm,
             "⏱️ Watermark removal timed out on this server. "
             "Try a smaller image (under 800px) or a shorter PDF. "
-            "If it keeps happening, the server may be low on memory."
+            "If it keeps happening, the server may be low on memory.",
         )
-    except WatermarkError as exc:
-        await status.edit_text("❌ " + _friendly_error(exc))
+    except (WatermarkError, WatermarkRemovalError) as exc:
+        await _report_failure(status, context, wm, "❌ " + _friendly_error(exc))
     except Exception as exc:
-        await status.edit_text("❌ Could not process this file: " + _friendly_error(exc))
+        await _report_failure(status, context, wm, "❌ Could not process this file: " + _friendly_error(exc))
     finally:
-        context.user_data["state"] = None
-        context.user_data.pop("wm", None)
+        if succeeded:
+            if context.user_data.get("wm") is wm:
+                context.user_data["state"] = None
+                context.user_data.pop("wm", None)
+        elif context.user_data.get("wm") is wm and context.user_data.get("state") == "wm_processing":
+            # e.g. task cancelled mid-flight: never leave the user stuck in "processing"
+            context.user_data["state"] = "wm_retry"
