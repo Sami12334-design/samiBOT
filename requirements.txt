@@ -32,3 +32,4 @@ phonenumbers>=9.0.0
 pycountry>=24.6.1
 bgutil-ytdlp-pot-provider==2.0.2
 pypdf>=5.0
+psycopg2-binary
