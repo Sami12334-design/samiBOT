@@ -1,0 +1,258 @@
+"""Tests for golden_downloader.py. Network access is mocked; no real site is contacted.
+
+Run from the repo root:  python -m unittest tests/test_golden_downloader.py
+"""
+import glob
+import io
+import os
+import shutil
+import sys
+import tempfile
+import unittest
+import urllib.request
+from unittest import mock
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import pymupdf
+from PIL import Image
+
+import golden_downloader as g
+
+PAGE = "https://www.scribd.com/document/123456/My-Biology-Notes"
+
+
+def read_bytes(path):
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
+def png(w=400, h=500, mode="RGB"):
+    buf = io.BytesIO()
+    Image.new(mode, (w, h), 200 if mode == "L" else (200, 50, 50)).save(buf, "PNG")
+    return buf.getvalue()
+
+
+def routes_request(routes):
+    """Replacement for g._request that serves canned responses."""
+    def fake(url, referer=None, limit=0, deadline=None, strict_hosts=True):
+        if url not in routes:
+            raise ValueError("HTTP Error 403: Forbidden")
+        return routes[url]
+    return fake
+
+
+def page_response(html, url=PAGE):
+    return {url: (url, "text/html", html.encode() if isinstance(html, str) else html)}
+
+
+class FakeResponse:
+    def __init__(self, chunks, url="https://www.scribd.com/x", ctype="application/pdf"):
+        self._chunks, self._url = list(chunks), url
+        self.headers = {"Content-Type": ctype}
+
+    def geturl(self):
+        return self._url
+
+    def read(self, n=-1):
+        return self._chunks.pop(0) if self._chunks else b""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class FakeOpener:
+    def __init__(self, response):
+        self.response = response
+
+    def open(self, req, timeout=None):
+        return self.response
+
+
+class Cleanup(unittest.TestCase):
+    def finish(self, path):
+        self.addCleanup(shutil.rmtree, os.path.dirname(path), True)
+        return path
+
+
+class PdfSelectionTests(Cleanup):
+    def run_page(self, html, extra=None):
+        routes = page_response(html)
+        routes.update(extra or {})
+        with mock.patch.object(g, "_request", routes_request(routes)):
+            return self.finish(g._download_public_document(PAGE))
+
+    def test_direct_pdf_link_is_saved(self):
+        routes = {PAGE: (PAGE, "application/pdf", b"%PDF-1.4 direct")}
+        with mock.patch.object(g, "_request", routes_request(routes)):
+            path = self.finish(g._download_public_document(PAGE))
+        self.assertEqual(read_bytes(path), b"%PDF-1.4 direct")
+
+    def test_related_document_link_is_not_downloaded(self):
+        other = "https://www.scribd.com/other/Completely-Different-Doc.pdf"
+        with self.assertRaises(ValueError) as cm:
+            self.run_page(f'<a href="{other}">related</a>', {other: (other, "application/pdf", b"%PDF-1.4 OTHER")})
+        self.assertIn("No public downloadable file", str(cm.exception))
+
+    def test_link_matching_this_document_is_accepted(self):
+        mine = "https://www.scribd.com/files/My-Biology-Notes.pdf"
+        path = self.run_page(f'<a href="{mine}">pdf</a>', {mine: (mine, "application/pdf", b"%PDF-1.4 MINE")})
+        self.assertTrue(read_bytes(path).endswith(b"MINE"))
+
+    def test_embedded_and_download_links_are_accepted(self):
+        for tag in ('<embed src="{u}">', '<iframe src="{u}"></iframe>', '<a download href="{u}">get</a>',
+                    '<object data="{u}"></object>', '<link rel="alternate" type="application/pdf" href="{u}">'):
+            u = "https://www.scribd.com/files/anything-at-all.pdf"
+            path = self.run_page(tag.format(u=u), {u: (u, "application/pdf", b"%PDF-1.4 EMB")})
+            self.assertTrue(read_bytes(path).endswith(b"EMB"), tag)
+
+    def test_js_only_page_gives_clear_error(self):
+        with self.assertRaises(ValueError) as cm:
+            self.run_page("<html><div id=app></div><script src=/app.js></script></html>")
+        self.assertIn("No public downloadable file", str(cm.exception))
+
+    def test_unsupported_hosts_and_http_are_rejected(self):
+        for url in ("http://www.scribd.com/doc/1", "https://example.com/a.pdf"):
+            with self.assertRaises(ValueError):
+                g._download_public_document(url)
+
+
+class ImagePathTests(Cleanup):
+    def test_page_images_become_pdf_and_bad_ones_are_skipped(self):
+        html = ('<img src="https://html.scribdassets.com/a/1.jpg"><img src="https://html.scribdassets.com/a/2.jpg">'
+                '<img src="https://evil.example/3.jpg"><img src="https://html.scribdassets.com/a/thumb.jpg">')
+        routes = page_response(html)
+        routes["https://html.scribdassets.com/a/1.jpg"] = ("u", "image/png", png())
+        routes["https://html.scribdassets.com/a/2.jpg"] = ("u", "image/png", png(600, 800))
+        routes["https://html.scribdassets.com/a/thumb.jpg"] = ("u", "image/png", png(100, 100))
+        with mock.patch.object(g, "_request", routes_request(routes)):
+            path = self.finish(g._download_public_document(PAGE))
+        with pymupdf.open(path) as doc:
+            self.assertEqual(doc.page_count, 2)  # off-host image and thumbnail skipped
+            self.assertAlmostEqual(doc[0].rect.width, g.PAGE_WIDTH_PT, places=0)
+
+    def test_oversized_pixel_count_is_rejected_before_decoding(self):
+        big = png(9000, 9000, mode="L")  # 81M pixels, tiny in memory as 1 channel
+        self.assertIsNone(g._prepare_page_image(big))
+
+    def test_large_image_is_downscaled(self):
+        jpeg, w, h = g._prepare_page_image(png(3000, 3000, mode="L"))
+        self.assertLessEqual(max(w, h), g.MAX_PAGE_SIDE_PX)
+        self.assertTrue(jpeg.startswith(b"\xff\xd8"))
+
+    def test_images_are_not_all_held_decoded(self):
+        """Each page is re-encoded to compressed JPEG immediately (no list of PIL images)."""
+        decoded = []
+        real = g._prepare_page_image
+
+        def spy(data):
+            result = real(data)
+            decoded.append(type(result[0]).__name__ if result else None)
+            return result
+
+        html = "".join(f'<img src="https://html.scribdassets.com/a/{i}.png">' for i in range(5))
+        routes = page_response(html)
+        for i in range(5):
+            routes[f"https://html.scribdassets.com/a/{i}.png"] = ("u", "image/png", png())
+        with mock.patch.object(g, "_request", routes_request(routes)), mock.patch.object(g, "_prepare_page_image", spy):
+            path = self.finish(g._download_public_document(PAGE))
+        self.assertEqual(decoded, ["bytes"] * 5)
+        with pymupdf.open(path) as doc:
+            self.assertEqual(doc.page_count, 5)
+
+
+class SafetyAndTimeTests(unittest.TestCase):
+    def test_redirect_to_unknown_host_is_blocked(self):
+        opener = g._make_opener(g._check_source_url)
+        handler = next(h for h in opener.handlers if isinstance(h, urllib.request.HTTPRedirectHandler))
+        req = urllib.request.Request("https://www.scribd.com/a")
+        with self.assertRaises(ValueError):
+            handler.redirect_request(req, None, 302, "Found", {}, "https://evil.example/x")
+        with self.assertRaises(ValueError):
+            handler.redirect_request(req, None, 302, "Found", {}, "http://www.scribd.com/x")
+        ok = handler.redirect_request(req, None, 302, "Found", {}, "https://www.scribd.com/b")
+        self.assertEqual(ok.full_url, "https://www.scribd.com/b")
+
+    def test_public_https_guard(self):
+        for bad in ("https://127.0.0.1/x", "https://10.0.0.5/x", "https://192.168.1.1/x", "http://8.8.8.8/x"):
+            with self.assertRaises(ValueError, msg=bad):
+                g._check_public_https(bad)
+        g._check_public_https("https://8.8.8.8/x")  # public literal passes
+
+    def test_expired_deadline_stops_before_any_network_call(self):
+        with mock.patch.object(g, "_make_opener") as opener:
+            with self.assertRaises(g._OutOfTime):
+                g._request("https://www.scribd.com/x", deadline=g.time.monotonic() - 1)
+        opener.assert_not_called()
+
+    def test_slow_drip_download_hits_deadline(self):
+        clock = {"t": 0.0}
+
+        class Resp(FakeResponse):
+            def read(self, n=-1):
+                clock["t"] += 1.0
+                return b"x" * 10
+
+        with mock.patch.object(g.time, "monotonic", lambda: clock["t"]), \
+             mock.patch.object(g, "_make_opener", lambda check: FakeOpener(Resp([]))):
+            with self.assertRaises(g._OutOfTime):
+                g._request("https://www.scribd.com/x", deadline=5.0)
+
+    def test_oversized_download_is_rejected(self):
+        resp = FakeResponse([b"x" * 1024] * 10)
+        with mock.patch.object(g, "_make_opener", lambda check: FakeOpener(resp)):
+            with self.assertRaises(ValueError) as cm:
+                g._request("https://www.scribd.com/x", limit=4096)
+        self.assertIn("too large", str(cm.exception))
+
+    def test_whole_call_respects_time_budget(self):
+        with mock.patch.object(g, "TOTAL_TIME_BUDGET", -1), mock.patch.object(g, "_make_opener") as opener:
+            with self.assertRaises(ValueError) as cm:
+                g.download_public_document("https://www.scribd.com/document/1/x")
+        opener.assert_not_called()
+        self.assertIn("took too long", str(cm.exception))
+
+
+class ApiFallbackTests(Cleanup):
+    def setUp(self):
+        self.env = mock.patch.dict(os.environ, {}, clear=False)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        os.environ.pop("GOLDEN_DOWNLOADER_API_URLS", None)
+
+    def test_unconfigured_fallback_is_skipped_and_not_mentioned(self):
+        with mock.patch.object(g, "_request", routes_request({})):
+            with self.assertRaises(ValueError) as cm:
+                g.download_public_document(PAGE)
+        self.assertNotIn("external API", str(cm.exception))
+        self.assertIn("public source", str(cm.exception))
+
+    def test_configured_provider_returning_pdf_works(self):
+        os.environ["GOLDEN_DOWNLOADER_API_URLS"] = "https://provider.example/dl?url={url}"
+        calls = []
+
+        def fake(url, referer=None, limit=0, deadline=None, strict_hosts=True):
+            calls.append((url, strict_hosts))
+            if url.startswith("https://provider.example/"):
+                return url, "application/pdf", b"%PDF-1.4 API"
+            raise ValueError("403")
+
+        with mock.patch.object(g, "_request", fake):
+            path = self.finish(g.download_public_document(PAGE))
+        self.assertEqual(read_bytes(path), b"%PDF-1.4 API")
+        self.assertFalse(calls[-1][1])  # provider traffic uses the public-address guard
+
+    def test_failed_write_does_not_leave_temp_dir(self):
+        before = set(glob.glob(os.path.join(tempfile.gettempdir(), "golden_api_*")))
+        with mock.patch("builtins.open", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                g._save_temp_pdf("golden_api_", "document.pdf", b"%PDF-")
+        after = set(glob.glob(os.path.join(tempfile.gettempdir(), "golden_api_*")))
+        self.assertEqual(before, after)
+
+
+if __name__ == "__main__":
+    unittest.main()
